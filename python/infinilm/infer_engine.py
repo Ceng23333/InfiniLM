@@ -17,6 +17,14 @@ _MODEL_DEFAULTS = {
     "mistral": {"torch_dtype": "bfloat16"},
 }
 
+_ALWAYS_MULTIMODAL_MODEL_TYPES = frozenset(
+    {
+        "minicpmv",
+        "videonsa",
+        "qwen3_vl",
+    }
+)
+
 
 def _apply_torch_dtype_defaults(config: dict) -> dict:
     if config.get("torch_dtype") is None:
@@ -48,6 +56,14 @@ def _normalize_videonsa_config(config_dict):
         return normalized
 
     return config_dict
+
+
+def is_multimodal_model_config(config: dict) -> bool:
+    """Return whether the normalized model config has multimodal inputs."""
+    vision_config = config.get("vision_config")
+    return vision_config is not None or config.get("model_type") in (
+        _ALWAYS_MULTIMODAL_MODEL_TYPES
+    )
 
 
 def read_hf_config(model_path):
