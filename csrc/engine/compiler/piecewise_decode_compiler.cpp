@@ -14,11 +14,41 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <spdlog/spdlog.h>
 
 namespace infinilm::engine {
 
 namespace {
+
+bool graph_capture_audit_enabled_() {
+    const char *v = std::getenv("INFINI_GRAPH_CAPTURE_AUDIT");
+    return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+}
+
+void assert_post_one_device_seg_(
+    const char *where,
+    size_t layer,
+    const std::shared_ptr<infinicore::graph::Graph> &g) {
+    if (!graph_capture_audit_enabled_()
+        || !infinicore::context::moeTritonCaptureAllowed()
+        || !g) {
+        return;
+    }
+    const size_t n = g->device_segment_count();
+    if (n == 1) {
+        return;
+    }
+    spdlog::error(
+        "[capture_audit] {} layer={} post device_segments={} expected=1 "
+        "(MoE capturable — true one-piece post requires a single device seg)",
+        where,
+        layer,
+        n);
+    throw std::runtime_error(
+        std::string("[capture_audit] post device_segments!=1 when MoE capturable (")
+        + where + ")");
+}
 
 std::vector<size_t> parse_capture_batches_() {
     std::vector<size_t> batches;
@@ -216,6 +246,8 @@ void PiecewiseDecodeCompiler::capture_batch_legacy_(size_t /*batch*/,
                 layer, graphs.input, hidden, residual);
             graphs.post_attn[layer] = rec.stop();
         }
+        assert_post_one_device_seg_(
+            "piecewise_decode_post", layer, graphs.post_attn[layer]);
         device_segs += count_device_segments_(graphs.post_attn[layer]);
 
         model_->native_piecewise_eager_moe_layer(layer, graphs.input, hidden, residual);
@@ -263,6 +295,8 @@ void PiecewiseDecodeCompiler::capture_batch_fused_(size_t /*batch*/,
                     layer, graphs.input, hidden, residual);
                 graphs.post_attn[layer] = rec.stop();
             }
+            assert_post_one_device_seg_(
+                "piecewise_decode_post_only", layer, graphs.post_attn[layer]);
             device_segs += count_device_segments_(graphs.post_attn[layer]);
             model_->native_piecewise_eager_moe_layer(layer, graphs.input, hidden, residual);
         }
@@ -316,6 +350,7 @@ void PiecewiseDecodeCompiler::capture_batch_fused_(size_t /*batch*/,
                     layer + 1, graphs.input, hidden, residual);
             }
             auto g = rec.stop();
+            assert_post_one_device_seg_("piecewise_decode_span_post", layer, g);
             device_segs += count_device_segments_(g);
             graphs.layer_groups.push_back(std::move(g));
             graphs.group_layer0.push_back(layer);
@@ -411,30 +446,12 @@ void PiecewiseDecodeCompiler::capture_batch_(size_t batch) {
     compiled_[batch] = std::move(graphs);
 
     const auto &stored = compiled_[batch];
-    const bool triton_capture = []() {
-        const char *v = std::getenv("INFINI_MOE_TRITON_CAPTURE");
-        return v != nullptr && v[0] != '\0' && std::string(v) != "0";
-    }();
-    const bool capture_safe = []() {
-        const char *v = std::getenv("INFINI_MOE_CAPTURE_SAFE");
-        return v != nullptr && v[0] != '\0' && std::string(v) != "0";
-    }();
-    const char *mode_name = "span_fuse_moe_hostbreak";
-    if (triton_capture) {
-        mode_name = "span_fuse_triton_capture";
-    } else if (capture_safe) {
-        mode_name = "span_fuse_capture_safe";
-    }
+    const bool moe_capturable = infinicore::context::moeTritonCaptureAllowed();
+    const char *mode_name = moe_capturable ? "span_fuse_moe_ingraph" : "span_fuse_moe_hostbreak";
     if (stored.fuse_layers == 1) {
         mode_name = "legacy_split";
     } else if (stored.fuse_layers == 2) {
-        if (triton_capture) {
-            mode_name = "post_only_triton_capture";
-        } else if (capture_safe) {
-            mode_name = "post_only_capture_safe";
-        } else {
-            mode_name = "post_only_cg";
-        }
+        mode_name = moe_capturable ? "post_only_moe_ingraph" : "post_only_cg";
     }
     spdlog::info(
         "native piecewise decode CG: captured batch={} layers={} fuse_layers={} "

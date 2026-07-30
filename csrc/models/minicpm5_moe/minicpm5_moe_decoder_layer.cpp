@@ -2,8 +2,7 @@
 
 #include "../../global_state/decode_phase_profile.hpp"
 
-#include <cstdlib>
-#include <string>
+#include <infinicore/context/context.hpp>
 
 namespace infinilm::models::minicpm5_moe {
 
@@ -152,6 +151,10 @@ void MiniCPM5MoeDecoderLayer::piecewise_post_attn_cg(
     infinicore::Tensor &hidden_states,
     infinicore::Tensor &residual,
     global_state::PiecewiseLayerStaging &staging) const {
+    // RC-7A: o_proj via forward_post_attn_piecewise_cg_into (inline row-parallel AR).
+    // MoE/dense MLP always recorded here; InductorMoe host_break_ follows
+    // moe_device_capturable() (INFINI_MOE_INGRAPH + MetaX wall) so capturable
+    // MoE stays in one device segment; otherwise HostOp-split.
     self_attn_->forward_post_attn_piecewise_cg_into(hidden_states, staging);
     post_attention_layernorm_->forward_inplace(hidden_states, residual);
     auto mlp_out = mlp_forward(hidden_states);
@@ -164,25 +167,15 @@ void MiniCPM5MoeDecoderLayer::piecewise_post_attn_decode_cg(
     global_state::PiecewiseLayerStaging &staging) const {
     self_attn_->forward_post_attn_piecewise_cg_into(hidden_states, staging);
     post_attention_layernorm_->forward_inplace(hidden_states, residual);
-    // Dense FFN is MetaX capture-safe. MoE: default stays outside (Triton host-break);
-    // with INFINI_MOE_TRITON_CAPTURE=1 or INFINI_MOE_CAPTURE_SAFE=1, fold MoE into
-    // the device segment (Triton or aten under capture respectively).
+    // Dense FFN is MetaX capture-safe. MoE folds into the device segment iff
+    // moeTritonCaptureAllowed() (shared gate with InductorMoe host_break_);
+    // otherwise piecewise_eager_moe runs MoE outside the segment.
     if (dense_mlp_) {
         auto mlp_out = dense_mlp_->forward(hidden_states);
         hidden_states->copy_from(mlp_out);
-    } else if (moe_mlp_) {
-        static const bool fold_moe = []() {
-            const char *triton = std::getenv("INFINI_MOE_TRITON_CAPTURE");
-            if (triton != nullptr && triton[0] != '\0' && std::string(triton) != "0") {
-                return true;
-            }
-            const char *v = std::getenv("INFINI_MOE_CAPTURE_SAFE");
-            return v != nullptr && v[0] != '\0' && std::string(v) != "0";
-        }();
-        if (fold_moe) {
-            auto mlp_out = moe_mlp_->forward(hidden_states);
-            hidden_states->copy_from(mlp_out);
-        }
+    } else if (moe_mlp_ && infinicore::context::moeTritonCaptureAllowed()) {
+        auto mlp_out = moe_mlp_->forward(hidden_states);
+        hidden_states->copy_from(mlp_out);
     }
 }
 
@@ -196,15 +189,7 @@ void MiniCPM5MoeDecoderLayer::piecewise_eager_moe(
         return;
     }
     // When MoE was folded into post_attn device segment, skip the eager call.
-    static const bool fold_moe = []() {
-        const char *triton = std::getenv("INFINI_MOE_TRITON_CAPTURE");
-        if (triton != nullptr && triton[0] != '\0' && std::string(triton) != "0") {
-            return true;
-        }
-        const char *v = std::getenv("INFINI_MOE_CAPTURE_SAFE");
-        return v != nullptr && v[0] != '\0' && std::string(v) != "0";
-    }();
-    if (fold_moe) {
+    if (infinicore::context::moeTritonCaptureAllowed()) {
         return;
     }
     const bool profile = global_state::decode_phase_profile::recording();

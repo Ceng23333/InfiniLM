@@ -16,8 +16,10 @@ Classification (for PR review):
   DEBUG — diagnostics / smoke baselines only:
     ``prefill_cg_debug_ptrs_enabled``, ``prefill_cg_baseline_none``,
     ``return_logits_enabled``, ``INFINI_PREFILL_MEM_PROFILE`` (see ``mem_profile.py``),
-    ``INFINI_FA_FORCE_CAPTURE`` (diagnose-only; prefer ``full_and_piecewise``).
-    ``INFINI_MOE_FORCE_HOST_BREAK`` (bisect: force MoE host-break even in Decode).
+    ``INFINI_FA_INGRAPH`` (diagnose-only; legacy ``INFINI_FA_FORCE_CAPTURE``).
+    ``INFINI_MOE_INGRAPH`` (``off``|``decode``|``prefill``|``both``; phase allow-list).
+    ``INFINI_MOE_FORCE_HOST_BREAK`` (bisect: force MoE host-break).
+    ``INFINI_MOE_METAX_INGRAPH_UNSAFE`` (MetaX wall opt-in; legacy METAX_CAPTURE_UNSAFE).
 
 When ``INFINI_NATIVE_CG_CAPTURE_BUCKETS`` is set, Inductor bootstrap and
 ``compile_buckets`` use that list only (no auto power-of-two through 8192).
@@ -38,6 +40,11 @@ _PREFILL_COMPILE_WARNED = False
 _SCHEDULE_HOMOGENEOUS_WARNED = False
 _FA_FORCE_POLICY_WARNED = False
 _PREFILL_NATIVE_POLICY_WARNED = False
+_MOE_INGRAPH_SHIM_WARNED = False
+_MOE_METAX_UNSAFE_SHIM_WARNED = False
+_FA_INGRAPH_SHIM_WARNED = False
+_MOE_CAPTURE_SAFE_WARNED = False
+_PREFILL_CHUNK_SIZE_WARNED = False
 
 # CUDA-graph master policy (entry CLI / INFINI_CUDAGRAPH_POLICY).
 # ``track_b`` and other unknowns are rejected.
@@ -87,20 +94,78 @@ def cudagraph_policy() -> str:
 
 
 def _warn_fa_force_with_policy() -> None:
-    """FA_FORCE is diagnose-only; warn when combined with cudagraph policy."""
+    """FA_INGRAPH / legacy FA_FORCE is diagnose-only; warn when combined with policy."""
     global _FA_FORCE_POLICY_WARNED
-    if not _truthy("INFINI_FA_FORCE_CAPTURE", "0"):
+    if not (_truthy("INFINI_FA_INGRAPH", "0") or _truthy("INFINI_FA_FORCE_CAPTURE", "0")):
         return
     if _FA_FORCE_POLICY_WARNED:
         return
     logger.warning(
-        "INFINI_FA_FORCE_CAPTURE=1 is diagnose-only; prefer "
+        "INFINI_FA_INGRAPH=1 (or legacy FA_FORCE_CAPTURE) is diagnose-only; prefer "
         "INFINI_CUDAGRAPH_POLICY=full_and_piecewise (FULL decode + FA "
-        "host-break + Decode-phase MoE in-graph + native prefill on MetaX). "
-        "FA_FORCE remains a global override and does not restore production "
+        "host-break + phase-scoped MoE via INFINI_MOE_INGRAPH + native prefill). "
+        "FA_INGRAPH remains a global override and does not restore production "
         "FA-in-graph. MoE bisect: INFINI_MOE_FORCE_HOST_BREAK=1."
     )
     _FA_FORCE_POLICY_WARNED = True
+
+
+def _normalize_moe_fa_env_aliases() -> None:
+    """Map legacy MoE/FA capture flags to canonical names (one release shim)."""
+    global _MOE_INGRAPH_SHIM_WARNED, _MOE_METAX_UNSAFE_SHIM_WARNED
+    global _FA_INGRAPH_SHIM_WARNED, _MOE_CAPTURE_SAFE_WARNED
+
+    # CAPTURE_SAFE hard-removed (aten body deleted Phase 1).
+    if _truthy("INFINI_MOE_CAPTURE_SAFE", "0"):
+        if not _MOE_CAPTURE_SAFE_WARNED:
+            logger.warning(
+                "INFINI_MOE_CAPTURE_SAFE is hard-removed (aten MoE body deleted); "
+                "ignored. Use INFINI_MOE_INGRAPH + Triton, or host-break."
+            )
+            _MOE_CAPTURE_SAFE_WARNED = True
+
+    # TRITON_CAPTURE / FORCE_CAPTURE → MOE_INGRAPH=decode (preserve Decode-only).
+    legacy_moe_force = _truthy("INFINI_MOE_FORCE_CAPTURE", "0") or _truthy(
+        "INFINI_MOE_TRITON_CAPTURE", "0"
+    )
+    if os.environ.get("INFINI_MOE_TRITON_CAPTURE") and not _MOE_INGRAPH_SHIM_WARNED:
+        logger.warning(
+            "INFINI_MOE_TRITON_CAPTURE is deprecated; mapping truthy values to "
+            "INFINI_MOE_INGRAPH=decode (legacy Decode-only). Prefer "
+            "INFINI_MOE_INGRAPH=decode|prefill|both. On MetaX also set "
+            "INFINI_MOE_METAX_INGRAPH_UNSAFE=1."
+        )
+        _MOE_INGRAPH_SHIM_WARNED = True
+    if legacy_moe_force and not os.environ.get("INFINI_MOE_INGRAPH", "").strip():
+        if not _MOE_INGRAPH_SHIM_WARNED and _truthy("INFINI_MOE_FORCE_CAPTURE", "0"):
+            logger.warning(
+                "INFINI_MOE_FORCE_CAPTURE is deprecated; shim to "
+                "INFINI_MOE_INGRAPH=decode. Prefer INFINI_MOE_INGRAPH="
+                "decode|prefill|both (+ INFINI_MOE_METAX_INGRAPH_UNSAFE on MetaX)."
+            )
+            _MOE_INGRAPH_SHIM_WARNED = True
+        _setdefault_env("INFINI_MOE_INGRAPH", "decode")
+
+    # METAX_CAPTURE_UNSAFE → METAX_INGRAPH_UNSAFE
+    if _truthy("INFINI_MOE_METAX_CAPTURE_UNSAFE", "0"):
+        if not os.environ.get("INFINI_MOE_METAX_INGRAPH_UNSAFE", "").strip():
+            if not _MOE_METAX_UNSAFE_SHIM_WARNED:
+                logger.warning(
+                    "INFINI_MOE_METAX_CAPTURE_UNSAFE is deprecated; use "
+                    "INFINI_MOE_METAX_INGRAPH_UNSAFE=1"
+                )
+                _MOE_METAX_UNSAFE_SHIM_WARNED = True
+            _setdefault_env("INFINI_MOE_METAX_INGRAPH_UNSAFE", "1")
+
+    # FA_FORCE_CAPTURE → FA_INGRAPH
+    if _truthy("INFINI_FA_FORCE_CAPTURE", "0"):
+        if not os.environ.get("INFINI_FA_INGRAPH", "").strip():
+            if not _FA_INGRAPH_SHIM_WARNED:
+                logger.warning(
+                    "INFINI_FA_FORCE_CAPTURE is deprecated; use INFINI_FA_INGRAPH=1"
+                )
+                _FA_INGRAPH_SHIM_WARNED = True
+            _setdefault_env("INFINI_FA_INGRAPH", "1")
 
 
 def _warn_prefill_native_with_policy() -> None:
@@ -137,11 +202,12 @@ def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
       ``DECODE_PIECEWISE=0``). Native prefill off via policy.
     ``full_and_piecewise`` (MetaX contract; matches vLLM dual-mode)
       Decode monolithic FULL for uniform decode batches; FA **host-break**;
-      MoE Triton **in-graph on Decode** (Prefill / Unknown host-break;
-      bisect ``INFINI_MOE_FORCE_HOST_BREAK=1``). Prefill **native piecewise**
+      MoE Triton phase-scoped via ``INFINI_MOE_INGRAPH`` (default off /
+      host-break; MetaX needs ``METAX_INGRAPH_UNSAFE``; bisect
+      ``INFINI_MOE_FORCE_HOST_BREAK=1``). Prefill **native piecewise**
       for bucket hits including ragged/mixed multi-req (pad-up
       ``num_tokens``; capture ``max_capture_req ≥ MAX_BATCH_SIZE``). Does
-      **not** set ``FA_FORCE``. ``INFINI_PREFILL_NATIVE_CG`` is not written
+      **not** set ``FA_INGRAPH``. ``INFINI_PREFILL_NATIVE_CG`` is not written
       and is ignored when set.
     """
     if policy is None:
@@ -154,21 +220,9 @@ def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
                 f"expected one of {sorted(_CUDAGRAPH_POLICIES)}"
             )
     os.environ["INFINI_CUDAGRAPH_POLICY"] = p
+    _normalize_moe_fa_env_aliases()
     _warn_fa_force_with_policy()
     _warn_prefill_native_with_policy()
-    if os.environ.get("INFINI_MOE_TRITON_CAPTURE"):
-        # Jul21 Band C recipe used TRITON_CAPTURE=1. Map to FORCE_CAPTURE for
-        # Decode-only fold; MetaX still requires METAX_CAPTURE_UNSAFE (default
-        # ban — MoE-in-capture garbles on this stack).
-        logger.warning(
-            "INFINI_MOE_TRITON_CAPTURE is deprecated; mapping truthy values to "
-            "INFINI_MOE_FORCE_CAPTURE=1 (Decode-only). On MetaX also set "
-            "INFINI_MOE_METAX_CAPTURE_UNSAFE=1 to opt into MoE-in-graph "
-            "(known garble under hcGraph — Step1: FORCE and CAPTURE_SAFE both "
-            "GARBLE; FORCE_OP_LIST OK; default remains MoE host-break segs≈28)."
-        )
-        if _truthy("INFINI_MOE_TRITON_CAPTURE", "0"):
-            _setdefault_env("INFINI_MOE_FORCE_CAPTURE", "1")
 
     if p == CUDAGRAPH_POLICY_EAGER:
         _setdefault_env("INFINI_DECODE_GRAPH_ONLY", "1")
@@ -177,20 +231,26 @@ def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
         return p
 
     # full_and_piecewise
-    # Decode FULL: FA host-break by default; MoE host-break on MetaX (FORCE +
-    # METAX_CAPTURE_UNSAFE diagnose-only). FA-in-graph via INFINI_FA_FORCE_CAPTURE.
-    # Prefill: native piecewise always on (derived from policy, not PREFILL_NATIVE_CG).
+    # Decode FULL: FA host-break by default; MoE host-break on MetaX unless
+    # INFINI_MOE_INGRAPH + METAX_INGRAPH_UNSAFE (diagnose). FA-in-graph via
+    # INFINI_FA_INGRAPH. Prefill: native piecewise from policy (not PREFILL_NATIVE_CG).
     # Ragged/mixed multi-req → PIECEWISE (pad-up num_tokens); FULL remains uniform decode only.
     _setdefault_env("INFINI_DECODE_GRAPH_ONLY", "0")
     _setdefault_env("INFINI_SKIP_MONOLITHIC_DECODE_CG", "0")
     _setdefault_env("INFINI_DECODE_PIECEWISE", "0")
     _setdefault_env("INFINI_DECODE_CG_BATCHES", "1,2,4")
-    _setdefault_env("INFINI_NATIVE_CG_CAPTURE_BUCKETS", "16,64,512,1024,2048,4096")
+    # Dense 2-pow through capture max=2048. Skip 1/2/4/8: B4 needs MiniCPM5 AOT
+    # (missing); 1/2/8 hard-crash under MoE-in-graph MC=4 (VRAM / tiny-bucket).
+    _setdefault_env(
+        "INFINI_NATIVE_CG_CAPTURE_BUCKETS",
+        "16,32,64,128,256,512,1024,2048",
+    )
+    _setdefault_env("INFINI_MAX_NUM_BATCHED_TOKENS", "2048")
     _setdefault_env("INFINI_MUL_HOST_BREAK", "0")
     logger.info(
         "cudagraph_policy=full_and_piecewise "
         "(FULL uniform decode + FA host-break + MetaX MoE host-break; "
-        "PIECEWISE prefill/mixed pad-up)"
+        "PIECEWISE prefill/mixed pad-up; MAX_BATCHED=2048)"
     )
     return p
 
@@ -235,10 +295,13 @@ def prefill_chunked_enabled() -> bool:
 
 
 def prefill_chunk_size(default: int = 8192) -> int:
-    """Max new tokens per chunked prefill step (clamped to power ladder cap)."""
-    raw = os.environ.get("INFINI_PREFILL_CHUNK_SIZE")
-    size = int(raw) if raw else default
-    return min(max(size, 1), _VLLM_POWER_LADDER_CAP)
+    """Deprecated alias of ``max_num_batched_tokens`` (one shared step budget).
+
+    ``INFINI_PREFILL_CHUNK_SIZE`` is deprecated: warn once; if it differs from
+    ``INFINI_MAX_NUM_BATCHED_TOKENS``, MAX_BATCHED wins. If only CHUNK is set,
+    treat it as MAX_BATCHED for one release (compat shim).
+    """
+    return max_num_batched_tokens(default=default)
 
 
 def v1_scheduler_enabled() -> bool:
@@ -274,23 +337,59 @@ def schedule_no_mixed_enabled() -> bool:
 
 
 def max_num_batched_tokens(default: int = 8192) -> int:
-    """Token budget per v1 scheduler step (primary shared chunker, as vLLM)."""
-    raw = os.environ.get("INFINI_MAX_NUM_BATCHED_TOKENS")
-    return int(raw) if raw else default
+    """Token budget per v1 scheduler step (sole shared chunker / step budget).
+
+    Canonical knob: ``INFINI_MAX_NUM_BATCHED_TOKENS``. When unset and chunked
+    prefill + native CG / ``full_and_piecewise`` is on, default **2048** (capture
+    max), not 8192. Deprecated ``INFINI_PREFILL_CHUNK_SIZE`` is a one-release
+    compat shim when MAX_BATCHED is unset.
+    """
+    global _PREFILL_CHUNK_SIZE_WARNED
+    raw_max = os.environ.get("INFINI_MAX_NUM_BATCHED_TOKENS")
+    raw_chunk = os.environ.get("INFINI_PREFILL_CHUNK_SIZE")
+
+    if raw_chunk and not _PREFILL_CHUNK_SIZE_WARNED:
+        logger.warning(
+            "INFINI_PREFILL_CHUNK_SIZE is deprecated; use "
+            "INFINI_MAX_NUM_BATCHED_TOKENS (shared step budget = capture max). "
+            "CHUNK is ignored when MAX_BATCHED is set; if only CHUNK is set it "
+            "is treated as MAX_BATCHED for one release."
+        )
+        _PREFILL_CHUNK_SIZE_WARNED = True
+
+    if raw_max:
+        max_v = int(raw_max)
+        if raw_chunk and int(raw_chunk) != max_v:
+            logger.warning(
+                "INFINI_PREFILL_CHUNK_SIZE=%s ignored; "
+                "INFINI_MAX_NUM_BATCHED_TOKENS=%s wins",
+                raw_chunk,
+                raw_max,
+            )
+        return max(1, max_v)
+
+    if raw_chunk:
+        return max(1, int(raw_chunk))
+
+    # Production / LongBench: align step budget with capture max when chunked
+    # native CG is active (avoids MIXED over_max like 2048+decode→2051).
+    if prefill_chunked_enabled() and prefill_native_cg_enabled():
+        return 2048
+    return default
 
 
 def long_prefill_threshold(default: int = 0) -> int:
     """Per-request prefill cap for one v1 step (vLLM ``long_prefill_token_threshold``).
 
     Default **0** (inactive) when unset. Explicit ``INFINI_LONG_PREFILL_THRESHOLD``
-    wins; otherwise chunked prefill uses ``INFINI_PREFILL_CHUNK_SIZE`` as the
-    per-request cap only (shared step budget remains ``max_num_batched_tokens``).
+    wins; otherwise chunked prefill uses ``max_num_batched_tokens()`` as the
+    per-request cap (shared step budget).
     """
     raw = os.environ.get("INFINI_LONG_PREFILL_THRESHOLD")
     if raw:
         return int(raw)
     if prefill_chunked_enabled():
-        return prefill_chunk_size()
+        return max_num_batched_tokens()
     return default
 
 

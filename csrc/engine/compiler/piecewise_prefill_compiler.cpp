@@ -6,6 +6,7 @@
 #include "../compiled_prefill_flags.hpp"
 #include "../../global_state/piecewise_inductor_flags.hpp"
 #include "../../utils.hpp"
+#include "../dispatch_hist.hpp"
 #include "piecewise_bucket_policy.hpp"
 #include "attn_metadata_utils.hpp"
 
@@ -14,13 +15,47 @@
 #include <cstdlib>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 #include <spdlog/spdlog.h>
 #include "infinicore/context/context.hpp"
+#include "infinicore/graph/graph.hpp"
 #include "infinicore/ops/inductor_segment.hpp"
 
 namespace infinilm::engine {
 
 namespace {
+
+bool graph_capture_audit_enabled_() {
+    const char *v = std::getenv("INFINI_GRAPH_CAPTURE_AUDIT");
+    return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+}
+
+/// When MoE is device-capturable, post_attn must be a single hcGraph segment
+/// (true one-piece: o_proj+AR+LN+MoE). Fail fast under capture audit.
+void assert_post_one_device_seg_(
+    const char *where,
+    size_t layer,
+    const std::shared_ptr<infinicore::graph::Graph> &g) {
+    if (!graph_capture_audit_enabled_()
+        || !infinicore::context::moeTritonCaptureAllowed()
+        || !g) {
+        return;
+    }
+    const size_t n = g->device_segment_count();
+    if (n == 1) {
+        return;
+    }
+    spdlog::error(
+        "[capture_audit] {} layer={} post device_segments={} expected=1 "
+        "(MoE capturable — true one-piece post requires a single device seg)",
+        where,
+        layer,
+        n);
+    throw std::runtime_error(
+        std::string("[capture_audit] post device_segments!=1 when MoE capturable (")
+        + where + ")");
+}
 
 bool rank_worker_profile_enabled() {
     static int cached = -1;
@@ -353,6 +388,8 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
         {1, bucket, vocab_size}, dtype, infinicore::context::getDevice());
 
     // Eager warmup dry-run before capture (NONE-equivalent).
+    // Dry-run / capture use valid_seq_len==bucket (exact). Runtime mid-chunk
+    // with seq_len==graph_bucket shares this staging; pad-up does not.
     model_->native_piecewise_embed(graphs.input, hidden);
     for (size_t layer = 0; layer < capture_layers; ++layer) {
         model_->native_piecewise_pre_attn_layer(layer, graphs.input, hidden, residual);
@@ -403,6 +440,7 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
         infinicore::context::startGraphRecording();
         model_->native_piecewise_post_attn_cg_layer(layer, graphs.input, hidden, residual);
         graphs.post_attn[layer] = infinicore::context::stopGraphRecording();
+        assert_post_one_device_seg_("piecewise_prefill_post", layer, graphs.post_attn[layer]);
         barrier_->wait("piecewise_capture_post_attn_sync");
     }
 
@@ -663,9 +701,12 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         return std::nullopt;
     }
     const bool inductor_mode = infinilm::global_state::piecewise_inductor_segment_enabled();
-    // Mid-chunks must not replay CG pre/post under inductor: capture dry-run shapes
-    // assume final-chunk inductor staging; mid-chunk CG pre_attn SIGSEGVs at 2048
-    // (Gate D). Use eager infiniop pre/post so KV matches Case A boundary.
+    // Capture dry-run / CG capture set piecewise.valid_seq_len = bucket (exact-width
+    // staging). Runtime mid-chunk with !pad_up (seq_len == graph_bucket) matches that
+    // shape, so CG pre/post replay is safe — same as final exact-bucket. Pad-up still
+    // forces eager (PlannedMeta bakes valid_len==bucket). Historical Gate D SIGSEGV
+    // was from mismatched inductor mid-chunk staging; keep allow_inductor_pre_attn
+    // false for mid-chunk and replay device CG segments instead.
     const bool mid_chunk = !final_chunk;
     // Pad-up (seq_len < graph_bucket): CG PlannedMeta bakes valid_len==bucket at
     // capture; replaying that meta on a short chat SIGSEGVs. Use eager inductor
@@ -673,6 +714,15 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     const bool pad_up = seq_len != graph_bucket;
 
     auto &bucket_graphs = compiled_.at(graph_bucket);
+    // Step-level eager hist: pad_up > mid_chunk-eager > missing > exact_cg.
+    // Exact-bucket mid-chunk uses CG → exact_cg (mid_chunk alone no longer eager).
+    {
+        const bool missing_graph =
+            bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0]
+            || bucket_graphs.post_attn.empty() || !bucket_graphs.post_attn[0];
+        const bool mid_chunk_eager = false; // Phase 2: mid_chunk !pad_up → CG
+        dispatch_hist::record_piecewise_eager(pad_up, mid_chunk_eager, missing_graph);
+    }
     const double t_copy0 = profile ? monotonic_ms() : 0.0;
     copy_runtime_into_bucket_(bucket_graphs, input, seq_len);
     set_attn_metadata_for_varlen_batch(bucket_graphs.input, input);
@@ -711,17 +761,16 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
 
 
     const size_t num_layers = bucket_graphs.pre_attn.size();
-    // Mid-chunk: always eager pre/post under inductor (do not replay CG segments).
-    // Final-chunk inductor pre-attn needs the same eager post replay (B4 tail).
-    // Pad-up: always eager post/lm_head (CG PlannedMeta bakes full-bucket shapes).
+    // Eager pre/post only for pad_up or missing segment (or final inductor B4 post).
+    // Exact-bucket mid-chunk: CG pre/post replay (capture valid_seq_len==bucket).
     const bool use_eager_post =
         inductor_mode
-        && (mid_chunk || piecewise.allow_inductor_pre_attn);
+        && (pad_up || piecewise.allow_inductor_pre_attn);
     const bool use_eager_lm_head = inductor_mode && piecewise.allow_inductor_pre_attn;
     const bool use_eager_pre_attn_summary =
         inductor_mode
-        && (mid_chunk || pad_up
-            || (final_chunk && (bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0])));
+        && (pad_up
+            || (bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0]));
     const size_t slot_len = input.slot_mapping.has_value()
                                 ? input.slot_mapping.value()->shape()[0]
                                 : 0;
@@ -731,7 +780,7 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         const double t_layer0 = profile ? monotonic_ms() : 0.0;
         barrier_->wait("piecewise_replay_pre_attn");
         const bool use_eager_pre_attn =
-            inductor_mode && (mid_chunk || pad_up || !bucket_graphs.pre_attn[layer]);
+            inductor_mode && (pad_up || !bucket_graphs.pre_attn[layer]);
         if (use_eager_pre_attn) {
             model_->native_piecewise_pre_attn_layer(
                 layer, bucket_graphs.input, piecewise.hidden_states, piecewise.residual);

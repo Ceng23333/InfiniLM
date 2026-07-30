@@ -365,7 +365,7 @@ def host_split_report(label: str = "host_split") -> Dict[str, float]:
 
 
 def _moe_capture_safe_deprecated_warn() -> bool:
-    """INFINI_MOE_CAPTURE_SAFE is deprecated (Phase 1 — aten body removed).
+    """INFINI_MOE_CAPTURE_SAFE is hard-removed (Phase 1 — aten body deleted).
 
     Returns True if the env is truthy (so callers can log), but never selects
     an aten MoE body. Emits a one-shot warning.
@@ -377,8 +377,8 @@ def _moe_capture_safe_deprecated_warn() -> bool:
         import warnings
 
         warnings.warn(
-            "INFINI_MOE_CAPTURE_SAFE is deprecated: aten index_select+bmm MoE "
-            "capture escape removed (Phase 1). Use FORCE_CAPTURE + Triton "
+            "INFINI_MOE_CAPTURE_SAFE is hard-removed: aten index_select+bmm MoE "
+            "capture escape deleted (Phase 1). Use INFINI_MOE_INGRAPH + Triton "
             "fused_moe_routed, or host-break. Ignoring.",
             DeprecationWarning,
             stacklevel=2,
@@ -390,30 +390,48 @@ def _moe_capture_safe_deprecated_warn() -> bool:
 def _moe_triton_capture_enabled() -> bool:
     """Whether Triton fused_moe_routed may run under stream capture.
 
-    Defers to InfiniCore ``moe_triton_capture_allowed`` (FORCE_CAPTURE /
-    deprecated TRITON_CAPTURE alias + Decode; MetaX needs METAX_CAPTURE_UNSAFE).
-    ``INFINI_MOE_FORCE_HOST_BREAK=1`` forces off.
+    Defers to InfiniCore ``moe_triton_capture_allowed`` (``INFINI_MOE_INGRAPH``
+    phase allow-list; legacy FORCE/TRITON → decode; MetaX needs
+    ``METAX_INGRAPH_UNSAFE``). ``INFINI_MOE_FORCE_HOST_BREAK=1`` forces off.
     """
     raw_force = os.environ.get("INFINI_MOE_FORCE_HOST_BREAK", "").strip().lower()
     if raw_force in ("1", "true", "yes", "on"):
         return False
-    if os.environ.get("INFINI_MOE_TRITON_CAPTURE"):
+    # Legacy aliases → canonical (one release).
+    if os.environ.get("INFINI_MOE_TRITON_CAPTURE") or os.environ.get(
+        "INFINI_MOE_FORCE_CAPTURE"
+    ):
         import warnings
 
-        warnings.warn(
-            "INFINI_MOE_TRITON_CAPTURE is deprecated; treat truthy as "
-            "INFINI_MOE_FORCE_CAPTURE (Decode-only). MetaX also needs "
-            "INFINI_MOE_METAX_CAPTURE_UNSAFE=1 (MoE-in-graph garbles by default)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+        if not getattr(_moe_triton_capture_enabled, "_legacy_warned", False):
+            warnings.warn(
+                "INFINI_MOE_FORCE_CAPTURE / INFINI_MOE_TRITON_CAPTURE are "
+                "deprecated; shim to INFINI_MOE_INGRAPH=decode. Prefer "
+                "INFINI_MOE_INGRAPH=decode|prefill|both. MetaX also needs "
+                "INFINI_MOE_METAX_INGRAPH_UNSAFE=1",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _moe_triton_capture_enabled._legacy_warned = True  # type: ignore[attr-defined]
         if os.environ.get("INFINI_MOE_TRITON_CAPTURE", "").strip().lower() in (
             "1",
             "true",
             "yes",
             "on",
+        ) or os.environ.get("INFINI_MOE_FORCE_CAPTURE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         ):
-            os.environ.setdefault("INFINI_MOE_FORCE_CAPTURE", "1")
+            os.environ.setdefault("INFINI_MOE_INGRAPH", "decode")
+    if os.environ.get("INFINI_MOE_METAX_CAPTURE_UNSAFE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        os.environ.setdefault("INFINI_MOE_METAX_INGRAPH_UNSAFE", "1")
     try:
         from infinicore.lib import _infinicore as _ic
 
@@ -422,9 +440,14 @@ def _moe_triton_capture_enabled() -> bool:
     except Exception:  # noqa: BLE001
         pass
     # Fallback when C++ binding unavailable: non-eager policy only
-    # (phase is C++ TLS; under capture Decode guard is expected).
+    # (phase is C++ TLS; under capture Decode/Prefill guard is expected).
     policy = os.environ.get("INFINI_CUDAGRAPH_POLICY", "eager").strip().lower()
-    return policy not in ("", "eager") and _under_device_stream_capture()
+    ingraph = os.environ.get("INFINI_MOE_INGRAPH", "off").strip().lower()
+    return (
+        policy not in ("", "eager")
+        and ingraph in ("decode", "prefill", "both")
+        and _under_device_stream_capture()
+    )
 
 
 def _under_device_stream_capture() -> bool:
