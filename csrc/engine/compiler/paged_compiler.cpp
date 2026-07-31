@@ -5,15 +5,60 @@
 #include "attn_metadata_utils.hpp"
 
 #include "infinicore/context/context.hpp"
+#include "infinicore/dtype.hpp"
 #include "infinicore/graph/graph.hpp"
 
 #include <algorithm>
 #include <cstdlib>
+#include <infinirt.h>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
+#include <spdlog/spdlog.h>
 
 namespace infinilm::engine {
 namespace {
+
+size_t device_free_bytes_() {
+    const auto device = infinicore::context::getDevice();
+    size_t free_b = 0;
+    size_t total_b = 0;
+    const auto st = infinirtGetMemInfo(static_cast<infiniDevice_t>(device.getType()),
+                                       static_cast<int>(device.getIndex()),
+                                       &free_b,
+                                       &total_b);
+    if (st != INFINI_STATUS_SUCCESS) {
+        return 0;
+    }
+    return free_b;
+}
+
+size_t tensor_nbytes_(const infinicore::Tensor &t) {
+    return t ? t->nbytes() : 0;
+}
+
+size_t optional_tensor_nbytes_(const std::optional<infinicore::Tensor> &t) {
+    return t.has_value() ? tensor_nbytes_(t.value()) : 0;
+}
+
+size_t input_io_nbytes_(const InfinilmModel::Input &in) {
+    return optional_tensor_nbytes_(in.input_ids) + optional_tensor_nbytes_(in.position_ids)
+           + optional_tensor_nbytes_(in.past_sequence_lengths)
+           + optional_tensor_nbytes_(in.total_sequence_lengths)
+           + optional_tensor_nbytes_(in.input_offsets) + optional_tensor_nbytes_(in.cu_seqlens)
+           + optional_tensor_nbytes_(in.slot_mapping);
+}
+
+size_t compiled_arena_nbytes_(const PagedCompiler::Compiled &compiled) {
+    const auto &graph = std::get<0>(compiled);
+    return graph ? graph->capture_arena_bytes() : 0;
+}
+
+double bytes_to_gib_(size_t n) {
+    return static_cast<double>(n) / (1024.0 * 1024.0 * 1024.0);
+}
 
 std::vector<size_t> parse_decode_cg_batches_() {
     std::vector<size_t> batches;
@@ -66,15 +111,91 @@ PagedCompiler::PagedCompiler(const std::shared_ptr<InfinilmModel> &model, RankBa
         }());
 }
 
+void PagedCompiler::allocate_shared_decode_banks_(size_t max_batch) {
+    shared_decode_ = SharedDecodeBanks{};
+    shared_decode_.max_batch = max_batch;
+    const auto device = infinicore::context::getDevice();
+    shared_decode_.input_ids =
+        infinicore::Tensor::empty({1, max_batch}, infinicore::DataType::I64, device);
+    shared_decode_.position_ids =
+        infinicore::Tensor::empty({max_batch}, infinicore::DataType::I64, device);
+    shared_decode_.total_sequence_lengths =
+        infinicore::Tensor::empty({max_batch}, infinicore::DataType::I32, device);
+    shared_decode_.input_offsets =
+        infinicore::Tensor::empty({max_batch + 1}, infinicore::DataType::I32, device);
+    shared_decode_.cu_seqlens =
+        infinicore::Tensor::empty({max_batch + 1}, infinicore::DataType::I32, device);
+    shared_decode_.slot_mapping =
+        infinicore::Tensor::empty({max_batch}, infinicore::DataType::I64, device);
+    shared_decode_.io_physical_bytes =
+        tensor_nbytes_(shared_decode_.input_ids) + tensor_nbytes_(shared_decode_.position_ids)
+        + tensor_nbytes_(shared_decode_.total_sequence_lengths)
+        + tensor_nbytes_(shared_decode_.input_offsets) + tensor_nbytes_(shared_decode_.cu_seqlens)
+        + tensor_nbytes_(shared_decode_.slot_mapping);
+    spdlog::info(
+        "paged decode CG: shared max-batch banks max_batch={} io_GiB={:.3f}",
+        max_batch,
+        bytes_to_gib_(shared_decode_.io_physical_bytes));
+}
+
+InfinilmModel::Input PagedCompiler::make_decode_input_(size_t batch, size_t nblocks) const {
+    if (!shared_decode_.input_ids || batch > shared_decode_.max_batch) {
+        throw std::runtime_error("make_decode_input_: shared decode banks missing");
+    }
+    InfinilmModel::Input input;
+    input.input_ids = shared_decode_.input_ids->narrow({{1, 0, batch}});
+    input.position_ids = shared_decode_.position_ids->narrow({{0, 0, batch}});
+    input.total_sequence_lengths = shared_decode_.total_sequence_lengths->narrow({{0, 0, batch}});
+    input.input_offsets = shared_decode_.input_offsets->narrow({{0, 0, batch + 1}});
+    input.cu_seqlens = shared_decode_.cu_seqlens->narrow({{0, 0, batch + 1}});
+    input.slot_mapping = shared_decode_.slot_mapping->narrow({{0, 0, batch}});
+    set_zeros(input.input_ids.value());
+    set_zeros(input.position_ids.value());
+    set_zeros(input.total_sequence_lengths.value());
+    set_zeros(input.slot_mapping.value());
+    std::vector<int32_t> total_sequence_lengths_vec(batch, 1);
+    infinicore::context::memcpyH2D(
+        input.total_sequence_lengths.value()->data(),
+        total_sequence_lengths_vec.data(),
+        batch * sizeof(int32_t),
+        false);
+    std::vector<int32_t> input_offsets_vec(batch + 1, 0);
+    for (size_t i = 0; i <= batch; i++) {
+        input_offsets_vec[i] = static_cast<int32_t>(i);
+    }
+    infinicore::context::memcpyH2D(
+        input.input_offsets.value()->data(),
+        input_offsets_vec.data(),
+        (batch + 1) * sizeof(int32_t),
+        false);
+    infinicore::context::memcpyH2D(
+        input.cu_seqlens.value()->data(),
+        input_offsets_vec.data(),
+        (batch + 1) * sizeof(int32_t),
+        false);
+    const size_t block_per_req = nblocks;
+    input.block_tables =
+        block_tables_holder_->as_strided({batch, block_per_req}, {(ptrdiff_t)block_per_req, 1});
+    return input;
+}
+
 void PagedCompiler::compile() {
     if (model_->get_cache_config() != nullptr && dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())) {
-        size_t nblocks = dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())->num_blocks();
+        const auto *paged_config =
+            dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config());
+        size_t nblocks = paged_config->num_blocks();
+        const size_t block_size = paged_config->block_size();
         size_t max_batch_size = *std::max_element(decode_batch_sizes_.begin(), decode_batch_sizes_.end());
         compiled_map_decode_.clear();
         block_tables_holder_ = infinicore::Tensor::empty(
             {nblocks * max_batch_size}, infinicore::DataType::I32, infinicore::context::getDevice());
         set_zeros(block_tables_holder_);
+        allocate_shared_decode_banks_(max_batch_size);
         const auto &rank_info = infinilm::global_state::get_tensor_model_parallel_rank_info();
+        const size_t free_before = device_free_bytes_();
+        // Capture largest batch first (prefix-view I/O bank is max-sized).
+        std::vector<size_t> capture_order = decode_batch_sizes_;
+        std::sort(capture_order.begin(), capture_order.end(), std::greater<size_t>());
         if (rank_info.tp_size > 1 && !decode_cg_tp_enabled()) {
             spdlog::info(
                 "paged decode CG: skip capture (tp_size={} > 1; decode graphs are eager-only under TP; "
@@ -91,35 +212,12 @@ void PagedCompiler::compile() {
                     "paged decode CG: capturing under TP (tp_size={}, INFINI_DECODE_CG_TP=1)",
                     rank_info.tp_size);
             }
-        for (size_t b : decode_batch_sizes_) {
-            InfinilmModel::Input input;
-            input.input_ids = infinicore::Tensor::empty({1, b}, infinicore::DataType::I64, infinicore::context::getDevice());
-            input.position_ids = infinicore::Tensor::empty({b}, infinicore::DataType::I64, infinicore::context::getDevice());
-            input.total_sequence_lengths = infinicore::Tensor::empty({b}, infinicore::DataType::I32, infinicore::context::getDevice());
-            set_zeros(input.input_ids.value());
-            set_zeros(input.position_ids.value());
-            set_zeros(input.total_sequence_lengths.value());
-            std::vector<int32_t> total_sequence_lengths_vec(b, 1);
-            infinicore::context::memcpyH2D(input.total_sequence_lengths.value()->data(), total_sequence_lengths_vec.data(), b * sizeof(int32_t), false);
-            input.input_offsets = infinicore::Tensor::empty({b + 1}, infinicore::DataType::I32, infinicore::context::getDevice());
-            std::vector<int32_t> input_offsets_vec(b + 1, 0);
-            for (size_t i = 0; i <= b; i++) {
-                input_offsets_vec[i] = i;
+            for (size_t b : capture_order) {
+                InfinilmModel::Input input = make_decode_input_(b, nblocks);
+                attn_metadata_utils::set_attn_metadata(input);
+                barrier_->wait();
+                compiled_map_decode_[b] = capture_forward_graph_(std::move(input));
             }
-            infinicore::context::memcpyH2D(input.input_offsets.value()->data(), input_offsets_vec.data(), (b + 1) * sizeof(int32_t), false);
-            input.cu_seqlens = infinicore::Tensor::empty({b + 1}, infinicore::DataType::I32, infinicore::context::getDevice());
-            infinicore::context::memcpyH2D(input.cu_seqlens.value()->data(), input_offsets_vec.data(), (b + 1) * sizeof(int32_t), false);
-            const size_t block_per_req = nblocks;
-            input.block_tables = block_tables_holder_->as_strided({b, block_per_req}, {(ptrdiff_t)block_per_req, 1});
-            input.slot_mapping = infinicore::Tensor::empty({b}, infinicore::DataType::I64, infinicore::context::getDevice());
-            set_zeros(input.slot_mapping.value());
-
-            // Attention reads attn_metadata from thread-local forward context.
-            attn_metadata_utils::set_attn_metadata(input);
-
-            barrier_->wait();
-            compiled_map_decode_[b] = capture_forward_graph_(std::move(input));
-        }
         }
 
         // Prefill graphs: one capture per bucket (MVP: 4096 full prefill, batch_size == 1).
@@ -164,6 +262,69 @@ void PagedCompiler::compile() {
             compiled_map_prefill_[seq_bucket] = capture_forward_graph_(std::move(input));
         }
         }
+
+        infinicore::context::syncDevice();
+        // Physical I/O = shared max decode bank (O(max)).
+        size_t io_bytes = tensor_nbytes_(block_tables_holder_) + shared_decode_.io_physical_bytes;
+        size_t arena_bytes = 0;
+        for (const auto &kv : compiled_map_decode_) {
+            arena_bytes += compiled_arena_nbytes_(kv.second.compiled);
+        }
+        for (const auto &kv : compiled_map_prefill_) {
+            io_bytes += input_io_nbytes_(kv.second.input);
+            arena_bytes += compiled_arena_nbytes_(kv.second.compiled);
+        }
+        const size_t free_after = device_free_bytes_();
+        const size_t free_delta =
+            free_before >= free_after ? free_before - free_after : 0;
+        spdlog::info(
+            "cg_mem_budget tag=paged_decode batches={} staging_bytes=0 io_bytes={} "
+            "staging_io_bytes={} arena_bytes={} free_delta_bytes={} "
+            "staging_GiB=0.000 io_GiB={:.3f} staging_io_GiB={:.3f} arena_GiB={:.3f} "
+            "free_delta_GiB={:.3f}",
+            compiled_map_decode_.size(),
+            io_bytes,
+            io_bytes,
+            arena_bytes,
+            free_delta,
+            bytes_to_gib_(io_bytes),
+            bytes_to_gib_(io_bytes),
+            bytes_to_gib_(arena_bytes),
+            bytes_to_gib_(free_delta));
+
+        // M4: fold measured CG bytes into serve headroom vs NUM_BLOCKS (vLLM-style
+        // cuda_graph_memory_bytes accounting). KV is already allocated; log equivalent
+        // block cost so operators / auto-sizers can reserve headroom.
+        const size_t cg_total_bytes = io_bytes + arena_bytes;
+        size_t bytes_per_block = 0;
+        const auto &model_config = infinilm::global_state::get_infinilm_config().model_config;
+        if (model_config) {
+            const size_t layers = model_config->get<size_t>("num_hidden_layers");
+            const size_t tp = std::max<size_t>(
+                1,
+                static_cast<size_t>(
+                    infinilm::global_state::get_tensor_model_parallel_world_size()));
+            const size_t total_kv = model_config->get<size_t>("num_key_value_heads");
+            const size_t num_kv = total_kv < tp ? 1 : total_kv / tp;
+            const size_t head_dim = model_config->get_head_dim();
+            const size_t elem = infinicore::dsize(model_config->get_kv_cache_dtype());
+            bytes_per_block = layers * 2 * block_size * num_kv * head_dim * elem;
+        }
+        const size_t cg_as_blocks =
+            (bytes_per_block > 0) ? (cg_total_bytes + bytes_per_block - 1) / bytes_per_block : 0;
+        const size_t headroom_blocks =
+            nblocks > cg_as_blocks ? nblocks - cg_as_blocks : 0;
+        spdlog::info(
+            "cg_kv_budget tag=paged_decode num_blocks={} block_size={} "
+            "cg_total_bytes={} bytes_per_kv_block={} cg_as_blocks={} "
+            "kv_headroom_blocks={} cg_total_GiB={:.3f}",
+            nblocks,
+            block_size,
+            cg_total_bytes,
+            bytes_per_block,
+            cg_as_blocks,
+            headroom_blocks,
+            bytes_to_gib_(cg_total_bytes));
     }
 }
 

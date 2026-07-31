@@ -14,10 +14,12 @@
 #include <chrono>
 #include <cstdlib>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <spdlog/spdlog.h>
+#include <infinirt.h>
 #include "infinicore/context/context.hpp"
 #include "infinicore/graph/graph.hpp"
 #include "infinicore/ops/inductor_segment.hpp"
@@ -134,6 +136,43 @@ double monotonic_ms() {
     return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
 }
 
+size_t device_free_bytes_() {
+    const auto device = infinicore::context::getDevice();
+    size_t free_b = 0;
+    size_t total_b = 0;
+    const auto st = infinirtGetMemInfo(static_cast<infiniDevice_t>(device.getType()),
+                                       static_cast<int>(device.getIndex()),
+                                       &free_b,
+                                       &total_b);
+    if (st != INFINI_STATUS_SUCCESS) {
+        return 0;
+    }
+    return free_b;
+}
+
+size_t tensor_nbytes_(const infinicore::Tensor &t) {
+    return t ? t->nbytes() : 0;
+}
+
+size_t graph_arena_nbytes_(const std::shared_ptr<infinicore::graph::Graph> &g) {
+    return g ? g->capture_arena_bytes() : 0;
+}
+
+size_t bucket_arena_nbytes_(const PiecewisePrefillCompiler::BucketGraphs &g) {
+    size_t n = graph_arena_nbytes_(g.lm_head);
+    for (const auto &seg : g.pre_attn) {
+        n += graph_arena_nbytes_(seg);
+    }
+    for (const auto &seg : g.post_attn) {
+        n += graph_arena_nbytes_(seg);
+    }
+    return n;
+}
+
+double bytes_to_gib_(size_t n) {
+    return static_cast<double>(n) / (1024.0 * 1024.0 * 1024.0);
+}
+
 size_t compute_prefill_len(const InfinilmModel::Input &input) {
     if (input.input_offsets.has_value()) {
         const auto &offsets = input.input_offsets.value();
@@ -236,15 +275,17 @@ PiecewisePrefillCompiler::PiecewisePrefillCompiler(const std::shared_ptr<Infinil
     std::sort(capture_buckets_.begin(), capture_buckets_.end(), std::greater<size_t>());
 }
 
-void PiecewisePrefillCompiler::allocate_layer_staging_(size_t bucket, size_t num_layers) {
-    auto &piecewise = infinilm::global_state::get_forward_context().piecewise;
-    piecewise.bucket_seq_len = bucket;
-    piecewise.layer_staging.clear();
-    piecewise.layer_staging.resize(num_layers);
+void PiecewisePrefillCompiler::allocate_shared_banks_(size_t max_bucket,
+                                                      size_t num_layers,
+                                                      size_t n_req) {
+    shared_banks_ = SharedPrefillBanks{};
+    shared_banks_.max_bucket = max_bucket;
+    shared_banks_.num_layers = num_layers;
     const auto device = infinicore::context::getDevice();
     const auto &model_config = infinilm::global_state::get_infinilm_config().model_config;
     const auto dtype = model_config->get_dtype();
     const size_t hidden = model_config->get<size_t>("hidden_size");
+    const size_t vocab_size = model_config->get<size_t>("vocab_size");
     const size_t tp_size = std::max<size_t>(
         1, static_cast<size_t>(infinilm::global_state::get_tensor_model_parallel_world_size()));
     const size_t num_heads = model_config->get<size_t>("num_attention_heads") / static_cast<size_t>(tp_size);
@@ -252,25 +293,98 @@ void PiecewisePrefillCompiler::allocate_layer_staging_(size_t bucket, size_t num
     const size_t num_kv_heads = total_kv < tp_size ? 1 : total_kv / tp_size;
     const size_t head_dim = model_config->get_head_dim();
 
+    shared_banks_.layer_staging.resize(num_layers);
     for (size_t i = 0; i < num_layers; ++i) {
-        auto &st = piecewise.layer_staging[i];
-        st.q_rope = infinicore::Tensor::empty({1, bucket, num_heads, head_dim}, dtype, device);
-        st.k_rope = infinicore::Tensor::empty({1, bucket, num_kv_heads, head_dim}, dtype, device);
-        st.v_rope = infinicore::Tensor::empty({1, bucket, num_kv_heads, head_dim}, dtype, device);
-        st.attn_output = infinicore::Tensor::empty({1, bucket, num_heads * head_dim}, dtype, device);
+        auto &st = shared_banks_.layer_staging[i];
+        st.q_rope = infinicore::Tensor::empty({1, max_bucket, num_heads, head_dim}, dtype, device);
+        st.k_rope = infinicore::Tensor::empty({1, max_bucket, num_kv_heads, head_dim}, dtype, device);
+        st.v_rope = infinicore::Tensor::empty({1, max_bucket, num_kv_heads, head_dim}, dtype, device);
+        st.attn_output = infinicore::Tensor::empty({1, max_bucket, num_heads * head_dim}, dtype, device);
     }
-    piecewise.hidden_states = infinicore::Tensor::empty({1, bucket, hidden}, dtype, device);
-    piecewise.residual = infinicore::Tensor::empty({1, bucket, hidden}, dtype, device);
-    piecewise.ar_staging = infinicore::Tensor::empty({1, bucket, hidden}, dtype, device);
+    shared_banks_.hidden_states = infinicore::Tensor::empty({1, max_bucket, hidden}, dtype, device);
+    shared_banks_.residual = infinicore::Tensor::empty({1, max_bucket, hidden}, dtype, device);
+    shared_banks_.ar_staging = infinicore::Tensor::empty({1, max_bucket, hidden}, dtype, device);
+
+    shared_banks_.input_ids =
+        infinicore::Tensor::empty({1, max_bucket}, infinicore::DataType::I64, device);
+    shared_banks_.position_ids =
+        infinicore::Tensor::empty({max_bucket}, infinicore::DataType::I64, device);
+    shared_banks_.slot_mapping =
+        infinicore::Tensor::empty({max_bucket}, infinicore::DataType::I64, device);
+    shared_banks_.past_sequence_lengths =
+        infinicore::Tensor::empty({n_req}, infinicore::DataType::I32, device);
+    shared_banks_.total_sequence_lengths =
+        infinicore::Tensor::empty({n_req}, infinicore::DataType::I32, device);
+    shared_banks_.input_offsets =
+        infinicore::Tensor::empty({n_req + 1}, infinicore::DataType::I32, device);
+    shared_banks_.cu_seqlens =
+        infinicore::Tensor::empty({n_req + 1}, infinicore::DataType::I32, device);
+    shared_banks_.logits_holder =
+        infinicore::Tensor::empty({1, max_bucket, vocab_size}, dtype, device);
+
+    size_t staging = tensor_nbytes_(shared_banks_.hidden_states)
+                     + tensor_nbytes_(shared_banks_.residual)
+                     + tensor_nbytes_(shared_banks_.ar_staging);
+    for (const auto &st : shared_banks_.layer_staging) {
+        staging += tensor_nbytes_(st.q_rope) + tensor_nbytes_(st.k_rope)
+                   + tensor_nbytes_(st.v_rope) + tensor_nbytes_(st.attn_output);
+    }
+    const size_t io = tensor_nbytes_(shared_banks_.input_ids)
+                      + tensor_nbytes_(shared_banks_.position_ids)
+                      + tensor_nbytes_(shared_banks_.slot_mapping)
+                      + tensor_nbytes_(shared_banks_.past_sequence_lengths)
+                      + tensor_nbytes_(shared_banks_.total_sequence_lengths)
+                      + tensor_nbytes_(shared_banks_.input_offsets)
+                      + tensor_nbytes_(shared_banks_.cu_seqlens)
+                      + tensor_nbytes_(shared_banks_.logits_holder);
+    shared_banks_.staging_physical_bytes = staging;
+    shared_banks_.io_physical_bytes = io;
+    spdlog::info(
+        "native piecewise CG: shared max-bucket banks max_bucket={} layers={} "
+        "staging_GiB={:.3f} io_GiB={:.3f}",
+        max_bucket,
+        num_layers,
+        bytes_to_gib_(staging),
+        bytes_to_gib_(io));
+}
+
+void PiecewisePrefillCompiler::bind_bucket_staging_(size_t bucket, size_t num_layers) {
+    if (!shared_banks_.hidden_states || bucket > shared_banks_.max_bucket) {
+        throw std::runtime_error(
+            "bind_bucket_staging_: shared banks missing or bucket exceeds max");
+    }
+    if (num_layers > shared_banks_.num_layers) {
+        throw std::runtime_error("bind_bucket_staging_: num_layers exceeds shared bank");
+    }
+    auto &piecewise = infinilm::global_state::get_forward_context().piecewise;
+    piecewise.bucket_seq_len = bucket;
+    piecewise.layer_staging.clear();
+    piecewise.layer_staging.resize(num_layers);
+    for (size_t i = 0; i < num_layers; ++i) {
+        const auto &src = shared_banks_.layer_staging[i];
+        auto &st = piecewise.layer_staging[i];
+        st.q_rope = src.q_rope->narrow({{1, 0, bucket}});
+        st.k_rope = src.k_rope->narrow({{1, 0, bucket}});
+        st.v_rope = src.v_rope->narrow({{1, 0, bucket}});
+        st.attn_output = src.attn_output->narrow({{1, 0, bucket}});
+    }
+    piecewise.hidden_states = shared_banks_.hidden_states->narrow({{1, 0, bucket}});
+    piecewise.residual = shared_banks_.residual->narrow({{1, 0, bucket}});
+    piecewise.ar_staging = shared_banks_.ar_staging->narrow({{1, 0, bucket}});
 }
 
 InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket, size_t nblocks, size_t n_req) const {
+    if (!shared_banks_.input_ids || bucket > shared_banks_.max_bucket) {
+        throw std::runtime_error("make_bucket_input_: shared I/O banks not allocated");
+    }
     InfinilmModel::Input input;
-    const auto device = infinicore::context::getDevice();
-    input.input_ids = infinicore::Tensor::empty({1, bucket}, infinicore::DataType::I64, device);
-    input.position_ids = infinicore::Tensor::empty({bucket}, infinicore::DataType::I64, device);
-    input.past_sequence_lengths = infinicore::Tensor::empty({n_req}, infinicore::DataType::I32, device);
-    input.total_sequence_lengths = infinicore::Tensor::empty({n_req}, infinicore::DataType::I32, device);
+    input.input_ids = shared_banks_.input_ids->narrow({{1, 0, bucket}});
+    input.position_ids = shared_banks_.position_ids->narrow({{0, 0, bucket}});
+    input.past_sequence_lengths = shared_banks_.past_sequence_lengths;
+    input.total_sequence_lengths = shared_banks_.total_sequence_lengths;
+    input.input_offsets = shared_banks_.input_offsets;
+    input.cu_seqlens = shared_banks_.cu_seqlens;
+    input.slot_mapping = shared_banks_.slot_mapping->narrow({{0, 0, bucket}});
     set_zeros(input.input_ids.value());
     set_zeros(input.past_sequence_lengths.value());
     set_zeros(input.total_sequence_lengths.value());
@@ -296,7 +410,6 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
         n_req * sizeof(int32_t),
         false);
 
-    input.input_offsets = infinicore::Tensor::empty({n_req + 1}, infinicore::DataType::I32, device);
     std::vector<int32_t> input_offsets_vec(n_req + 1, 0);
     const int32_t per_req = static_cast<int32_t>(bucket / std::max<size_t>(1, n_req));
     for (size_t i = 0; i <= n_req; ++i) {
@@ -309,7 +422,6 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
         (n_req + 1) * sizeof(int32_t),
         false);
 
-    input.cu_seqlens = infinicore::Tensor::empty({n_req + 1}, infinicore::DataType::I32, device);
     std::vector<int32_t> cu_seqlens_vec(n_req + 1, 0);
     for (size_t i = 0; i <= n_req; ++i) {
         cu_seqlens_vec[i] = static_cast<int32_t>(std::min<size_t>(bucket, i * per_req));
@@ -337,7 +449,6 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
             row_tensor->data(), block_row.data(), block_per_req * sizeof(int32_t), false);
     }
 
-    input.slot_mapping = infinicore::Tensor::empty({bucket}, infinicore::DataType::I64, device);
     std::vector<int64_t> slot_mapping_vec(bucket);
     std::iota(slot_mapping_vec.begin(), slot_mapping_vec.end(), int64_t{0});
     infinicore::context::memcpyH2D(
@@ -361,7 +472,7 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
 
     const size_t nblocks = dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())->num_blocks();
     const size_t num_layers = model_->native_piecewise_num_layers();
-    allocate_layer_staging_(bucket, num_layers);
+    bind_bucket_staging_(bucket, num_layers);
     auto bucket_input = make_bucket_input_(bucket, nblocks, max_capture_req_);
     set_attn_metadata(bucket_input);
 
@@ -381,11 +492,7 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
         capture_layers = std::min(num_layers, static_cast<size_t>(std::stoul(raw)));
     }
 
-    const auto &model_config = infinilm::global_state::get_infinilm_config().model_config;
-    const auto dtype = model_config->get_dtype();
-    const size_t vocab_size = model_config->get<size_t>("vocab_size");
-    graphs.logits_holder = infinicore::Tensor::empty(
-        {1, bucket, vocab_size}, dtype, infinicore::context::getDevice());
+    graphs.logits_holder = shared_banks_.logits_holder->narrow({{1, 0, bucket}});
 
     // Eager warmup dry-run before capture (NONE-equivalent).
     // Dry-run / capture use valid_seq_len==bucket (exact). Runtime mid-chunk
@@ -475,7 +582,7 @@ void PiecewisePrefillCompiler::warmup_inductor_segments_(size_t nblocks, size_t 
         if (!infinilm::global_state::bucket_is_inductor_eligible(bucket)) {
             continue;
         }
-        allocate_layer_staging_(bucket, num_layers);
+        bind_bucket_staging_(bucket, num_layers);
         auto bucket_input = make_bucket_input_(bucket, nblocks, n_req);
         const auto &positions = bucket_input.position_ids.value();
         auto positions_padded = infinicore::Tensor::zeros(
@@ -541,9 +648,14 @@ void PiecewisePrefillCompiler::compile() {
     block_tables_holder_ = infinicore::Tensor::empty(
         {max_capture_req_ * nblocks}, infinicore::DataType::I32, infinicore::context::getDevice());
     set_zeros(block_tables_holder_);
+    const size_t num_layers = model_->native_piecewise_num_layers();
+    const size_t free_before = device_free_bytes_();
+    // M2: allocate shared banks before inductor warmup so warmup also uses prefix views.
+    allocate_shared_banks_(max_bucket, num_layers, max_capture_req_);
     spdlog::info(
-        "native piecewise CG: capture warmup n_req={} (metadata only, hidden [1,bucket])",
-        max_capture_req_);
+        "native piecewise CG: capture warmup n_req={} (metadata only, hidden [1,bucket] shared max={})",
+        max_capture_req_,
+        max_bucket);
 
     const int tp_rank = infinilm::global_state::get_tensor_model_parallel_rank();
     const int tp_size = infinilm::global_state::get_tensor_model_parallel_world_size();
@@ -561,6 +673,20 @@ void PiecewisePrefillCompiler::compile() {
         capture_bucket_(bucket);
         infinicore::context::syncDevice();
     }
+    infinicore::context::syncDevice();
+    const size_t free_after = device_free_bytes_();
+    // Physical staging/I-O = shared max bank (O(max)); arenas = MoE scratch via
+    // shared Python workspace after M3 (still summed per Graph CaptureArena).
+    const size_t staging_bytes = shared_banks_.staging_physical_bytes;
+    const size_t io_bytes =
+        shared_banks_.io_physical_bytes + tensor_nbytes_(block_tables_holder_);
+    size_t arena_bytes = 0;
+    for (const auto &kv : compiled_) {
+        arena_bytes += bucket_arena_nbytes_(kv.second);
+    }
+    const size_t staging_io_bytes = staging_bytes + io_bytes;
+    const size_t free_delta =
+        free_before >= free_after ? free_before - free_after : 0;
     std::ostringstream oss;
     for (size_t i = 0; i < capture_buckets_.size(); ++i) {
         if (i > 0) {
@@ -570,6 +696,23 @@ void PiecewisePrefillCompiler::compile() {
     }
     spdlog::info("native piecewise CG: capture_buckets=[{}] max_seq={}",
                  oss.str(), max_seq_len_);
+    // M1: greppable one-line CG VRAM split (before /health). Staging is physical O(max) after M2.
+    spdlog::info(
+        "cg_mem_budget tag=piecewise_prefill buckets={} staging_bytes={} io_bytes={} "
+        "staging_io_bytes={} arena_bytes={} free_delta_bytes={} "
+        "staging_GiB={:.3f} io_GiB={:.3f} staging_io_GiB={:.3f} arena_GiB={:.3f} "
+        "free_delta_GiB={:.3f}",
+        compiled_.size(),
+        staging_bytes,
+        io_bytes,
+        staging_io_bytes,
+        arena_bytes,
+        free_delta,
+        bytes_to_gib_(staging_bytes),
+        bytes_to_gib_(io_bytes),
+        bytes_to_gib_(staging_io_bytes),
+        bytes_to_gib_(arena_bytes),
+        bytes_to_gib_(free_delta));
 }
 
 size_t PiecewisePrefillCompiler::padded_bucket_for(size_t seq_len) const {
@@ -701,12 +844,9 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         return std::nullopt;
     }
     const bool inductor_mode = infinilm::global_state::piecewise_inductor_segment_enabled();
-    // Capture dry-run / CG capture set piecewise.valid_seq_len = bucket (exact-width
-    // staging). Runtime mid-chunk with !pad_up (seq_len == graph_bucket) matches that
-    // shape, so CG pre/post replay is safe — same as final exact-bucket. Pad-up still
-    // forces eager (PlannedMeta bakes valid_len==bucket). Historical Gate D SIGSEGV
-    // was from mismatched inductor mid-chunk staging; keep allow_inductor_pre_attn
-    // false for mid-chunk and replay device CG segments instead.
+    // Mid-chunks must not replay CG pre/post under inductor: capture dry-run shapes
+    // assume final-chunk inductor staging; mid-chunk CG pre_attn SIGSEGVs at 2048
+    // (Gate D). Phase 2 deferred — keep eager pre/post for mid_chunk.
     const bool mid_chunk = !final_chunk;
     // Pad-up (seq_len < graph_bucket): CG PlannedMeta bakes valid_len==bucket at
     // capture; replaying that meta on a short chat SIGSEGVs. Use eager inductor
@@ -714,13 +854,12 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     const bool pad_up = seq_len != graph_bucket;
 
     auto &bucket_graphs = compiled_.at(graph_bucket);
-    // Step-level eager hist: pad_up > mid_chunk-eager > missing > exact_cg.
-    // Exact-bucket mid-chunk uses CG → exact_cg (mid_chunk alone no longer eager).
+    // Step-level eager hist: pad_up > mid_chunk > missing > exact_cg.
     {
         const bool missing_graph =
             bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0]
             || bucket_graphs.post_attn.empty() || !bucket_graphs.post_attn[0];
-        const bool mid_chunk_eager = false; // Phase 2: mid_chunk !pad_up → CG
+        const bool mid_chunk_eager = mid_chunk; // Phase 2 skipped: mid_chunk still eager
         dispatch_hist::record_piecewise_eager(pad_up, mid_chunk_eager, missing_graph);
     }
     const double t_copy0 = profile ? monotonic_ms() : 0.0;
@@ -761,16 +900,17 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
 
 
     const size_t num_layers = bucket_graphs.pre_attn.size();
-    // Eager pre/post only for pad_up or missing segment (or final inductor B4 post).
-    // Exact-bucket mid-chunk: CG pre/post replay (capture valid_seq_len==bucket).
+    // Mid-chunk: always eager pre/post under inductor (Gate D; Phase 2 deferred).
+    // Final-chunk inductor pre-attn needs the same eager post replay (B4 tail).
+    // Pad-up: always eager post/lm_head (CG PlannedMeta bakes full-bucket shapes).
     const bool use_eager_post =
         inductor_mode
-        && (pad_up || piecewise.allow_inductor_pre_attn);
+        && (mid_chunk || piecewise.allow_inductor_pre_attn);
     const bool use_eager_lm_head = inductor_mode && piecewise.allow_inductor_pre_attn;
     const bool use_eager_pre_attn_summary =
         inductor_mode
-        && (pad_up
-            || (bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0]));
+        && (mid_chunk || pad_up
+            || (final_chunk && (bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0])));
     const size_t slot_len = input.slot_mapping.has_value()
                                 ? input.slot_mapping.value()->shape()[0]
                                 : 0;
@@ -780,7 +920,7 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         const double t_layer0 = profile ? monotonic_ms() : 0.0;
         barrier_->wait("piecewise_replay_pre_attn");
         const bool use_eager_pre_attn =
-            inductor_mode && (pad_up || !bucket_graphs.pre_attn[layer]);
+            inductor_mode && (mid_chunk || pad_up || !bucket_graphs.pre_attn[layer]);
         if (use_eager_pre_attn) {
             model_->native_piecewise_pre_attn_layer(
                 layer, bucket_graphs.input, piecewise.hidden_states, piecewise.residual);

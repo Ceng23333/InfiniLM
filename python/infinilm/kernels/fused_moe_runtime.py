@@ -967,20 +967,38 @@ class _RoutedWorkspace:
         need13 = num_tokens * top_k * max(N2, H)
         need2 = num_tokens * top_k * N
         need_out = num_tokens * H
-        # Under hcStream capture: always allocate IC-backed temps (do not reuse
-        # torch.empty caches from pre-capture warmup — those are not arena-owned).
+        # Under hcStream capture: share one max-sized IC arena bank across all
+        # MoE-in-graph segments/buckets (M3). Largest-first capture grows the bank
+        # once; later captures reuse the same data_ptr via prefix views so
+        # CaptureArena bytes stay near O(max) instead of O(segs×buckets).
         if _under_device_stream_capture():
-            cache13 = _empty_capture(need13, dtype=dtype, device=device)
-            cache2 = _empty_capture(need2, dtype=dtype, device=device)
-            out_buf = _empty_capture(need_out, dtype=dtype, device=device)
-            intermediate_cache1 = cache13[: num_tokens * top_k * N2].view(
+            if (
+                self.cache13 is None
+                or self.device != device
+                or self.dtype != dtype
+                or self.cap13 < need13
+            ):
+                self.cache13 = _empty_capture(need13, dtype=dtype, device=device)
+                self.cap13 = need13
+                self.device = device
+                self.dtype = dtype
+            if self.cache2 is None or self.cap2 < need2:
+                self.cache2 = _empty_capture(need2, dtype=dtype, device=device)
+                self.cap2 = need2
+            if self.out is None or self.cap_out < need_out:
+                self.out = _empty_capture(need_out, dtype=dtype, device=device)
+                self.cap_out = need_out
+            # Re-retain on the active arena so each DeviceGraph keeps the bank alive
+            # even if the allocating segment's Graph is destroyed first.
+            _retain_capture(self.cache13, self.cache2, self.out)
+            intermediate_cache1 = self.cache13[: num_tokens * top_k * N2].view(
                 num_tokens, top_k, N2
             )
-            intermediate_cache3 = cache13[: num_tokens * top_k * H].view(
+            intermediate_cache3 = self.cache13[: num_tokens * top_k * H].view(
                 num_tokens, top_k, H
             )
-            intermediate_cache2 = cache2[:need2].view(num_tokens * top_k, N)
-            out = out_buf[:need_out].view(num_tokens, H)
+            intermediate_cache2 = self.cache2[:need2].view(num_tokens * top_k, N)
+            out = self.out[:need_out].view(num_tokens, H)
             return intermediate_cache1, intermediate_cache2, intermediate_cache3, out
         if (
             self.cache13 is None

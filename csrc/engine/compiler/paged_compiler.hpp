@@ -37,13 +37,28 @@ public:
         std::shared_ptr<std::vector<global_state::DeferredAllreduce>> post_graph_allreduces;
     };
 
+    /// M4: max-batch decode I/O bank; smaller batches use prefix views.
+    struct SharedDecodeBanks {
+        size_t max_batch{0};
+        size_t io_physical_bytes{0};
+        infinicore::Tensor input_ids;
+        infinicore::Tensor position_ids;
+        infinicore::Tensor total_sequence_lengths;
+        infinicore::Tensor input_offsets;
+        infinicore::Tensor cu_seqlens;
+        infinicore::Tensor slot_mapping;
+    };
+
 private:
     CompiledResult capture_forward_graph_(InfinilmModel::Input input);
+    void allocate_shared_decode_banks_(size_t max_batch);
+    InfinilmModel::Input make_decode_input_(size_t batch, size_t nblocks) const;
 
     std::vector<size_t> decode_batch_sizes_;
     std::vector<size_t> prefill_seq_buckets_{4096};
 
     infinicore::Tensor block_tables_holder_;
+    SharedDecodeBanks shared_decode_;
 
     std::unordered_map<
         size_t, // num_requests
