@@ -763,15 +763,26 @@ void PiecewisePrefillCompiler::copy_runtime_into_bucket_(BucketGraphs &bucket_gr
     graph_input.cu_seqlens.value()
         ->narrow({{0, 0, runtime_n_req + 1}})
         ->copy_from(runtime.cu_seqlens.value());
-    // Zero-pad unused req rows in offsets/cu_seqlens (compiled width > runtime).
+    // Pad unused capture-width rows with the last cumulative value (not zeros).
+    // Zero-fill would make cu_seqlens/input_offsets non-monotonic
+    // (…, total_tokens, 0, …) → negative FA varlen spans if anything reads
+    // compiled_n_req width.
     if (runtime_n_req < compiled_n_req) {
         const size_t off_tail = compiled_n_req - runtime_n_req;
+        auto last_off = graph_input.input_offsets.value()
+                            ->narrow({{0, runtime_n_req, 1}})
+                            ->to(infinicore::Device::cpu());
+        const int32_t last_val =
+            *reinterpret_cast<const int32_t *>(last_off->data());
+        std::vector<int32_t> pad(off_tail, last_val);
         auto offsets_tail = graph_input.input_offsets.value()->narrow(
             {{0, runtime_n_req + 1, off_tail}});
-        set_zeros(offsets_tail);
+        infinicore::context::memcpyH2D(
+            offsets_tail->data(), pad.data(), pad.size() * sizeof(int32_t), false);
         auto cu_tail = graph_input.cu_seqlens.value()->narrow(
             {{0, runtime_n_req + 1, off_tail}});
-        set_zeros(cu_tail);
+        infinicore::context::memcpyH2D(
+            cu_tail->data(), pad.data(), pad.size() * sizeof(int32_t), false);
     }
 
     const size_t block_per_req = runtime.block_tables.value()->size(1);
@@ -820,16 +831,22 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     const size_t padded = padded_bucket_for(seq_len);
     const size_t graph_bucket = graph_replay_bucket_for_padded(padded);
     const size_t runtime_n_req = input.block_tables.has_value() ? input.block_tables.value()->size(0) : 1;
-    const bool final_chunk = InfinilmModel::any_final_prefill_chunk(input.is_final_prefill_chunk);
+    // Decode rows set is_final=True for sampling; that must not hide mid-prefill
+    // rows (MIXED). mid_chunk ← any False flag; need_lm_head ← any True / empty.
+    const bool mid_chunk =
+        InfinilmModel::has_nonfinal_prefill_chunk(input.is_final_prefill_chunk);
+    const bool need_lm_head =
+        InfinilmModel::any_final_prefill_chunk(input.is_final_prefill_chunk);
     if (profile) {
         spdlog::info(
             "rank_worker_profile: piecewise run_prefill begin seq_len={} padded={} graph_bucket={} "
-            "n_req={} final_chunk={}",
+            "n_req={} mid_chunk={} need_lm_head={}",
             seq_len,
             padded,
             graph_bucket,
             runtime_n_req,
-            final_chunk);
+            mid_chunk,
+            need_lm_head);
     }
     if (compiled_.find(graph_bucket) == compiled_.end()) {
         ++prefill_misses_;
@@ -847,7 +864,6 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     // Mid-chunks must not replay CG pre/post under inductor: capture dry-run shapes
     // assume final-chunk inductor staging; mid-chunk CG pre_attn SIGSEGVs at 2048
     // (Gate D). Phase 2 deferred — keep eager pre/post for mid_chunk.
-    const bool mid_chunk = !final_chunk;
     // Pad-up (seq_len < graph_bucket): CG PlannedMeta bakes valid_len==bucket at
     // capture; replaying that meta on a short chat SIGSEGVs. Use eager inductor
     // with runtime piecewise.valid_seq_len instead (same AOT package).
@@ -878,11 +894,11 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     piecewise.residual = bucket_graphs.residual;
     piecewise.ar_staging = bucket_graphs.ar_staging;
     piecewise.layer_staging = bucket_graphs.layer_staging;
-    if (final_chunk) {
+    if (!mid_chunk) {
         // Exact-width and pad-up final chunks both use inductor when enabled.
         // Pad-up still sets piecewise.valid_seq_len=L; AOT pads positions/hidden to bucket.
         piecewise.allow_inductor_pre_attn = inductor_mode && !repro_skip_final_inductor();
-    } else if (repro_skip_midchunk_eager() && mid_chunk) {
+    } else if (repro_skip_midchunk_eager()) {
         piecewise.allow_inductor_pre_attn = inductor_mode;
     } else {
         piecewise.allow_inductor_pre_attn = false;
@@ -903,17 +919,13 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     // Mid-chunk: always eager pre/post under inductor (Gate D; Phase 2 deferred).
     // Final-chunk inductor pre-attn needs the same eager post replay (B4 tail).
     // Pad-up: always eager post/lm_head (CG PlannedMeta bakes full-bucket shapes).
+    // MIXED mid+decode: mid_chunk=true but need_lm_head=true — keep lm_head eager.
     const bool use_eager_post =
         inductor_mode
-        && (mid_chunk || piecewise.allow_inductor_pre_attn);
-    const bool use_eager_lm_head = inductor_mode && piecewise.allow_inductor_pre_attn;
-    const bool use_eager_pre_attn_summary =
+        && (mid_chunk || pad_up || piecewise.allow_inductor_pre_attn);
+    const bool use_eager_lm_head =
         inductor_mode
-        && (mid_chunk || pad_up
-            || (final_chunk && (bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0])));
-    const size_t slot_len = input.slot_mapping.has_value()
-                                ? input.slot_mapping.value()->shape()[0]
-                                : 0;
+        && (mid_chunk || pad_up || piecewise.allow_inductor_pre_attn);
     double layers_ms = 0.0;
     const double t_layers0 = profile ? monotonic_ms() : 0.0;
     for (size_t layer = 0; layer < num_layers; ++layer) {
@@ -959,10 +971,7 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     if (profile) {
         layers_ms = monotonic_ms() - t_layers0;
     }
-    const bool emit_chunk1_boundary =
-        !InfinilmModel::any_final_prefill_chunk(input.is_final_prefill_chunk)
-        && infinilm::global_state::get_tensor_model_parallel_rank() == 0;
-    if (InfinilmModel::any_final_prefill_chunk(input.is_final_prefill_chunk)) {
+    if (need_lm_head) {
         const double t_lm0 = profile ? monotonic_ms() : 0.0;
         barrier_->wait("piecewise_replay_lm_head");
         if (use_eager_lm_head) {
@@ -985,16 +994,20 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     last_prefill_executed_ = true;
     if (profile) {
         spdlog::info(
-            "rank_worker_profile: piecewise run_prefill end layers_total_ms={:.3f} total_ms={:.3f}",
+            "rank_worker_profile: piecewise run_prefill end layers_total_ms={:.3f} total_ms={:.3f} "
+            "mid_chunk={} need_lm_head={} pad_up={}",
             layers_ms,
-            monotonic_ms() - t_total0);
+            monotonic_ms() - t_total0,
+            mid_chunk,
+            need_lm_head,
+            pad_up);
     }
     if (global_state::ar_profile::enabled()
         && global_state::get_tensor_model_parallel_rank() == 0) {
         global_state::ar_profile::log_barrier_chunk_summary(
             "piecewise_replay", seq_len, runtime_n_req);
     }
-    if (!InfinilmModel::any_final_prefill_chunk(input.is_final_prefill_chunk)) {
+    if (!need_lm_head) {
         return std::nullopt;
     }
     return bucket_graphs.logits_holder->narrow({{1, 0, seq_len}});

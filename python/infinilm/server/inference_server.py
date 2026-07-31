@@ -314,10 +314,20 @@ class InferenceServer:
                 stats = sched.get_cache_stats()
                 out["engine_free_blocks"] = float(stats.get("num_free_blocks", 0))
                 out["engine_used_blocks"] = float(stats.get("num_used_blocks", 0))
-            waiting = getattr(getattr(sched, "waiting_queue", None), "sync_q", None)
+                if "num_preemptions_total" in stats:
+                    out["engine_num_preemptions"] = float(
+                        stats["num_preemptions_total"]
+                    )
+            waiting_n = None
+            if hasattr(sched, "waiting_size"):
+                waiting_n = sched.waiting_size()
+            else:
+                waiting = getattr(getattr(sched, "waiting_queue", None), "sync_q", None)
+                if waiting is not None:
+                    waiting_n = waiting.qsize()
             running = getattr(getattr(sched, "running_queue", None), "sync_q", None)
-            if waiting is not None:
-                out["engine_queue_waiting"] = float(waiting.qsize())
+            if waiting_n is not None:
+                out["engine_queue_waiting"] = float(waiting_n)
             if running is not None:
                 out["engine_queue_running"] = float(running.qsize())
         except Exception:

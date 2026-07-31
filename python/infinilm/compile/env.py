@@ -336,6 +336,16 @@ def schedule_no_mixed_enabled() -> bool:
     return _truthy("INFINI_SCHEDULE_NO_MIXED", "0")
 
 
+def schedule_preempt_enabled() -> bool:
+    """When true, RECOMPUTE-preempt a RUNNING victim on decode ``append_slot`` OOM.
+
+    Default **on** (UX-first: avoid silent multi-minute stall under KV growth
+    pressure). Set ``INFINI_SCHEDULE_PREEMPT=0`` to restore defer-only behavior.
+    Preempt is not a substitute for sizing ``NUM_BLOCKS`` vs max concurrency.
+    """
+    return _truthy("INFINI_SCHEDULE_PREEMPT", "1")
+
+
 def max_num_batched_tokens(default: int = 8192) -> int:
     """Token budget per v1 scheduler step (sole shared chunker / step budget).
 

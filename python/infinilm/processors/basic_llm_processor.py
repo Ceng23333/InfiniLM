@@ -234,7 +234,7 @@ class BasicLLMProcessor(InfinilmProcessor):
     ) -> None:
         req = row.request
         num_cached = req.num_cached_tokens
-        req_tokens = req.get_input_tokens()
+        req_tokens = req.get_prefill_tokens()
         q = row.num_scheduled_tokens
         start = req.chunk_prefill_offset if req.chunk_prefill_offset > 0 else num_cached
         end = min(start + q, len(req_tokens))
@@ -390,7 +390,7 @@ class BasicLLMProcessor(InfinilmProcessor):
         for req in scheduler_output.scheduled_requests:
             num_cached = req.num_cached_tokens
             if scheduler_output.is_prefill:
-                req_tokens = req.get_input_tokens()
+                req_tokens = req.get_prefill_tokens()
 
                 if req.is_chunking():
                     start = req.chunk_prefill_offset

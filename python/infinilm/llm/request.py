@@ -149,6 +149,9 @@ class InferenceRequest:
         # Prompt tokens already fed through forward as chunked-prefill
         self.chunk_prefill_offset: int = 0
 
+        # RECOMPUTE preemption count (vLLM-aligned); stream/generated state is kept.
+        self.num_preemptions: int = 0
+
         # For server use
         self.request_data: Optional[dict] = request_data
         self.http_request: Optional[Any] = http_request
@@ -174,6 +177,44 @@ class InferenceRequest:
 
     def get_input_tokens(self) -> List[int]:
         return self.prompt_token_ids
+
+    def tokens_for_kv_recompute(self) -> List[int]:
+        """Full token sequence needed to rebuild KV after RECOMPUTE preemption."""
+        return self.prompt_token_ids + self.generated_token_ids
+
+    def get_prefill_tokens(self) -> List[int]:
+        """Tokens to feed during the current prefill (prompt+generated after RECOMPUTE)."""
+        if self.is_prefill and self.num_preemptions > 0:
+            return self.tokens_for_kv_recompute()
+        return self.prompt_token_ids
+
+    def prefill_seq_len(self) -> int:
+        """Sequence length that must be computed during the current prefill."""
+        if self.is_prefill and self.num_preemptions > 0:
+            return self.prompt_length + len(self.generated_token_ids)
+        return self.prompt_length
+
+    def prepare_for_recompute(self, chunk_size: int) -> None:
+        """Reset compute/KV state for RECOMPUTE while keeping streamed output.
+
+        Does **not** call ``mark_canceled`` (that would close client streams).
+        Keeps ``generated_token_ids``, ``generated_text``, and
+        ``_stream_last_yielded_length`` so resume does not re-emit prefixes.
+        """
+        self.is_prefill = True
+        self.status = RequestStatus.WAITING
+        self.finish_reason = None
+        self.finished_time = None
+
+        self.block_table = []
+        self.slot_mapping = []
+        self.num_cached_tokens = 0
+        self.num_blocks = 0
+        self.cache_id = None
+
+        self.chunk_prefill_offset = 0
+        self.chunk_size = chunk_size
+        self.num_preemptions += 1
 
     def get_num_generated_tokens(self) -> int:
         return len(self.generated_token_ids)
@@ -202,24 +243,28 @@ class InferenceRequest:
         return max(total - 1, 0)
 
     def prefill_debt(self) -> int:
-        """Prompt tokens still to compute during prefill (0 when decoding)."""
+        """Prefill tokens still to compute (0 when decoding).
+
+        After RECOMPUTE, debt covers prompt+generated so KV can be rebuilt.
+        """
         if not self.is_prefill:
             return 0
+        seq_len = self.prefill_seq_len()
         if self.chunk_size > 0 and self.chunk_prefill_offset > 0:
-            return self.prompt_length - self.chunk_prefill_offset
-        return self.prompt_length - self.num_cached_tokens
+            return seq_len - self.chunk_prefill_offset
+        return seq_len - self.num_cached_tokens
 
     def is_chunking(self) -> bool:
         """Return True if this request uses multi-step chunked prefill."""
         return (
             self.chunk_size > 0
             and self.is_prefill
-            and (self.prompt_length - self.num_cached_tokens) > self.chunk_size
+            and (self.prefill_seq_len() - self.num_cached_tokens) > self.chunk_size
         )
 
     def chunk_is_last(self) -> bool:
-        """Return True if the next chunk would finish the prompt."""
-        remaining = self.prompt_length - self.chunk_prefill_offset
+        """Return True if the next chunk would finish the prefill sequence."""
+        remaining = self.prefill_seq_len() - self.chunk_prefill_offset
         return remaining <= self.chunk_size
 
     def is_finished(self) -> bool:

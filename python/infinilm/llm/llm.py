@@ -200,6 +200,9 @@ class LLMEngine:
         except ImportError:
             pass
 
+        if self.cache_type == "paged" and hasattr(self.scheduler, "chunk_size"):
+            self.scheduler.chunk_size = config.chunk_size
+
         if config.enable_graph:
             try:
                 from infinilm.compile.env import prefill_native_cg_enabled
@@ -285,6 +288,9 @@ class LLMEngine:
             self._admit_request(request)
         if self.cache_type == "paged" and self.config.chunk_size > 0:
             request.chunk_size = self.config.chunk_size
+        # Scheduler restores this chunk size on RECOMPUTE preemption.
+        if hasattr(self.scheduler, "chunk_size"):
+            self.scheduler.chunk_size = self.config.chunk_size
         self.scheduler.add_request(request)
 
     def step(self) -> tuple[list[InferenceRequest], list[tuple]]:

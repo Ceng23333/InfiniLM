@@ -7,8 +7,9 @@ import queue
 import time
 import janus
 import logging
+from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Deque, List, Optional, Set
 
 from infinilm.compile.env import (
     long_prefill_threshold,
@@ -16,6 +17,7 @@ from infinilm.compile.env import (
     moe_aot_step_max_tokens,
     moe_aot_step_total_allowed,
     schedule_no_mixed_enabled,
+    schedule_preempt_enabled,
     v1_scheduler_enabled,
 )
 from infinilm.llm.request import RequestStatus, InferenceRequest, FinishReason, TokenOutput
@@ -25,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 # Piecewise CG power-ladder cap (matches piecewise_bucket_policy.hpp).
 _PACK_BUCKET_CAP = 8192
+# Log RECOMPUTE WARNING at most once per N preemptions (vLLM-style).
+_PREEMPT_WARN_EVERY = 10
 
 
 def _hang_trace_enabled() -> bool:
@@ -54,6 +58,31 @@ def _padded_bucket(total_q: int) -> int:
     while bucket < total_q:
         bucket *= 2
     return bucket
+
+
+class _WaitingQueueCompat:
+    """Thin janus-like facade over Scheduler._waiting for legacy callers."""
+
+    def __init__(self, scheduler: "Scheduler"):
+        self._scheduler = scheduler
+
+    @property
+    def sync_q(self) -> "_WaitingQueueCompat":
+        return self
+
+    def qsize(self) -> int:
+        return self._scheduler.waiting_size()
+
+    def put(self, request: InferenceRequest) -> None:
+        self._scheduler.waiting_append(request)
+
+    def get_nowait(self) -> InferenceRequest:
+        if self._scheduler.waiting_size() == 0:
+            raise queue.Empty
+        return self._scheduler.waiting_popleft()
+
+    def empty(self) -> bool:
+        return self._scheduler.waiting_size() == 0
 
 
 @dataclass
@@ -156,7 +185,8 @@ class Scheduler:
         max_waiting_yields: int = 4,
         max_model_len: Optional[int] = None,
     ):
-        self.waiting_queue = janus.Queue()
+        # Waiting is a deque (supports RECOMPUTE prepend). running/chunking stay janus.
+        self._waiting: Deque[InferenceRequest] = deque()
         self.running_queue = janus.Queue()
         self.chunking_queue = janus.Queue()
         self.max_batch_size = max_batch_size
@@ -173,10 +203,32 @@ class Scheduler:
         )
         self.block_size = block_size
         self.max_model_len = max_model_len
+        # Engine default chunk size restored on RECOMPUTE (set by LLMEngine.add_request).
+        self.chunk_size: int = 0
 
         self._waiting_yields_in_a_row: int = 0
         self.max_waiting_yields: int = max_waiting_yields
         self._hang_trace_last_log_mono: float = 0.0
+        self.num_preemptions_total: int = 0
+
+    # --- waiting deque helpers (source of truth for WAITING) ---
+
+    def waiting_append(self, request: InferenceRequest) -> None:
+        self._waiting.append(request)
+
+    def waiting_prepend(self, request: InferenceRequest) -> None:
+        self._waiting.appendleft(request)
+
+    def waiting_popleft(self) -> InferenceRequest:
+        return self._waiting.popleft()
+
+    def waiting_size(self) -> int:
+        return len(self._waiting)
+
+    @property
+    def waiting_queue(self):
+        """Compat shim: ``.sync_q.qsize()`` / ``.put`` / ``.get_nowait`` for callers."""
+        return _WaitingQueueCompat(self)
 
     def _hang_trace_should_log(self, interval_sec: float = 5.0) -> bool:
         if not _hang_trace_enabled():
@@ -188,7 +240,7 @@ class Scheduler:
         return True
 
     def _maybe_log_schedule_empty(self) -> None:
-        waiting = self.waiting_queue.sync_q.qsize()
+        waiting = self.waiting_size()
         running = self.running_queue.sync_q.qsize()
         chunking = self.chunking_queue.sync_q.qsize()
         if waiting == 0 and running == 0 and chunking == 0:
@@ -223,7 +275,7 @@ class Scheduler:
             total_required_blocks,
             self.cache_manager.get_total_usable_blocks(),
             cache_stats["num_free_blocks"],
-            self.waiting_queue.sync_q.qsize(),
+            self.waiting_size(),
             self.running_queue.sync_q.qsize(),
         )
 
@@ -261,7 +313,7 @@ class Scheduler:
                 self._reject_overlength_request(request)
                 return
             request.status = RequestStatus.WAITING
-            self.waiting_queue.sync_q.put(request)
+            self.waiting_append(request)
 
     def schedule(self) -> Optional[SchedulerOutput]:
         """Schedule and return batch of requests to execute."""
@@ -359,6 +411,9 @@ class Scheduler:
             if req.is_finished():
                 self.complete_requests([req])
                 continue
+            # Preempted earlier this step → already on waiting front.
+            if req.status != RequestStatus.RUNNING:
+                continue
             if req.is_prefill and req.prefill_debt() > 0:
                 chunk_size_hint_ref = [chunk_size_hint]
                 if self._try_schedule_v1_prefill_row(
@@ -373,7 +428,12 @@ class Scheduler:
                     chunk_size_hint = chunk_size_hint_ref[0]
             elif not req.is_prefill:
                 self._try_schedule_v1_decode_row(
-                    req, rows, scheduled_requests, budget, deferred_running
+                    req,
+                    rows,
+                    scheduled_requests,
+                    budget,
+                    deferred_running,
+                    running_pool=running_snapshot,
                 )
             else:
                 deferred_running.append(req)
@@ -392,21 +452,23 @@ class Scheduler:
             and n_prefill < prefill_batch_cap
             and len(scheduled_requests) < self.max_batch_size
         ):
-            try:
-                req = self.waiting_queue.sync_q.get_nowait()
-            except queue.Empty:
+            if self.waiting_size() == 0:
                 break
+            req = self.waiting_popleft()
 
             if req.is_finished():
                 self.complete_requests([req])
                 continue
 
             if not self.can_accept_request(req):
-                self.waiting_queue.sync_q.put(req)
+                self.waiting_prepend(req)
                 break
 
-            req_tokens = req.get_input_tokens()
-            num_required_blocks = req.get_num_blocks_required(self.block_size)
+            # After RECOMPUTE, allocate KV for prompt+generated.
+            req_tokens = req.get_prefill_tokens()
+            num_required_blocks = (
+                len(req_tokens) + self.block_size - 1
+            ) // self.block_size
 
             if not self.cache_manager.can_allocate(num_required_blocks):
                 if not self.cache_manager.try_free_blocks(num_required_blocks):
@@ -420,7 +482,7 @@ class Scheduler:
             req.num_blocks = len(req.block_table)
             req.status = RequestStatus.RUNNING
 
-            remaining = req.prompt_length - req.num_cached_tokens
+            remaining = req.prefill_seq_len() - req.num_cached_tokens
             if req.chunk_size > 0 and remaining > req.chunk_size:
                 req.chunk_prefill_offset = req.num_cached_tokens
 
@@ -468,6 +530,92 @@ class Scheduler:
         """Tokens still schedulable before hitting MoE max bucket."""
         return max(0, moe_aot_step_max_tokens() - self._step_scheduled_tokens(rows))
 
+    def _preempt_request(self, req: InferenceRequest) -> int:
+        """Free victim KV, prepare RECOMPUTE, prepend to waiting. Returns blocks freed."""
+        blocks_freed = len(req.block_table) if req.block_table else 0
+        if req.block_table:
+            # Prefill may leave blocks in req_block_ids (not used_block_ids);
+            # reclaim_unused_blocks only scans used — promote first.
+            cm = self.cache_manager
+            for bid in req.block_table:
+                if bid in cm.req_block_ids:
+                    cm.req_block_ids.discard(bid)
+                    cm.used_block_ids.add(bid)
+            cm.free_blocks(req.block_table)
+        chunk = self.chunk_size if self.chunk_size > 0 else req.chunk_size
+        req.prepare_for_recompute(chunk)
+        self.waiting_prepend(req)
+        self.cache_manager.reclaim_unused_blocks()
+        self.num_preemptions_total += 1
+        if self.num_preemptions_total == 1 or (
+            self.num_preemptions_total % _PREEMPT_WARN_EVERY == 0
+        ):
+            logger.warning(
+                "RECOMPUTE preempted request %s (num_preemptions_total=%d). "
+                "Chronic preemption usually means undersized NUM_BLOCKS / too-high "
+                "max concurrency — raise NUM_BLOCKS or lower MC.",
+                req.request_id[:16],
+                self.num_preemptions_total,
+            )
+        return blocks_freed
+
+    def _preempt_until_free(
+        self,
+        need_blocks: int,
+        *,
+        protected: Set[int],
+        candidate_pool: Optional[List[InferenceRequest]] = None,
+        deferred: Optional[List[InferenceRequest]] = None,
+    ) -> bool:
+        """Preempt newest RUNNING victims until ``need_blocks`` free or no candidates.
+
+        Prefer decode victims before mid-prefill. Never preempt ``protected`` ids
+        (current request / already scheduled this step). Victims are removed from
+        ``deferred`` / ``candidate_pool`` when present so they are not requeued
+        as RUNNING this step.
+        """
+        if not schedule_preempt_enabled():
+            return False
+        if self.cache_manager.can_allocate(need_blocks):
+            return True
+
+        deferred = deferred or []
+        candidate_pool = candidate_pool or []
+        protected_ids = set(protected)
+
+        def _candidates() -> List[InferenceRequest]:
+            seen: Set[int] = set()
+            pool: List[InferenceRequest] = []
+            for r in list(deferred) + list(candidate_pool):
+                rid = id(r)
+                if rid in protected_ids or rid in seen:
+                    continue
+                if r.is_finished() or not r.block_table:
+                    continue
+                seen.add(rid)
+                pool.append(r)
+            decode = [r for r in pool if not r.is_prefill]
+            mid_prefill = [r for r in pool if r.is_prefill]
+            decode.sort(key=lambda r: r.arrival_time, reverse=True)
+            mid_prefill.sort(key=lambda r: r.arrival_time, reverse=True)
+            return decode + mid_prefill
+
+        while not self.cache_manager.can_allocate(need_blocks):
+            cands = _candidates()
+            if not cands:
+                return False
+            victim = cands[0]
+            try:
+                deferred.remove(victim)
+            except ValueError:
+                pass
+            try:
+                candidate_pool.remove(victim)
+            except ValueError:
+                pass
+            self._preempt_request(victim)
+        return True
+
     def _try_schedule_v1_decode_row(
         self,
         req: InferenceRequest,
@@ -475,6 +623,7 @@ class Scheduler:
         scheduled_requests: List[InferenceRequest],
         budget: SchedulingBudget,
         deferred: List[InferenceRequest],
+        running_pool: Optional[List[InferenceRequest]] = None,
     ) -> bool:
         if len(scheduled_requests) >= self.max_batch_size:
             deferred.append(req)
@@ -485,7 +634,8 @@ class Scheduler:
         if not self._shape_gate_allows(rows, 1):
             deferred.append(req)
             return False
-        try:
+
+        def _append_once() -> None:
             req.block_table, new_slot = self.cache_manager.append_slot(
                 req.block_table,
                 req.get_total_length(),
@@ -494,9 +644,27 @@ class Scheduler:
             req.slot_mapping = [new_slot]
             req.num_blocks = len(req.block_table)
             req.num_cached_tokens = req.get_total_length() - 1
+
+        try:
+            _append_once()
         except RuntimeError:
-            deferred.append(req)
-            return False
+            # Stock vLLM: preempt other RUNNING on growth OOM, then retry once.
+            protected = {id(req)} | {id(r) for r in scheduled_requests}
+            freed = self._preempt_until_free(
+                1,
+                protected=protected,
+                candidate_pool=running_pool,
+                deferred=deferred,
+            )
+            if not freed:
+                deferred.append(req)
+                return False
+            try:
+                _append_once()
+            except RuntimeError:
+                deferred.append(req)
+                return False
+
         rows.append(ScheduledRow(req, 1, False, False))
         scheduled_requests.append(req)
         budget.add(req.request_id, 1)
@@ -526,7 +694,7 @@ class Scheduler:
         if headroom <= 0:
             if from_waiting:
                 req.status = RequestStatus.WAITING
-                self.waiting_queue.sync_q.put(req)
+                self.waiting_append(req)
             elif defer_fn is not None:
                 defer_fn(req)
             return False
@@ -534,14 +702,14 @@ class Scheduler:
         if q <= 0 or not budget.can_add(req.request_id, q):
             if from_waiting:
                 req.status = RequestStatus.WAITING
-                self.waiting_queue.sync_q.put(req)
+                self.waiting_append(req)
             elif defer_fn is not None:
                 defer_fn(req)
             return False
         if not self._shape_gate_allows(rows, q):
             if from_waiting:
                 req.status = RequestStatus.WAITING
-                self.waiting_queue.sync_q.put(req)
+                self.waiting_append(req)
             elif defer_fn is not None:
                 defer_fn(req)
             return False
@@ -554,7 +722,7 @@ class Scheduler:
             if not self._can_add_v1_prefill_row(rows, req, chunk_size_hint):
                 if from_waiting:
                     req.status = RequestStatus.WAITING
-                    self.waiting_queue.sync_q.put(req)
+                    self.waiting_append(req)
                 elif defer_fn is not None:
                     defer_fn(req)
                 return False
@@ -597,7 +765,7 @@ class Scheduler:
         return min(q, remaining)
 
     def _is_final_prefill_chunk(self, req: InferenceRequest, q: int) -> bool:
-        return req.num_computed_tokens + q >= req.prompt_length
+        return req.num_computed_tokens + q >= req.prefill_seq_len()
 
     def _can_add_v1_prefill_row(
         self,
@@ -652,10 +820,10 @@ class Scheduler:
 
     @staticmethod
     def _prefill_compute_len(req: InferenceRequest) -> int:
-        remaining = req.prompt_length - req.num_cached_tokens
+        remaining = req.prefill_seq_len() - req.num_cached_tokens
         if req.is_chunking():
             start = req.chunk_prefill_offset
-            end = min(start + req.chunk_size, len(req.get_input_tokens()))
+            end = min(start + req.chunk_size, len(req.get_prefill_tokens()))
             return end - start
         return remaining
 
@@ -758,21 +926,22 @@ class Scheduler:
         chunk_size = 0
 
         while len(scheduled_requests) < prefill_batch_cap:
-            try:
-                req = self.waiting_queue.sync_q.get_nowait()
-            except queue.Empty:
+            if self.waiting_size() == 0:
                 break
+            req = self.waiting_popleft()
 
             if req.is_finished():
                 self.complete_requests([req])
                 continue
 
             if not self.can_accept_request(req):
-                self.waiting_queue.sync_q.put(req)
+                self.waiting_prepend(req)
                 break
 
-            req_tokens = req.get_input_tokens()
-            num_required_blocks = req.get_num_blocks_required(self.block_size)
+            req_tokens = req.get_prefill_tokens()
+            num_required_blocks = (
+                len(req_tokens) + self.block_size - 1
+            ) // self.block_size
 
             if not self.cache_manager.can_allocate(num_required_blocks):
                 if not self.cache_manager.try_free_blocks(num_required_blocks):
@@ -786,7 +955,7 @@ class Scheduler:
             req.num_blocks = len(req.block_table)
             req.status = RequestStatus.RUNNING
 
-            remaining = req.prompt_length - req.num_cached_tokens
+            remaining = req.prefill_seq_len() - req.num_cached_tokens
             if req.chunk_size > 0 and remaining > req.chunk_size:
                 req.chunk_prefill_offset = req.num_cached_tokens
 
@@ -797,7 +966,7 @@ class Scheduler:
                     scheduled_requests, req, chunk_size=chunk_size
                 ):
                     req.status = RequestStatus.WAITING
-                    self.waiting_queue.sync_q.put(req)
+                    self.waiting_append(req)
                     break
             else:
                 chunk_size = req.chunk_size
@@ -833,7 +1002,7 @@ class Scheduler:
                 if req.is_chunking():
                     self.requeue_chunking(req)
                 else:
-                    self.waiting_queue.sync_q.put(req)
+                    self.waiting_append(req)
                 continue
 
             try:
@@ -906,6 +1075,22 @@ class Scheduler:
         return max(0, max_tokens - req.get_num_generated_tokens())
 
     def _kv_completion_tokens(self, req: InferenceRequest) -> int:
+        """KV tokens needed through generation end.
+
+        Fresh / RUNNING: prompt + remaining generation (block_table already
+        holds current generated tokens for RUNNING). After RECOMPUTE, WAITING
+        must reserve prompt + full ``max_tokens`` so re-prefill of
+        prompt+generated is covered.
+        """
+        max_tokens = req.sampling_params.max_tokens
+        if max_tokens is None:
+            return req.get_total_length()
+        if (
+            req.status == RequestStatus.WAITING
+            and req.num_preemptions > 0
+            and req.generated_token_ids
+        ):
+            return req.get_prompt_length() + max_tokens
         return req.get_prompt_length() + self._remaining_generation_tokens(req)
 
     def can_accept_request(self, request: InferenceRequest) -> bool:
@@ -935,7 +1120,7 @@ class Scheduler:
         total_required_blocks += num_blocks_needed
 
         accepted = total_required_blocks <= self.cache_manager.get_total_usable_blocks()
-        if not accepted and self.waiting_queue.sync_q.qsize() > 0:
+        if not accepted and self.waiting_size() > 0:
             self._maybe_log_admission_reject(
                 request, total_required_blocks, num_blocks_needed
             )
@@ -949,4 +1134,5 @@ class Scheduler:
             "num_free_blocks": self.cache_manager.get_num_free_blocks(),
             "num_req_blocks": len(self.cache_manager.req_block_ids),
             "num_used_blocks": len(self.cache_manager.used_block_ids),
+            "num_preemptions_total": self.num_preemptions_total,
         }
