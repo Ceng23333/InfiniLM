@@ -55,7 +55,7 @@ public:
 
     /// True if any row is still a non-final prefill chunk (flag bit false).
     /// Decode rows append True for sampling; they must not hide mid-prefill rows
-    /// when deciding CG vs eager (MIXED + mid-chunk → must stay eager).
+    /// when deciding CG vs eager (MIXED → mixed-mid dual capture or eager fallback).
     static bool has_nonfinal_prefill_chunk(const std::vector<bool> &flags) {
         return !flags.empty()
                && std::any_of(flags.begin(), flags.end(), [](bool v) { return !v; });

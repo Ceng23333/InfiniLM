@@ -110,11 +110,16 @@ inline void set_attn_metadata_for_varlen_batch(const InfinilmModel::Input &compi
     meta.block_tables = compiled.block_tables.value()->narrow({{0, 0, runtime_n_req}, {1, 0, block_per_req}});
     // paged_caching uses slot_mapping.shape[0] as num_tokens (see paged_caching/info.h).
     meta.slot_mapping = compiled.slot_mapping.value()->narrow({{0, 0, slot_len}});
-    // Host max seqlens must come from RUNTIME tensors: narrowed compiled/graph views
-    // fail raw D2H (and may fail to(cpu) on graph storage). FA still uses narrowed
-    // compiled meta (CG-safe addresses); runtime lengths were already copy_from'd
-    // into those buffers in copy_runtime_into_bucket_. Do NOT swap meta to runtime
-    // tensor objects under pad-up — that breaks CG address binding (SIGSEGV).
+    // Host max seqlens must come from RUNTIME length tensors: narrowed compiled/graph
+    // views fail raw D2H (and may fail to(cpu) on graph storage). FA still uses
+    // narrowed compiled meta (CG-safe addresses); runtime lengths were already
+    // copy_from'd into those buffers in copy_runtime_into_bucket_. Do NOT swap meta
+    // to runtime tensor objects under pad-up — that breaks CG address binding (SIGSEGV).
+    //
+    // Clamp capacity from *compiled* block_tables (full num_blocks width), not the
+    // runtime table's shorter padded width. Large-past MIXED (past≫capture, e.g.
+    // ~18k) was clamping max_kv_len to runtime_bt_cols*256 and under-covering the
+    // cu_seqlens KV span → FA varlen OOB / silent death (211225 class).
     {
         auto io = meta.input_offsets;
         auto tot = meta.total_sequence_lengths;
@@ -123,7 +128,7 @@ inline void set_attn_metadata_for_varlen_batch(const InfinilmModel::Input &compi
         meta.input_offsets = runtime.input_offsets;
         meta.total_sequence_lengths = runtime.total_sequence_lengths;
         meta.cu_seqlens = runtime.cu_seqlens;
-        meta.block_tables = runtime.block_tables;
+        meta.block_tables = bt; // compiled width for table_cap clamp
         refresh_max_seqlens(meta);
         const int mq = meta.max_query_len;
         const int mk = meta.max_kv_len;

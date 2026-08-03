@@ -83,6 +83,18 @@ bool repro_skip_midchunk_eager() {
     return infinilm::global_state::repro_skip_midchunk_eager();
 }
 
+bool repro_allow_midchunk_cg() {
+    return infinilm::global_state::repro_allow_midchunk_cg();
+}
+
+bool repro_mixed_mid_cg() {
+    return infinilm::global_state::repro_mixed_mid_cg();
+}
+
+bool enable_mixed_mid_cg() {
+    return infinilm::global_state::enable_mixed_mid_cg();
+}
+
 bool scoped_inductor_pre_attn() {
     return infinilm::global_state::scoped_inductor_pre_attn_enabled();
 }
@@ -239,7 +251,8 @@ PiecewisePrefillCompiler::PiecewisePrefillCompiler(const std::shared_ptr<Infinil
         return;
     }
     max_seq_len_ = compile_max_seq_from_env();
-    const size_t chunk_cap = prefill_chunk_size_from_env();
+    prefill_chunk_size_ = prefill_chunk_size_from_env();
+    const size_t chunk_cap = prefill_chunk_size_;
     const bool vllm_ladder = vllm_capture_ladder_enabled();
     if (const char *raw = std::getenv("INFINI_NATIVE_CG_CAPTURE_BUCKETS")) {
         capture_buckets_.clear();
@@ -373,7 +386,10 @@ void PiecewisePrefillCompiler::bind_bucket_staging_(size_t bucket, size_t num_la
     piecewise.ar_staging = shared_banks_.ar_staging->narrow({{1, 0, bucket}});
 }
 
-InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket, size_t nblocks, size_t n_req) const {
+InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
+                                                                  size_t nblocks,
+                                                                  size_t n_req,
+                                                                  bool mid_chunk_capture) const {
     if (!shared_banks_.input_ids || bucket > shared_banks_.max_bucket) {
         throw std::runtime_error("make_bucket_input_: shared I/O banks not allocated");
     }
@@ -389,16 +405,23 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
     set_zeros(input.past_sequence_lengths.value());
     set_zeros(input.total_sequence_lengths.value());
 
-    const size_t chunk_size = prefill_chunk_size_from_env();
-    const int64_t pos_start =
-        (bucket < chunk_size) ? static_cast<int64_t>(chunk_size) : int64_t{0};
+    const size_t chunk_size =
+        prefill_chunk_size_ > 0 ? prefill_chunk_size_ : prefill_chunk_size_from_env();
+    // Mid dual-capture: representative continuing chunk after one full prior chunk.
+    const size_t past =
+        mid_chunk_capture ? (bucket == chunk_size ? bucket : chunk_size) : 0;
+    const int64_t pos_start = mid_chunk_capture
+        ? static_cast<int64_t>(past)
+        : ((bucket < chunk_size) ? static_cast<int64_t>(chunk_size) : int64_t{0});
     std::vector<int64_t> position_ids_vec(bucket);
     std::iota(position_ids_vec.begin(), position_ids_vec.end(), pos_start);
     infinicore::context::memcpyH2D(
         input.position_ids.value()->data(), position_ids_vec.data(), bucket * sizeof(int64_t), false);
 
-    std::vector<int32_t> past_lengths_vec(n_req, 0);
-    std::vector<int32_t> total_lengths_vec(n_req, static_cast<int32_t>(bucket / std::max<size_t>(1, n_req)));
+    const int32_t per_req = static_cast<int32_t>(bucket / std::max<size_t>(1, n_req));
+    std::vector<int32_t> past_lengths_vec(n_req, static_cast<int32_t>(past));
+    std::vector<int32_t> total_lengths_vec(
+        n_req, static_cast<int32_t>(past) + per_req);
     infinicore::context::memcpyH2D(
         input.past_sequence_lengths.value()->data(),
         past_lengths_vec.data(),
@@ -411,7 +434,6 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
         false);
 
     std::vector<int32_t> input_offsets_vec(n_req + 1, 0);
-    const int32_t per_req = static_cast<int32_t>(bucket / std::max<size_t>(1, n_req));
     for (size_t i = 0; i <= n_req; ++i) {
         input_offsets_vec[i] = static_cast<int32_t>(std::min<size_t>(bucket, i * per_req));
     }
@@ -437,7 +459,8 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
     input.block_tables = block_tables_holder_->as_strided({n_req, block_per_req}, {(ptrdiff_t)block_per_req, 1});
     const auto *paged_config = dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config());
     const size_t block_size = paged_config != nullptr ? paged_config->block_size() : 256;
-    const size_t blocks_needed = (bucket + block_size - 1) / block_size;
+    const size_t span_tokens = past + bucket;
+    const size_t blocks_needed = (span_tokens + block_size - 1) / block_size;
     for (size_t row = 0; row < n_req; ++row) {
         std::vector<int32_t> block_row(block_per_req, -1);
         const size_t row_offset = row * blocks_needed;
@@ -450,13 +473,118 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
     }
 
     std::vector<int64_t> slot_mapping_vec(bucket);
-    std::iota(slot_mapping_vec.begin(), slot_mapping_vec.end(), int64_t{0});
+    std::iota(slot_mapping_vec.begin(),
+              slot_mapping_vec.end(),
+              static_cast<int64_t>(past));
     infinicore::context::memcpyH2D(
         input.slot_mapping.value()->data(), slot_mapping_vec.data(), bucket * sizeof(int64_t), false);
+    // Mid capture is a continuing chunk (not final); leave flag empty → treated as final for
+    // lm_head dry-run only when we explicitly run lm_head below. Runtime mid uses is_final=false.
     return input;
 }
 
-void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
+InfinilmModel::Input PiecewisePrefillCompiler::make_mixed_mid_bucket_input_(size_t bucket,
+                                                                           size_t nblocks) const {
+    if (!shared_banks_.input_ids || bucket > shared_banks_.max_bucket) {
+        throw std::runtime_error("make_mixed_mid_bucket_input_: shared I/O banks not allocated");
+    }
+    if (bucket < 2) {
+        throw std::runtime_error("make_mixed_mid_bucket_input_: bucket must be >= 2");
+    }
+    const size_t n_req = mixed_mid_capture_req_;
+    // Match v1 scheduler RUNNING order: decode rows often precede mid-prefills.
+    // Dominant LongBench MIXED@2048: 1 decode token + continuing mid fills bucket-1.
+    const size_t decode_q = 1;
+    const size_t mid_q = bucket - 1;
+    const size_t decode_past = bucket;
+    const size_t mid_past = bucket;
+    const size_t decode_total = decode_past + decode_q;
+    const size_t mid_total = mid_past + mid_q;
+
+    InfinilmModel::Input input;
+    input.input_ids = shared_banks_.input_ids->narrow({{1, 0, bucket}});
+    input.position_ids = shared_banks_.position_ids->narrow({{0, 0, bucket}});
+    // Narrow metadata to capture n_req so FA max_seqlens do not see zero-pad tails.
+    input.past_sequence_lengths = shared_banks_.past_sequence_lengths->narrow({{0, 0, n_req}});
+    input.total_sequence_lengths = shared_banks_.total_sequence_lengths->narrow({{0, 0, n_req}});
+    input.input_offsets = shared_banks_.input_offsets->narrow({{0, 0, n_req + 1}});
+    input.cu_seqlens = shared_banks_.cu_seqlens->narrow({{0, 0, n_req + 1}});
+    input.slot_mapping = shared_banks_.slot_mapping->narrow({{0, 0, bucket}});
+    set_zeros(input.input_ids.value());
+    set_zeros(input.past_sequence_lengths.value());
+    set_zeros(input.total_sequence_lengths.value());
+
+    std::vector<int64_t> position_ids_vec(bucket);
+    position_ids_vec[0] = static_cast<int64_t>(decode_past);
+    for (size_t i = 0; i < mid_q; ++i) {
+        position_ids_vec[decode_q + i] = static_cast<int64_t>(mid_past + i);
+    }
+    infinicore::context::memcpyH2D(
+        input.position_ids.value()->data(), position_ids_vec.data(), bucket * sizeof(int64_t), false);
+
+    const std::vector<int32_t> past_lengths_vec{
+        static_cast<int32_t>(decode_past), static_cast<int32_t>(mid_past)};
+    const std::vector<int32_t> total_lengths_vec{
+        static_cast<int32_t>(decode_total), static_cast<int32_t>(mid_total)};
+    infinicore::context::memcpyH2D(
+        input.past_sequence_lengths.value()->data(),
+        past_lengths_vec.data(),
+        n_req * sizeof(int32_t),
+        false);
+    infinicore::context::memcpyH2D(
+        input.total_sequence_lengths.value()->data(),
+        total_lengths_vec.data(),
+        n_req * sizeof(int32_t),
+        false);
+
+    const std::vector<int32_t> input_offsets_vec{
+        0, static_cast<int32_t>(decode_q), static_cast<int32_t>(bucket)};
+    // cu_seqlens = cumulative KV lengths (matches processor MIXED packing).
+    const std::vector<int32_t> cu_seqlens_vec{
+        0, static_cast<int32_t>(decode_total), static_cast<int32_t>(decode_total + mid_total)};
+    infinicore::context::memcpyH2D(
+        input.input_offsets.value()->data(),
+        input_offsets_vec.data(),
+        (n_req + 1) * sizeof(int32_t),
+        false);
+    infinicore::context::memcpyH2D(
+        input.cu_seqlens.value()->data(),
+        cu_seqlens_vec.data(),
+        (n_req + 1) * sizeof(int32_t),
+        false);
+
+    const size_t block_per_req = nblocks;
+    input.block_tables = block_tables_holder_->as_strided({n_req, block_per_req}, {(ptrdiff_t)block_per_req, 1});
+    const auto *paged_config = dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config());
+    const size_t block_size = paged_config != nullptr ? paged_config->block_size() : 256;
+    const size_t spans[2] = {decode_total, mid_total};
+    size_t row_block_cursor = 0;
+    for (size_t row = 0; row < n_req; ++row) {
+        std::vector<int32_t> block_row(block_per_req, -1);
+        const size_t blocks_needed = (spans[row] + block_size - 1) / block_size;
+        for (size_t b = 0; b < blocks_needed && b < block_per_req; ++b) {
+            block_row[b] = static_cast<int32_t>(row_block_cursor + b);
+        }
+        row_block_cursor += blocks_needed;
+        auto row_tensor = input.block_tables.value()->narrow({{0, row, 1}});
+        infinicore::context::memcpyH2D(
+            row_tensor->data(), block_row.data(), block_per_req * sizeof(int32_t), false);
+    }
+
+    std::vector<int64_t> slot_mapping_vec(bucket);
+    slot_mapping_vec[0] = static_cast<int64_t>(decode_past);
+    for (size_t i = 0; i < mid_q; ++i) {
+        slot_mapping_vec[decode_q + i] = static_cast<int64_t>(mid_past + i);
+    }
+    infinicore::context::memcpyH2D(
+        input.slot_mapping.value()->data(), slot_mapping_vec.data(), bucket * sizeof(int64_t), false);
+
+    // Row0 decode (lm_head + sample); row1 continuing mid (no sample).
+    input.is_final_prefill_chunk = {true, false};
+    return input;
+}
+
+void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_capture) {
     const auto rank_device = infinilm::global_state::get_tensor_model_parallel_rank_info().device;
     infinicore::context::setDevice(rank_device);
     // Prefill: FA host-break + AOT MoE under full_and_piecewise.
@@ -473,7 +601,7 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
     const size_t nblocks = dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())->num_blocks();
     const size_t num_layers = model_->native_piecewise_num_layers();
     bind_bucket_staging_(bucket, num_layers);
-    auto bucket_input = make_bucket_input_(bucket, nblocks, max_capture_req_);
+    auto bucket_input = make_bucket_input_(bucket, nblocks, max_capture_req_, mid_chunk_capture);
     set_attn_metadata(bucket_input);
 
     BucketGraphs graphs;
@@ -481,7 +609,9 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
 
     auto &piecewise = infinilm::global_state::get_forward_context().piecewise;
     piecewise.valid_seq_len = bucket;
-    piecewise.allow_inductor_pre_attn = bucket_inductor_capture_enabled(bucket);
+    // Mid dual-capture: never bake inductor-in-CG (A2 remains opt-in via SKIP_MIDCHUNK_EAGER).
+    piecewise.allow_inductor_pre_attn =
+        mid_chunk_capture ? false : bucket_inductor_capture_enabled(bucket);
     piecewise.phase = global_state::PiecewiseCapturePhase::None;
 
     auto &hidden = piecewise.hidden_states;
@@ -518,6 +648,133 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
             infinicore::context::syncDevice();
         }
     }
+    // Mid chunks do not sample; skip lm_head dry-run/capture for mid key.
+    if (!mid_chunk_capture) {
+        model_->native_piecewise_lm_head(graphs.input, hidden, residual, graphs.logits_holder);
+    }
+    graphs.pre_attn.resize(capture_layers);
+    graphs.post_attn.resize(capture_layers);
+
+    set_zeros(piecewise.residual);
+    model_->native_piecewise_embed(graphs.input, hidden);
+
+    for (size_t layer = 0; layer < capture_layers; ++layer) {
+        piecewise.active_layer = layer;
+        piecewise.phase = global_state::PiecewiseCapturePhase::PreAttn;
+
+        barrier_->wait("piecewise_capture_pre_attn");
+        const bool capture_inductor =
+            !mid_chunk_capture && layer_capture_inductor_pre_attn(layer, bucket);
+        piecewise.allow_inductor_pre_attn = capture_inductor;
+        infinicore::context::startGraphRecording();
+        model_->native_piecewise_pre_attn_layer(layer, graphs.input, hidden, residual);
+        graphs.pre_attn[layer] = infinicore::context::stopGraphRecording();
+        infinicore::context::syncStream();
+
+        piecewise.phase = global_state::PiecewiseCapturePhase::EagerAttn;
+        model_->native_piecewise_eager_attn_layer(layer, graphs.input);
+
+        piecewise.phase = global_state::PiecewiseCapturePhase::PostAttn;
+        barrier_->wait("piecewise_capture_post_attn");
+        infinicore::context::startGraphRecording();
+        model_->native_piecewise_post_attn_cg_layer(layer, graphs.input, hidden, residual);
+        graphs.post_attn[layer] = infinicore::context::stopGraphRecording();
+        assert_post_one_device_seg_("piecewise_prefill_post", layer, graphs.post_attn[layer]);
+        barrier_->wait("piecewise_capture_post_attn_sync");
+    }
+
+    if (!mid_chunk_capture) {
+        piecewise.phase = global_state::PiecewiseCapturePhase::LmHead;
+        barrier_->wait("piecewise_capture_lm_head");
+        infinicore::context::startGraphRecording();
+        model_->native_piecewise_lm_head(graphs.input, hidden, residual, graphs.logits_holder);
+        graphs.lm_head = infinicore::context::stopGraphRecording();
+        barrier_->wait("piecewise_capture_lm_head_sync");
+    }
+
+    piecewise.phase = global_state::PiecewiseCapturePhase::None;
+    graphs.hidden_states = piecewise.hidden_states;
+    graphs.residual = piecewise.residual;
+    graphs.ar_staging = piecewise.ar_staging;
+    graphs.layer_staging = piecewise.layer_staging;
+    if (mid_chunk_capture) {
+        compiled_mid_[bucket] = std::move(graphs);
+    } else {
+        compiled_[bucket] = std::move(graphs);
+    }
+    const size_t captured_segments =
+        capture_layers * 2 + (mid_chunk_capture ? 0 : 1);
+    spdlog::info(
+        "native piecewise CG: captured bucket={} mid={} layers={} segments={}",
+        bucket,
+        mid_chunk_capture,
+        capture_layers,
+        captured_segments);
+}
+
+void PiecewisePrefillCompiler::capture_mixed_mid_bucket_(size_t bucket) {
+    const auto rank_device = infinilm::global_state::get_tensor_model_parallel_rank_info().device;
+    infinicore::context::setDevice(rank_device);
+    infinicore::context::InferencePhaseGuard phase_guard(
+        infinicore::context::InferencePhase::Prefill);
+
+    auto &piecewise_flag = infinilm::global_state::get_forward_context().piecewise;
+    struct CaptureGuard {
+        infinilm::global_state::PiecewisePrefillState &pw;
+        explicit CaptureGuard(infinilm::global_state::PiecewisePrefillState &p) : pw(p) {
+            pw.compile_capture_active = true;
+        }
+        ~CaptureGuard() { pw.compile_capture_active = false; }
+    } capture_guard(piecewise_flag);
+
+    const size_t nblocks =
+        dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())->num_blocks();
+    const size_t num_layers = model_->native_piecewise_num_layers();
+    bind_bucket_staging_(bucket, num_layers);
+    auto bucket_input = make_mixed_mid_bucket_input_(bucket, nblocks);
+    set_attn_metadata(bucket_input);
+
+    BucketGraphs graphs;
+    graphs.input = std::move(bucket_input);
+
+    auto &piecewise = infinilm::global_state::get_forward_context().piecewise;
+    piecewise.valid_seq_len = bucket;
+    // MIXED mid dual-capture: never bake inductor-in-CG (same as homo mid).
+    piecewise.allow_inductor_pre_attn = false;
+    piecewise.phase = global_state::PiecewiseCapturePhase::None;
+
+    auto &hidden = piecewise.hidden_states;
+    auto &residual = piecewise.residual;
+
+    size_t capture_layers = num_layers;
+    if (const char *raw = std::getenv("INFINI_NATIVE_CG_MAX_LAYERS")) {
+        capture_layers = std::min(num_layers, static_cast<size_t>(std::stoul(raw)));
+    }
+
+    graphs.logits_holder = shared_banks_.logits_holder->narrow({{1, 0, bucket}});
+
+    // Eager warmup dry-run (includes lm_head — decode row needs logits).
+    model_->native_piecewise_embed(graphs.input, hidden);
+    for (size_t layer = 0; layer < capture_layers; ++layer) {
+        model_->native_piecewise_pre_attn_layer(layer, graphs.input, hidden, residual);
+        if (infinilm::global_state::piecewise_inductor_segment_enabled()) {
+            infinicore::context::syncDevice();
+            barrier_->wait("piecewise_dry_run_pre_attn");
+        }
+        model_->native_piecewise_eager_attn_layer(layer, graphs.input);
+        if (infinilm::global_state::piecewise_inductor_segment_enabled()) {
+            infinicore::context::syncDevice();
+            barrier_->wait("piecewise_dry_run_eager_attn");
+        }
+        model_->native_piecewise_post_attn_cg_layer(layer, graphs.input, hidden, residual);
+        if (infinilm::global_state::piecewise_inductor_segment_enabled()) {
+            infinicore::context::syncDevice();
+            barrier_->wait("piecewise_dry_run_post_attn");
+        }
+        if (infinilm::global_state::piecewise_inductor_segment_enabled()) {
+            infinicore::context::syncDevice();
+        }
+    }
     model_->native_piecewise_lm_head(graphs.input, hidden, residual, graphs.logits_holder);
     graphs.pre_attn.resize(capture_layers);
     graphs.post_attn.resize(capture_layers);
@@ -525,15 +782,12 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
     set_zeros(piecewise.residual);
     model_->native_piecewise_embed(graphs.input, hidden);
 
-    const bool inductor_mode =
-        infinilm::global_state::piecewise_inductor_segment_enabled();
     for (size_t layer = 0; layer < capture_layers; ++layer) {
         piecewise.active_layer = layer;
         piecewise.phase = global_state::PiecewiseCapturePhase::PreAttn;
 
         barrier_->wait("piecewise_capture_pre_attn");
-        const bool capture_inductor = layer_capture_inductor_pre_attn(layer, bucket);
-        piecewise.allow_inductor_pre_attn = capture_inductor;
+        piecewise.allow_inductor_pre_attn = false;
         infinicore::context::startGraphRecording();
         model_->native_piecewise_pre_attn_layer(layer, graphs.input, hidden, residual);
         graphs.pre_attn[layer] = infinicore::context::stopGraphRecording();
@@ -563,10 +817,14 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket) {
     graphs.residual = piecewise.residual;
     graphs.ar_staging = piecewise.ar_staging;
     graphs.layer_staging = piecewise.layer_staging;
-    compiled_[bucket] = std::move(graphs);
+    compiled_mixed_mid_[bucket] = std::move(graphs);
     const size_t captured_segments = capture_layers * 2 + 1;
-    spdlog::info("native piecewise CG: captured bucket={} layers={} segments={}",
-                 bucket, capture_layers, captured_segments);
+    spdlog::info(
+        "native piecewise CG: captured bucket={} mixed_mid=1 n_req={} layers={} segments={}",
+        bucket,
+        mixed_mid_capture_req_,
+        capture_layers,
+        captured_segments);
 }
 
 void PiecewisePrefillCompiler::warmup_inductor_segments_(size_t nblocks, size_t n_req) {
@@ -669,9 +927,21 @@ void PiecewisePrefillCompiler::compile() {
     }
 
     compiled_.clear();
+    compiled_mid_.clear();
+    compiled_mixed_mid_.clear();
+    mixed_mid_capture_req_ = std::min<size_t>(2, max_capture_req_);
     for (size_t bucket : capture_buckets_) {
-        capture_bucket_(bucket);
+        capture_bucket_(bucket, /*mid_chunk_capture=*/false);
         infinicore::context::syncDevice();
+        // Dual capture: exact chunk-sized bucket also gets homo mid + MIXED mid keys.
+        if (bucket == prefill_chunk_size_ && prefill_chunk_size_ > 0) {
+            capture_bucket_(bucket, /*mid_chunk_capture=*/true);
+            infinicore::context::syncDevice();
+            if (mixed_mid_capture_req_ >= 2 && bucket >= 2) {
+                capture_mixed_mid_bucket_(bucket);
+                infinicore::context::syncDevice();
+            }
+        }
     }
     infinicore::context::syncDevice();
     const size_t free_after = device_free_bytes_();
@@ -684,6 +954,12 @@ void PiecewisePrefillCompiler::compile() {
     for (const auto &kv : compiled_) {
         arena_bytes += bucket_arena_nbytes_(kv.second);
     }
+    for (const auto &kv : compiled_mid_) {
+        arena_bytes += bucket_arena_nbytes_(kv.second);
+    }
+    for (const auto &kv : compiled_mixed_mid_) {
+        arena_bytes += bucket_arena_nbytes_(kv.second);
+    }
     const size_t staging_io_bytes = staging_bytes + io_bytes;
     const size_t free_delta =
         free_before >= free_after ? free_before - free_after : 0;
@@ -694,15 +970,24 @@ void PiecewisePrefillCompiler::compile() {
         }
         oss << capture_buckets_[i];
     }
-    spdlog::info("native piecewise CG: capture_buckets=[{}] max_seq={}",
-                 oss.str(), max_seq_len_);
+    spdlog::info(
+        "native piecewise CG: capture_buckets=[{}] max_seq={} chunk_size={} mid_keys={} "
+        "mixed_mid_keys={}",
+        oss.str(),
+        max_seq_len_,
+        prefill_chunk_size_,
+        compiled_mid_.size(),
+        compiled_mixed_mid_.size());
     // M1: greppable one-line CG VRAM split (before /health). Staging is physical O(max) after M2.
     spdlog::info(
-        "cg_mem_budget tag=piecewise_prefill buckets={} staging_bytes={} io_bytes={} "
+        "cg_mem_budget tag=piecewise_prefill buckets={} mid_buckets={} mixed_mid_buckets={} "
+        "staging_bytes={} io_bytes={} "
         "staging_io_bytes={} arena_bytes={} free_delta_bytes={} "
         "staging_GiB={:.3f} io_GiB={:.3f} staging_io_GiB={:.3f} arena_GiB={:.3f} "
         "free_delta_GiB={:.3f}",
         compiled_.size(),
+        compiled_mid_.size(),
+        compiled_mixed_mid_.size(),
         staging_bytes,
         io_bytes,
         staging_io_bytes,
@@ -861,25 +1146,99 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         return std::nullopt;
     }
     const bool inductor_mode = infinilm::global_state::piecewise_inductor_segment_enabled();
-    // Mid-chunks must not replay CG pre/post under inductor: capture dry-run shapes
-    // assume final-chunk inductor staging; mid-chunk CG pre_attn SIGSEGVs at 2048
-    // (Gate D). Phase 2 deferred — keep eager pre/post for mid_chunk.
     // Pad-up (seq_len < graph_bucket): CG PlannedMeta bakes valid_len==bucket at
     // capture; replaying that meta on a short chat SIGSEGVs. Use eager inductor
     // with runtime piecewise.valid_seq_len instead (same AOT package).
     const bool pad_up = seq_len != graph_bucket;
 
-    auto &bucket_graphs = compiled_.at(graph_bucket);
+    const bool have_mid_graphs = [&]() {
+        auto it = compiled_mid_.find(graph_bucket);
+        if (it == compiled_mid_.end()) {
+            return false;
+        }
+        return !it->second.pre_attn.empty() && it->second.pre_attn[0]
+            && !it->second.post_attn.empty() && it->second.post_attn[0];
+    }();
+    const bool have_mixed_mid_graphs = [&]() {
+        auto it = compiled_mixed_mid_.find(graph_bucket);
+        if (it == compiled_mixed_mid_.end()) {
+            return false;
+        }
+        return !it->second.pre_attn.empty() && it->second.pre_attn[0]
+            && !it->second.post_attn.empty() && it->second.post_attn[0]
+            && static_cast<bool>(it->second.lm_head);
+    }();
+    // Runtime past of request 0 (representative). Mid dual-capture baked past>0;
+    // past==0 mid (first chunk of a long prompt) still SIGSEGVs under CG (Gate D /
+    // homo_mid 20260731) — keep that case eager. Continuing mids (past>0) use mid graphs.
+    int32_t runtime_past0 = 0;
+    if (input.past_sequence_lengths.has_value()
+        && input.past_sequence_lengths.value()->size(0) > 0) {
+        auto cpu = input.past_sequence_lengths.value()->to(infinicore::Device::cpu());
+        runtime_past0 = reinterpret_cast<const int32_t *>(cpu->data())[0];
+    }
+    const bool past_matches_mid_capture = runtime_past0 > 0;
+    // MIXED layout must match dual-capture: n_req=2 decode(1) + mid(bucket-1).
+    // v1 RUNNING pack typically emits decode before continuing mid.
+    bool mixed_layout_matches_capture = false;
+    int32_t mixed_q0 = -1;
+    int32_t mixed_q1 = -1;
+    int32_t runtime_mid_past = runtime_past0;
+    if (runtime_n_req == mixed_mid_capture_req_ && input.input_offsets.has_value()
+        && input.input_offsets.value()->size(0) >= runtime_n_req + 1) {
+        auto off_cpu = input.input_offsets.value()->to(infinicore::Device::cpu());
+        const auto *offs = reinterpret_cast<const int32_t *>(off_cpu->data());
+        mixed_q0 = offs[1] - offs[0];
+        mixed_q1 = offs[2] - offs[1];
+        const int32_t expect_mid_q = static_cast<int32_t>(graph_bucket) - 1;
+        mixed_layout_matches_capture = (mixed_q0 == 1 && mixed_q1 == expect_mid_q);
+        if (mixed_layout_matches_capture && input.past_sequence_lengths.has_value()
+            && input.past_sequence_lengths.value()->size(0) >= 2) {
+            auto past_cpu = input.past_sequence_lengths.value()->to(infinicore::Device::cpu());
+            // Row1 is continuing mid under decode-first capture.
+            runtime_mid_past = reinterpret_cast<const int32_t *>(past_cpu->data())[1];
+        }
+    }
+    // Product: MIXED mid CG prefer is opt-in (ENABLE_MIXED_MID_CG / REPRO_MIXED_MID_CG).
+    // Default off: ENABLE=1 collapses LongBench EM (215547 lb_em≈0.017 vs Phase2 0.305).
+    const bool prefer_mixed_mid_graphs =
+        mid_chunk && need_lm_head && !pad_up && have_mixed_mid_graphs
+        && runtime_mid_past > 0
+        && (enable_mixed_mid_cg() || repro_mixed_mid_cg())
+        && (mixed_layout_matches_capture || repro_mixed_mid_cg());
+    // Product: exact homogeneous mid + past>0 → mid dual-capture graphs.
+    // MIXED without mixed-mid hit stays eager (Phase2 gate 200231 if homo mid reused).
+    // Part A bisect: ALLOW_MIDCHUNK_CG forces final graphs on mid (Gate D / 143915).
+    const bool prefer_mid_graphs =
+        !prefer_mixed_mid_graphs
+        && mid_chunk && !need_lm_head && !pad_up && have_mid_graphs
+        && past_matches_mid_capture && !repro_allow_midchunk_cg();
+    auto &bucket_graphs = prefer_mixed_mid_graphs
+        ? compiled_mixed_mid_.at(graph_bucket)
+        : (prefer_mid_graphs ? compiled_mid_.at(graph_bucket) : compiled_.at(graph_bucket));
+
+    // Mid CG ok when dual mid / mixed-mid graphs selected, or repro lifts the gate onto final graphs.
+    const bool mid_cg_ok =
+        prefer_mid_graphs
+        || prefer_mixed_mid_graphs
+        || (mid_chunk && !pad_up
+            && (repro_allow_midchunk_cg() || repro_skip_midchunk_eager()));
+    const bool force_mid_eager = mid_chunk && !mid_cg_ok;
     // Step-level eager hist: pad_up > mid_chunk > missing > exact_cg.
     {
         const bool missing_graph =
             bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0]
             || bucket_graphs.post_attn.empty() || !bucket_graphs.post_attn[0];
-        const bool mid_chunk_eager = mid_chunk; // Phase 2 skipped: mid_chunk still eager
+        const bool mid_chunk_eager = force_mid_eager;
         dispatch_hist::record_piecewise_eager(pad_up, mid_chunk_eager, missing_graph);
     }
     const double t_copy0 = profile ? monotonic_ms() : 0.0;
     copy_runtime_into_bucket_(bucket_graphs, input, seq_len);
+    // Keep sample/lm_head row flags aligned with the live MIXED pack (capture baked
+    // decode-first {true,false}; runtime must match for eager lm_head gather).
+    if (!input.is_final_prefill_chunk.empty()) {
+        bucket_graphs.input.is_final_prefill_chunk = input.is_final_prefill_chunk;
+    }
     set_attn_metadata_for_varlen_batch(bucket_graphs.input, input);
     if (profile) {
         spdlog::info(
@@ -899,8 +1258,10 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         // Pad-up still sets piecewise.valid_seq_len=L; AOT pads positions/hidden to bucket.
         piecewise.allow_inductor_pre_attn = inductor_mode && !repro_skip_final_inductor();
     } else if (repro_skip_midchunk_eager()) {
+        // A2: stress inductor-in-CG mid (out of product default).
         piecewise.allow_inductor_pre_attn = inductor_mode;
     } else {
+        // Mid dual-capture / product mid: keep inductor out of mid path.
         piecewise.allow_inductor_pre_attn = false;
     }
 
@@ -916,23 +1277,89 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
 
 
     const size_t num_layers = bucket_graphs.pre_attn.size();
-    // Mid-chunk: always eager pre/post under inductor (Gate D; Phase 2 deferred).
+    // Mid with dual mid graphs: CG replay; inductor-in-CG layers stay eager unless A2.
     // Final-chunk inductor pre-attn needs the same eager post replay (B4 tail).
     // Pad-up: always eager post/lm_head (CG PlannedMeta bakes full-bucket shapes).
-    // MIXED mid+decode: mid_chunk=true but need_lm_head=true — keep lm_head eager.
+    // Homo mid graphs omit lm_head — MIXED without mixed-mid hit uses eager lm_head.
+    // MIXED mid prefer: eager pre_attn (CG QKV/RoPE on decode+mid packs garbles when
+    // runtime past ≫ capture — ENABLE=1 LIMIT=8 EM 0.375→0); CG post_attn OK to keep;
+    // lm_head stays eager for sample-row safety.
     const bool use_eager_post =
-        inductor_mode
-        && (mid_chunk || pad_up || piecewise.allow_inductor_pre_attn);
+        pad_up
+        || force_mid_eager
+        || (inductor_mode && piecewise.allow_inductor_pre_attn);
     const bool use_eager_lm_head =
-        inductor_mode
-        && (mid_chunk || pad_up || piecewise.allow_inductor_pre_attn);
+        pad_up
+        || force_mid_eager
+        || prefer_mid_graphs
+        || prefer_mixed_mid_graphs
+        || !bucket_graphs.lm_head
+        || (inductor_mode && piecewise.allow_inductor_pre_attn);
+    {
+        // Telemetry for Part A/C: first past=0 mid and first past>0 mid at exact bucket.
+        static bool logged_mid_past0 = false;
+        static bool logged_mid_past_gt0 = false;
+        static bool logged_mixed_mid = false;
+        if (mid_chunk && !pad_up && graph_bucket >= 2048) {
+            const bool do_log = (runtime_past0 <= 0 && !logged_mid_past0)
+                || (runtime_past0 > 0 && !logged_mid_past_gt0)
+                || (prefer_mixed_mid_graphs && !logged_mixed_mid)
+                || (need_lm_head && runtime_past0 > 0 && !logged_mixed_mid);
+            if (do_log) {
+                if (runtime_past0 <= 0) {
+                    logged_mid_past0 = true;
+                } else if (!need_lm_head) {
+                    logged_mid_past_gt0 = true;
+                }
+                if (need_lm_head && runtime_past0 > 0) {
+                    logged_mixed_mid = true;
+                }
+                spdlog::info(
+                    "mid_chunk_cg_probe: mid_chunk={} past_len={} mid_past={} seq_len={} "
+                    "graph_bucket={} force_mid_eager={} prefer_mid_graphs={} "
+                    "prefer_mixed_mid_graphs={} mid_cg_ok={} past_matches_mid_capture={} "
+                    "mixed_layout_matches_capture={} mixed_q0={} mixed_q1={} n_req={} "
+                    "allow_inductor_pre_attn={} use_eager_post={}",
+                    mid_chunk,
+                    runtime_past0,
+                    runtime_mid_past,
+                    seq_len,
+                    graph_bucket,
+                    force_mid_eager,
+                    prefer_mid_graphs,
+                    prefer_mixed_mid_graphs,
+                    mid_cg_ok,
+                    past_matches_mid_capture,
+                    mixed_layout_matches_capture,
+                    mixed_q0,
+                    mixed_q1,
+                    runtime_n_req,
+                    piecewise.allow_inductor_pre_attn,
+                    use_eager_post);
+            }
+        }
+    }
     double layers_ms = 0.0;
     const double t_layers0 = profile ? monotonic_ms() : 0.0;
     for (size_t layer = 0; layer < num_layers; ++layer) {
         const double t_layer0 = profile ? monotonic_ms() : 0.0;
         barrier_->wait("piecewise_replay_pre_attn");
+        const bool inductor_layer_mid =
+            mid_chunk && layer_capture_inductor_pre_attn(layer, graph_bucket)
+            && !repro_skip_midchunk_eager();
+        // MIXED mid prefer: keep mixed dual-capture buffers + FA meta, but do not
+        // replay CG pre_attn when runtime past ≫ capture past — CG QKV/RoPE on
+        // decode+mid packs garbles LongBench (ENABLE=1 LIMIT=8 EM 0.375→0).
+        // Pre stays eager until a past-robust mixed pre capture lands; post/lm_head
+        // already eager on this path. Hist still counts prefer as exact_cg.
         const bool use_eager_pre_attn =
-            inductor_mode && (mid_chunk || pad_up || !bucket_graphs.pre_attn[layer]);
+            pad_up
+            || force_mid_eager
+            || prefer_mixed_mid_graphs
+            || inductor_layer_mid
+            || !bucket_graphs.pre_attn[layer]
+            || (inductor_mode && piecewise.allow_inductor_pre_attn
+                && !prefer_mid_graphs && !prefer_mixed_mid_graphs && mid_chunk);
         if (use_eager_pre_attn) {
             model_->native_piecewise_pre_attn_layer(
                 layer, bucket_graphs.input, piecewise.hidden_states, piecewise.residual);
@@ -948,7 +1375,7 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         model_->native_piecewise_eager_attn_layer(layer, bucket_graphs.input);
         const double t_eager_attn = profile ? monotonic_ms() : 0.0;
         barrier_->wait("piecewise_replay_post_attn");
-        if (use_eager_post) {
+        if (use_eager_post || inductor_layer_mid || !bucket_graphs.post_attn[layer]) {
             model_->native_piecewise_post_attn_cg_layer(
                 layer, bucket_graphs.input, piecewise.hidden_states, piecewise.residual);
             barrier_->wait("piecewise_replay_post_attn_sync");

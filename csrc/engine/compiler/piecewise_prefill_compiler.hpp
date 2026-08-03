@@ -67,8 +67,15 @@ private:
     void allocate_shared_banks_(size_t max_bucket, size_t num_layers, size_t n_req);
     /// Bind prefix views of the shared max bank into piecewise TLS for ``bucket``.
     void bind_bucket_staging_(size_t bucket, size_t num_layers);
-    InfinilmModel::Input make_bucket_input_(size_t bucket, size_t nblocks, size_t n_req) const;
-    void capture_bucket_(size_t bucket);
+    /// ``mid_chunk_capture``: past_len=chunk_size, positions continue from past (exact mid key).
+    InfinilmModel::Input make_bucket_input_(size_t bucket,
+                                            size_t nblocks,
+                                            size_t n_req,
+                                            bool mid_chunk_capture = false) const;
+    /// MIXED dual-capture: n_req=2 continuing mid (~bucket-1 toks) + 1 decode tok @ chunk bucket.
+    InfinilmModel::Input make_mixed_mid_bucket_input_(size_t bucket, size_t nblocks) const;
+    void capture_bucket_(size_t bucket, bool mid_chunk_capture = false);
+    void capture_mixed_mid_bucket_(size_t bucket);
     void warmup_inductor_segments_(size_t nblocks, size_t n_req);
     void copy_runtime_into_bucket_(BucketGraphs &bucket_graphs,
                                    const InfinilmModel::Input &runtime,
@@ -78,12 +85,19 @@ private:
     RankBarrier *barrier_;
     bool enabled_{false};
     size_t max_seq_len_{0};
+    size_t prefill_chunk_size_{0};
     std::vector<size_t> capture_buckets_;
     std::vector<size_t> bs_to_padded_;
     size_t max_capture_req_{1};
     infinicore::Tensor block_tables_holder_;
     SharedPrefillBanks shared_banks_;
     std::unordered_map<size_t, BucketGraphs> compiled_;
+    /// Exact-width mid-chunk graphs for ``bucket == prefill_chunk_size`` (dual capture).
+    std::unordered_map<size_t, BucketGraphs> compiled_mid_;
+    /// MIXED mid+decode graphs for ``bucket == prefill_chunk_size`` (n_req=2, includes lm_head).
+    std::unordered_map<size_t, BucketGraphs> compiled_mixed_mid_;
+    /// Capture width used for ``compiled_mixed_mid_`` (normally 2).
+    size_t mixed_mid_capture_req_{2};
     size_t segment_replays_{0};
     size_t prefill_hits_{0};
     size_t prefill_misses_{0};

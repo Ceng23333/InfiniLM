@@ -30,12 +30,20 @@ inline bool vllm_capture_ladder_enabled() {
     return v != "0" && v != "false" && v != "no" && v != "off";
 }
 
+/// Shared step budget / chunk size. Prefer ``INFINI_MAX_NUM_BATCHED_TOKENS``
+/// (Python canonical); fall back to deprecated ``INFINI_PREFILL_CHUNK_SIZE``.
 inline size_t prefill_chunk_size_from_env(size_t default_size = 512) {
-    const char *raw = std::getenv("INFINI_PREFILL_CHUNK_SIZE");
-    if (raw == nullptr || raw[0] == '\0') {
-        return default_size;
+    if (const char *raw = std::getenv("INFINI_MAX_NUM_BATCHED_TOKENS")) {
+        if (raw[0] != '\0') {
+            return std::max<size_t>(1, static_cast<size_t>(std::stoul(raw)));
+        }
     }
-    return static_cast<size_t>(std::stoul(raw));
+    if (const char *raw = std::getenv("INFINI_PREFILL_CHUNK_SIZE")) {
+        if (raw[0] != '\0') {
+            return std::max<size_t>(1, static_cast<size_t>(std::stoul(raw)));
+        }
+    }
+    return default_size;
 }
 
 inline std::vector<size_t> vllm_piecewise_capture_sizes(size_t chunk_cap) {

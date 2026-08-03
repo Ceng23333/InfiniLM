@@ -25,6 +25,30 @@ inline bool repro_skip_midchunk_eager() {
     return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
+/// Part A / Gate D bisect: allow exact-width mid-chunk CG replay (final graphs).
+/// Keeps allow_inductor_pre_attn=false for mid unless SKIP_MIDCHUNK_EAGER also set.
+/// Do not enable in product defaults.
+inline bool repro_allow_midchunk_cg() {
+    const char *v = std::getenv("INFINI_PIECEWISE_REPRO_ALLOW_MIDCHUNK_CG");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+/// MIXED mid dual-capture bisect: force prefer ``compiled_mixed_mid_`` when present
+/// even if row layout is not the capture shape (n_req=2 decode 1 + mid~2047).
+/// Microbench only — do not enable in product defaults.
+inline bool repro_mixed_mid_cg() {
+    const char *v = std::getenv("INFINI_PIECEWISE_REPRO_MIXED_MID_CG");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+/// Product opt-in for MIXED mid CG replay (default OFF). Capture still runs when
+/// native piecewise is on; prefer requires this or REPRO_MIXED_MID_CG until
+/// LongBench quality gates pass (see midchunk Phase MIXED mid gate notes).
+inline bool enable_mixed_mid_cg() {
+    const char *v = std::getenv("INFINI_PIECEWISE_ENABLE_MIXED_MID_CG");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
 inline bool repro_skip_final_inductor() {
     const char *v = std::getenv("INFINI_PIECEWISE_REPRO_SKIP_FINAL_INDUCTOR");
     return v != nullptr && v[0] == '1' && v[1] == '\0';

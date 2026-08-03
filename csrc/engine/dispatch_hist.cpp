@@ -142,15 +142,16 @@ void record_mode(CudaGraphRuntimeMode mode, const char *none_reason) {
     maybe_dump_eager("periodic");
 }
 
-void record_piecewise_eager(bool pad_up, bool mid_chunk, bool missing_graph) {
+void record_piecewise_eager(bool pad_up, bool mid_chunk_eager, bool missing_graph) {
     auto &h = counters();
     if (pad_up) {
         h.pw_eager_pad_up.fetch_add(1, std::memory_order_relaxed);
-    } else if (mid_chunk) {
+    } else if (mid_chunk_eager) {
         h.pw_eager_mid_chunk.fetch_add(1, std::memory_order_relaxed);
     } else if (missing_graph) {
         h.pw_eager_missing_graph.fetch_add(1, std::memory_order_relaxed);
     } else {
+        // Final exact CG and exact-width mid CG (dual mid graphs) both land here.
         h.pw_exact_cg.fetch_add(1, std::memory_order_relaxed);
     }
 }
