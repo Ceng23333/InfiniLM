@@ -102,8 +102,23 @@ public:
                 return;
             }
         }
+        piecewise_pre_attn_qkv(positions, hidden_states, residual, staging);
+        piecewise_pre_attn_rope(positions, staging);
+    }
+
+    /// Layernorm + past-independent QKV (CG-capturable). No RoPE / inductor.
+    void piecewise_pre_attn_qkv(const infinicore::Tensor &positions,
+                                infinicore::Tensor &hidden_states,
+                                infinicore::Tensor &residual,
+                                global_state::PiecewiseLayerStaging &staging) const {
         input_layernorm_->forward_inplace(hidden_states, residual);
-        self_attn_->forward_pre_attn_piecewise(positions, hidden_states, staging);
+        self_attn_->forward_pre_attn_qkv_piecewise(positions, hidden_states, staging);
+    }
+
+    /// Eager RoPE on staging Q/K (host-break).
+    void piecewise_pre_attn_rope(const infinicore::Tensor &positions,
+                                 global_state::PiecewiseLayerStaging &staging) const {
+        self_attn_->forward_pre_attn_rope_piecewise(positions, staging);
     }
 
     void piecewise_eager_attn(const infinicore::Tensor &positions,

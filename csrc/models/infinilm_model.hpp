@@ -82,6 +82,14 @@ public:
                                                  const Input &input,
                                                  infinicore::Tensor &hidden_states,
                                                  infinicore::Tensor &residual) const;
+    /// Past-independent QKV half of pre_attn (CG-capturable). RoPE is separate.
+    virtual void native_piecewise_pre_attn_qkv_layer(size_t layer_idx,
+                                                     const Input &input,
+                                                     infinicore::Tensor &hidden_states,
+                                                     infinicore::Tensor &residual) const;
+    /// Eager RoPE half of pre_attn (host-break; uses live position_ids).
+    virtual void native_piecewise_pre_attn_rope_layer(size_t layer_idx,
+                                                      const Input &input) const;
     virtual void native_piecewise_eager_attn_layer(size_t layer_idx,
                                                      const Input &input) const;
     virtual void native_piecewise_post_attn_layer(size_t layer_idx,

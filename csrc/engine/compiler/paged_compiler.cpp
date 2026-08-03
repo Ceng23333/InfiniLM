@@ -348,7 +348,15 @@ PagedCompiler::CompiledResult PagedCompiler::capture_forward_graph_(InfinilmMode
                                          : infinicore::context::InferencePhase::Prefill;
     infinicore::context::InferencePhaseGuard phase_guard(phase);
 
+    // Eager dry-run before CG: size host/device caches outside recording.
+    // Prefill piecewise capture may leave MiniCPM gate_score_cache_ at bucket
+    // seq (e.g. 16); decode needs exact seq=1. Alloc/realloc inside
+    // startGraphRecording silently kills MetaX decode CG.
     barrier_->wait();
+    (void)model_->forward(input);
+    infinicore::context::syncDevice();
+    barrier_->wait();
+
     infinicore::context::startGraphRecording();
     auto output = model_->forward(input);
     auto graph = infinicore::context::stopGraphRecording();

@@ -19,6 +19,13 @@ public:
                                     const infinicore::Tensor &hidden_states,
                                     global_state::PiecewiseLayerStaging &staging) const;
 
+    void forward_pre_attn_qkv_piecewise(const infinicore::Tensor &positions,
+                                        const infinicore::Tensor &hidden_states,
+                                        global_state::PiecewiseLayerStaging &staging) const;
+
+    void forward_pre_attn_rope_piecewise(const infinicore::Tensor &positions,
+                                         global_state::PiecewiseLayerStaging &staging) const;
+
     infinicore::op::inductor_segment_impl::PreAttnExternalWeightTensors
     pre_attn_external_weights() const override;
 

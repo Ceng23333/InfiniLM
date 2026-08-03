@@ -114,9 +114,9 @@ infinicore::Tensor Attention::forward_static_(const infinicore::Tensor &position
     return output;
 }
 
-void Attention::forward_pre_attn_piecewise(const infinicore::Tensor &position_ids,
-                                           const infinicore::Tensor &hidden_states,
-                                           global_state::PiecewiseLayerStaging &staging) const {
+void Attention::forward_pre_attn_qkv_piecewise(const infinicore::Tensor &,
+                                               const infinicore::Tensor &hidden_states,
+                                               global_state::PiecewiseLayerStaging &staging) const {
     auto &piecewise = global_state::get_forward_context().piecewise;
     auto hidden_states_mutable = hidden_states;
     auto shape = hidden_states->shape();
@@ -146,6 +146,13 @@ void Attention::forward_pre_attn_piecewise(const infinicore::Tensor &position_id
         staging.k_rope->copy_from(k_heads);
         staging.v_rope->copy_from(v_heads);
     }
+}
+
+void Attention::forward_pre_attn_rope_piecewise(const infinicore::Tensor &position_ids,
+                                                global_state::PiecewiseLayerStaging &staging) const {
+    auto &piecewise = global_state::get_forward_context().piecewise;
+    const size_t seq_len = staging.q_rope->size(1);
+    const size_t valid_len = piecewise.valid_seq_len > 0 ? piecewise.valid_seq_len : seq_len;
 
     auto pos_shape = position_ids->shape();
     infinicore::Tensor pos_ids_for_rope = position_ids;
@@ -172,6 +179,13 @@ void Attention::forward_pre_attn_piecewise(const infinicore::Tensor &position_id
     }
     rotary_emb_->forward(q_rope, pos_ids_for_rope, true);
     rotary_emb_->forward(k_rope, pos_ids_for_rope, true);
+}
+
+void Attention::forward_pre_attn_piecewise(const infinicore::Tensor &position_ids,
+                                           const infinicore::Tensor &hidden_states,
+                                           global_state::PiecewiseLayerStaging &staging) const {
+    forward_pre_attn_qkv_piecewise(position_ids, hidden_states, staging);
+    forward_pre_attn_rope_piecewise(position_ids, staging);
 }
 
 void Attention::forward_eager_attn_piecewise(const infinicore::Tensor &,

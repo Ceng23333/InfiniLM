@@ -27,6 +27,15 @@ public:
                                     const infinicore::Tensor &hidden_states,
                                     global_state::PiecewiseLayerStaging &staging) const;
 
+    /// Piecewise: past-independent QKV write into staging (unrotated). Safe for CG.
+    void forward_pre_attn_qkv_piecewise(const infinicore::Tensor &positions,
+                                        const infinicore::Tensor &hidden_states,
+                                        global_state::PiecewiseLayerStaging &staging) const;
+
+    /// Piecewise: eager RoPE on staging Q/K using live position_ids (host-break).
+    void forward_pre_attn_rope_piecewise(const infinicore::Tensor &positions,
+                                         global_state::PiecewiseLayerStaging &staging) const;
+
     /// Piecewise prefill: KV cache + varlen attention (eager, outside graph).
     void forward_eager_attn_piecewise(const infinicore::Tensor &positions,
                                       global_state::PiecewiseLayerStaging &staging) const;

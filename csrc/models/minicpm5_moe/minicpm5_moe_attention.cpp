@@ -7,9 +7,11 @@
 #include "../../layers/attention/attention.hpp"
 #include "minicpm5_moe_router_cpu_detail.hpp"
 
+#include "infinicore/context/context.hpp"
 #include "infinicore/ops/mul.hpp"
 #include "infinicore/ops/sigmoid.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace infinilm::models::minicpm5_moe {
@@ -23,10 +25,66 @@ void ensure_same_shape_buf(infinicore::Tensor &buf, const infinicore::Tensor &li
     }
 }
 
-void store_gate_score(infinicore::Tensor &gate_buf, const infinicore::Tensor &gate) {
-    auto g = gate->contiguous();
-    ensure_same_shape_buf(gate_buf, g);
-    gate_buf->copy_from(g);
+bool same_trailing_dims_(const infinicore::Shape &a, const infinicore::Shape &b) {
+    if (a.size() != b.size() || a.empty()) {
+        return false;
+    }
+    for (size_t i = 1; i < a.size(); ++i) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void store_gate_score(infinicore::Tensor &gate_buf,
+                      infinicore::Tensor &gate_write_view,
+                      const infinicore::Tensor &gate) {
+    // Grow-only base buffer: multi-bucket piecewise CG records copy destinations by
+    // device pointer. Shrinking (exact-shape realloc) after bucket=2048 → 16 made
+    // earlier graphs write into freed/undersized memory → EM collapse / garbage.
+    // During CG: only copy_from into a write view prepared outside recording
+    // (narrow/empty HostOps inside startGraphRecording kill MetaX decode CG).
+    const bool recording = infinicore::context::isGraphRecording();
+    infinicore::Tensor g = gate->is_contiguous() ? gate : gate->contiguous();
+    const auto &gshape = g->shape();
+
+    const bool need_alloc = !gate_buf || gate_buf->dtype() != g->dtype()
+        || gate_buf->device() != g->device()
+        || !same_trailing_dims_(gate_buf->shape(), gshape)
+        || gate_buf->shape()[0] < gshape[0];
+
+    if (need_alloc) {
+        if (recording) {
+            throw std::runtime_error(
+                "MiniCPM5MoeAttention: gate_score_cache_ grow required during CG "
+                "(dry-run must grow-only allocate via C++ QKV path)");
+        }
+        auto alloc_shape = gshape;
+        if (gate_buf && same_trailing_dims_(gate_buf->shape(), gshape)
+            && gate_buf->dtype() == g->dtype() && gate_buf->device() == g->device()) {
+            alloc_shape[0] = std::max(gate_buf->shape()[0], gshape[0]);
+        }
+        gate_buf = infinicore::Tensor::empty(alloc_shape, g->dtype(), g->device());
+        gate_write_view = infinicore::Tensor{};
+    }
+
+    const bool view_ok = gate_write_view && gate_write_view->shape() == gshape
+        && gate_write_view->dtype() == g->dtype()
+        && gate_write_view->device() == g->device();
+    if (!view_ok) {
+        if (recording) {
+            throw std::runtime_error(
+                "MiniCPM5MoeAttention: gate_score_write_view_ unset/mismatch during CG "
+                "(dry-run must narrow write view outside recording)");
+        }
+        if (gate_buf->shape() == gshape) {
+            gate_write_view = gate_buf;
+        } else {
+            gate_write_view = gate_buf->narrow({{0, 0, gshape[0]}});
+        }
+    }
+    gate_write_view->copy_from(g);
 }
 
 infinicore::Tensor apply_gate_sigmoid_mul(const infinicore::Tensor &attn_output,
@@ -134,6 +192,7 @@ infinicore::Tensor MiniCPM5MoeAttention::forward(const infinicore::Tensor &posit
             q = qg_view->narrow({{3, 0, head_dim_}})->contiguous();
             auto gate = qg_view->narrow({{3, head_dim_, head_dim_}})->contiguous();
             store_gate_score(gate_score_cache_,
+                             gate_score_write_view_,
                              gate->view({batch_size, seq_len, num_attention_heads_ * head_dim_}));
         } else {
             ASSERT_EQ(batch_size, 1);
@@ -141,6 +200,7 @@ infinicore::Tensor MiniCPM5MoeAttention::forward(const infinicore::Tensor &posit
             q = qg_view->narrow({{2, 0, head_dim_}})->contiguous();
             auto gate = qg_view->narrow({{2, head_dim_, head_dim_}})->contiguous();
             store_gate_score(gate_score_cache_,
+                             gate_score_write_view_,
                              gate->view({seq_len, num_attention_heads_ * head_dim_}));
         }
     } else if (::infinilm::backends::AttentionBackend::STATIC_ATTN == attention_backend_) {
@@ -182,14 +242,17 @@ infinicore::Tensor MiniCPM5MoeAttention::forward(const infinicore::Tensor &posit
     }
 
     if (use_gated_attention_) {
-        attn_output = apply_gate_sigmoid_mul(attn_output, gate_score_cache_, gate_sigmoid_buf_);
+        // Use write view (current seq), not the grow-only max buffer.
+        attn_output = apply_gate_sigmoid_mul(
+            attn_output, gate_score_write_view_ ? gate_score_write_view_ : gate_score_cache_,
+            gate_sigmoid_buf_);
     }
     auto o = o_proj_->forward(attn_output);
     return o;
 }
 
-void MiniCPM5MoeAttention::forward_pre_attn_piecewise(
-    const infinicore::Tensor &position_ids,
+void MiniCPM5MoeAttention::forward_pre_attn_qkv_piecewise(
+    const infinicore::Tensor &,
     const infinicore::Tensor &hidden_states,
     global_state::PiecewiseLayerStaging &staging) const {
     auto &piecewise = global_state::get_forward_context().piecewise;
@@ -204,10 +267,13 @@ void MiniCPM5MoeAttention::forward_pre_attn_piecewise(
 
     infinicore::Tensor q_heads;
     if (use_gated_attention_) {
+        // Gate extract into stable per-layer cache (device copy; dry-run allocates).
+        // Gate *apply* stays with eager attn (host-break).
         auto qg_view = qg->view({1, seq_len, num_attention_heads_, 2 * head_dim_});
         auto q = qg_view->narrow({{3, 0, head_dim_}})->contiguous();
         auto gate = qg_view->narrow({{3, head_dim_, head_dim_}})->contiguous();
         store_gate_score(gate_score_cache_,
+                         gate_score_write_view_,
                          gate->view({seq_len, num_attention_heads_ * head_dim_}));
         q_heads = q->view({1, seq_len, num_attention_heads_, head_dim_});
     } else {
@@ -231,6 +297,14 @@ void MiniCPM5MoeAttention::forward_pre_attn_piecewise(
         staging.k_rope->copy_from(k_heads);
         staging.v_rope->copy_from(v_heads);
     }
+}
+
+void MiniCPM5MoeAttention::forward_pre_attn_rope_piecewise(
+    const infinicore::Tensor &position_ids,
+    global_state::PiecewiseLayerStaging &staging) const {
+    auto &piecewise = global_state::get_forward_context().piecewise;
+    const size_t seq_len = staging.q_rope->size(1);
+    const size_t valid_len = piecewise.valid_seq_len > 0 ? piecewise.valid_seq_len : seq_len;
 
     auto pos_shape = position_ids->shape();
     infinicore::Tensor pos_ids_for_rope = position_ids;
@@ -253,6 +327,14 @@ void MiniCPM5MoeAttention::forward_pre_attn_piecewise(
     rotary_emb_->forward(k_rope, pos_ids_for_rope, true);
 }
 
+void MiniCPM5MoeAttention::forward_pre_attn_piecewise(
+    const infinicore::Tensor &position_ids,
+    const infinicore::Tensor &hidden_states,
+    global_state::PiecewiseLayerStaging &staging) const {
+    forward_pre_attn_qkv_piecewise(position_ids, hidden_states, staging);
+    forward_pre_attn_rope_piecewise(position_ids, staging);
+}
+
 void MiniCPM5MoeAttention::forward_eager_attn_piecewise(
     const infinicore::Tensor &,
     global_state::PiecewiseLayerStaging &staging) const {
@@ -269,9 +351,15 @@ void MiniCPM5MoeAttention::forward_eager_attn_piecewise(
 
     auto attn_output = attn_->forward(q, k, v);
     if (use_gated_attention_ && gate_score_cache_) {
+        // Prefer grow-only cache + valid_len prefix: write_view_ may still be the
+        // last capture/eager seq (e.g. 16) after a larger bucket CG replay wrote
+        // into the shared base buffer.
         auto gate = gate_score_cache_;
         if (gate->shape().size() == 2 && gate->shape()[0] >= valid_len) {
             gate = gate->narrow({{0, 0, valid_len}});
+        } else if (gate_score_write_view_ && gate_score_write_view_->shape().size() == 2
+                   && gate_score_write_view_->shape()[0] >= valid_len) {
+            gate = gate_score_write_view_->narrow({{0, 0, valid_len}});
         }
         attn_output = apply_gate_sigmoid_mul(attn_output, gate, gate_sigmoid_buf_);
     }

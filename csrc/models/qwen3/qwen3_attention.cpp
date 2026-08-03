@@ -123,9 +123,9 @@ infinicore::Tensor Qwen3Attention::forward_paged_(const infinicore::Tensor &posi
     return output;
 }
 
-void Qwen3Attention::forward_pre_attn_piecewise(const infinicore::Tensor &position_ids,
-                                                const infinicore::Tensor &hidden_states,
-                                                global_state::PiecewiseLayerStaging &staging) const {
+void Qwen3Attention::forward_pre_attn_qkv_piecewise(const infinicore::Tensor &,
+                                                    const infinicore::Tensor &hidden_states,
+                                                    global_state::PiecewiseLayerStaging &staging) const {
     auto &piecewise = global_state::get_forward_context().piecewise;
     auto hidden_states_mutable = hidden_states;
     auto shape = hidden_states->shape();
@@ -160,31 +160,19 @@ void Qwen3Attention::forward_pre_attn_piecewise(const infinicore::Tensor &positi
         staging.k_rope->copy_from(k_staged);
         staging.v_rope->copy_from(v_heads);
     }
+}
 
-    auto pos_shape = position_ids->shape();
-    infinicore::Tensor pos_ids_for_rope = position_ids;
-    if (pos_shape.size() == 2) {
-        auto pos_narrowed = position_ids->narrow({{0, 0, 1}});
-        pos_ids_for_rope = pos_narrowed->view({pos_shape[1]});
-    } else if (pos_shape.size() == 1) {
-        pos_ids_for_rope = position_ids->contiguous();
-    } else {
-        throw std::runtime_error("Unexpected position_ids shape");
-    }
-    if (pos_ids_for_rope->size(0) > valid_len) {
-        pos_ids_for_rope = pos_ids_for_rope->narrow({{0, 0, valid_len}})->contiguous();
-    }
+void Qwen3Attention::forward_pre_attn_rope_piecewise(
+    const infinicore::Tensor &position_ids,
+    global_state::PiecewiseLayerStaging &staging) const {
+    Attention::forward_pre_attn_rope_piecewise(position_ids, staging);
+}
 
-    auto q_rope = staging.q_rope->view({seq_len, num_attention_heads_, head_dim_})->narrow({{0, 0, valid_len}});
-    auto k_rope = staging.k_rope->view({seq_len, num_key_value_heads_, head_dim_})->narrow({{0, 0, valid_len}});
-    if (!q_rope->is_contiguous()) {
-        q_rope = q_rope->contiguous();
-    }
-    if (!k_rope->is_contiguous()) {
-        k_rope = k_rope->contiguous();
-    }
-    rotary_emb_->forward(q_rope, pos_ids_for_rope, true);
-    rotary_emb_->forward(k_rope, pos_ids_for_rope, true);
+void Qwen3Attention::forward_pre_attn_piecewise(const infinicore::Tensor &position_ids,
+                                                const infinicore::Tensor &hidden_states,
+                                                global_state::PiecewiseLayerStaging &staging) const {
+    forward_pre_attn_qkv_piecewise(position_ids, hidden_states, staging);
+    forward_pre_attn_rope_piecewise(position_ids, staging);
 }
 
 infinicore::op::inductor_segment_impl::PreAttnExternalWeightTensors

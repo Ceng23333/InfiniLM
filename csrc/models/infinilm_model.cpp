@@ -100,6 +100,18 @@ void InfinilmModel::native_piecewise_pre_attn_layer(size_t,
     throw std::runtime_error("InfinilmModel: native_piecewise_pre_attn_layer not supported");
 }
 
+void InfinilmModel::native_piecewise_pre_attn_qkv_layer(size_t,
+                                                        const Input &,
+                                                        infinicore::Tensor &,
+                                                        infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_pre_attn_qkv_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_pre_attn_rope_layer(size_t,
+                                                         const Input &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_pre_attn_rope_layer not supported");
+}
+
 void InfinilmModel::native_piecewise_eager_attn_layer(size_t,
                                                       const Input &) const {
     throw std::runtime_error("InfinilmModel: native_piecewise_eager_attn_layer not supported");

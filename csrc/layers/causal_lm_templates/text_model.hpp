@@ -135,6 +135,21 @@ public:
             input.position_ids.value(), hidden_states, residual, staging);
     }
 
+    void piecewise_pre_attn_qkv_layer(size_t layer_idx,
+                                      const infinilm::InfinilmModel::Input &input,
+                                      infinicore::Tensor &hidden_states,
+                                      infinicore::Tensor &residual) const {
+        auto &staging = infinilm::global_state::get_forward_context().piecewise.layer_staging.at(layer_idx);
+        layers_.at(layer_idx)->piecewise_pre_attn_qkv(
+            input.position_ids.value(), hidden_states, residual, staging);
+    }
+
+    void piecewise_pre_attn_rope_layer(size_t layer_idx,
+                                       const infinilm::InfinilmModel::Input &input) const {
+        auto &staging = infinilm::global_state::get_forward_context().piecewise.layer_staging.at(layer_idx);
+        layers_.at(layer_idx)->piecewise_pre_attn_rope(input.position_ids.value(), staging);
+    }
+
     void piecewise_eager_attn_layer(size_t layer_idx,
                                     const infinilm::InfinilmModel::Input &input) const {
         auto &staging = infinilm::global_state::get_forward_context().piecewise.layer_staging.at(layer_idx);

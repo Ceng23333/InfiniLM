@@ -25,6 +25,15 @@ public:
                                     const infinicore::Tensor &hidden_states,
                                     global_state::PiecewiseLayerStaging &staging) const;
 
+    /// Past-independent QKV (+ gate extract into stable cache). Safe for CG.
+    void forward_pre_attn_qkv_piecewise(const infinicore::Tensor &positions,
+                                        const infinicore::Tensor &hidden_states,
+                                        global_state::PiecewiseLayerStaging &staging) const;
+
+    /// Eager RoPE on staging Q/K (host-break; uses live position_ids).
+    void forward_pre_attn_rope_piecewise(const infinicore::Tensor &positions,
+                                         global_state::PiecewiseLayerStaging &staging) const;
+
     void forward_eager_attn_piecewise(const infinicore::Tensor &positions,
                                       global_state::PiecewiseLayerStaging &staging) const;
 
@@ -68,7 +77,11 @@ protected:
 
     /// Stable per-layer gate buffers (avoid CG HostOp / free-list aliasing of
     /// per-forward ``contiguous()`` / ``sigmoid()`` temporaries).
+    /// ``gate_score_cache_`` is grow-only (never shrink) so multi-bucket CG
+    /// keeps a stable device pointer; ``gate_score_write_view_`` is a prefix
+    /// view rebuilt only outside recording for the current seq.
     mutable infinicore::Tensor gate_score_cache_;
+    mutable infinicore::Tensor gate_score_write_view_;
     mutable infinicore::Tensor gate_sigmoid_buf_;
 };
 

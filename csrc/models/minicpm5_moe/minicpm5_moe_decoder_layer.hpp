@@ -58,6 +58,16 @@ public:
                             infinicore::Tensor &residual,
                             global_state::PiecewiseLayerStaging &staging) const;
 
+    /// Layernorm + past-independent QKV (CG-capturable). No RoPE.
+    void piecewise_pre_attn_qkv(const infinicore::Tensor &positions,
+                                infinicore::Tensor &hidden_states,
+                                infinicore::Tensor &residual,
+                                global_state::PiecewiseLayerStaging &staging) const;
+
+    /// Eager RoPE on staging Q/K (host-break).
+    void piecewise_pre_attn_rope(const infinicore::Tensor &positions,
+                                 global_state::PiecewiseLayerStaging &staging) const;
+
     void piecewise_eager_attn(const infinicore::Tensor &positions,
                               global_state::PiecewiseLayerStaging &staging) const {
         self_attn_->forward_eager_attn_piecewise(positions, staging);

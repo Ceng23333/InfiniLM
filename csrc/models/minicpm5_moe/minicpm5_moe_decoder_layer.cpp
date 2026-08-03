@@ -143,8 +143,24 @@ void MiniCPM5MoeDecoderLayer::piecewise_pre_attn(
             return;
         }
     }
+    piecewise_pre_attn_qkv(positions, hidden_states, residual, staging);
+    piecewise_pre_attn_rope(positions, staging);
+}
+
+void MiniCPM5MoeDecoderLayer::piecewise_pre_attn_qkv(
+    const infinicore::Tensor &positions,
+    infinicore::Tensor &hidden_states,
+    infinicore::Tensor &residual,
+    global_state::PiecewiseLayerStaging &staging) const {
+    // Inductor packages include RoPE — only use them from full piecewise_pre_attn.
     input_layernorm_->forward_inplace(hidden_states, residual);
-    self_attn_->forward_pre_attn_piecewise(positions, hidden_states, staging);
+    self_attn_->forward_pre_attn_qkv_piecewise(positions, hidden_states, staging);
+}
+
+void MiniCPM5MoeDecoderLayer::piecewise_pre_attn_rope(
+    const infinicore::Tensor &positions,
+    global_state::PiecewiseLayerStaging &staging) const {
+    self_attn_->forward_pre_attn_rope_piecewise(positions, staging);
 }
 
 void MiniCPM5MoeDecoderLayer::piecewise_post_attn_cg(
