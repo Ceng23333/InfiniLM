@@ -16,7 +16,8 @@ Classification (for PR review):
   DEBUG — diagnostics / smoke baselines only:
     ``prefill_cg_debug_ptrs_enabled``, ``prefill_cg_baseline_none``,
     ``return_logits_enabled``, ``INFINI_PREFILL_MEM_PROFILE`` (see ``mem_profile.py``),
-    ``INFINI_FA_INGRAPH`` (diagnose-only; legacy ``INFINI_FA_FORCE_CAPTURE``).
+    ``INFINI_FA_INGRAPH`` (``off``|``decode``|``both``; truthy ``1``→``both``;
+      product ``full_and_piecewise`` defaults ``decode``; legacy ``FA_FORCE_CAPTURE``).
     ``INFINI_MOE_INGRAPH`` (``off``|``decode``|``prefill``|``both``; phase allow-list).
     ``INFINI_MOE_FORCE_HOST_BREAK`` (bisect: force MoE host-break).
     ``INFINI_MOE_METAX_INGRAPH_UNSAFE`` (MetaX wall opt-in; legacy METAX_CAPTURE_UNSAFE).
@@ -93,19 +94,34 @@ def cudagraph_policy() -> str:
     )
 
 
+def _fa_ingraph_mode() -> str:
+    """Parse ``INFINI_FA_INGRAPH``: ``off`` | ``decode`` | ``both``."""
+    raw = os.environ.get("INFINI_FA_INGRAPH", "").strip().lower()
+    if raw:
+        if raw in ("0", "false", "no", "off"):
+            return "off"
+        if raw == "decode":
+            return "decode"
+        if raw in ("1", "true", "yes", "on", "both"):
+            return "both"
+        return "off"
+    if _truthy("INFINI_FA_FORCE_CAPTURE", "0"):
+        return "both"
+    return "off"
+
+
 def _warn_fa_force_with_policy() -> None:
-    """FA_INGRAPH / legacy FA_FORCE is diagnose-only; warn when combined with policy."""
+    """Warn when FA_INGRAPH=both (Prefill+Decode); product path is decode."""
     global _FA_FORCE_POLICY_WARNED
-    if not (_truthy("INFINI_FA_INGRAPH", "0") or _truthy("INFINI_FA_FORCE_CAPTURE", "0")):
+    if _fa_ingraph_mode() != "both":
         return
     if _FA_FORCE_POLICY_WARNED:
         return
     logger.warning(
-        "INFINI_FA_INGRAPH=1 (or legacy FA_FORCE_CAPTURE) is diagnose-only; prefer "
-        "INFINI_CUDAGRAPH_POLICY=full_and_piecewise (FULL decode + FA "
-        "host-break + phase-scoped MoE via INFINI_MOE_INGRAPH + native prefill). "
-        "FA_INGRAPH remains a global override and does not restore production "
-        "FA-in-graph. MoE bisect: INFINI_MOE_FORCE_HOST_BREAK=1."
+        "INFINI_FA_INGRAPH=both (or 1 / legacy FA_FORCE_CAPTURE) enables FA "
+        "in-graph for Prefill and Decode; product full_and_piecewise path is "
+        "INFINI_FA_INGRAPH=decode (FULL decode segs≈1; prefill FA host-break). "
+        "Kill-switch: INFINI_FA_INGRAPH=0. MoE bisect: INFINI_MOE_FORCE_HOST_BREAK=1."
     )
     _FA_FORCE_POLICY_WARNED = True
 
@@ -157,15 +173,16 @@ def _normalize_moe_fa_env_aliases() -> None:
                 _MOE_METAX_UNSAFE_SHIM_WARNED = True
             _setdefault_env("INFINI_MOE_METAX_INGRAPH_UNSAFE", "1")
 
-    # FA_FORCE_CAPTURE → FA_INGRAPH
+    # FA_FORCE_CAPTURE → FA_INGRAPH=both (legacy truthy = Prefill+Decode)
     if _truthy("INFINI_FA_FORCE_CAPTURE", "0"):
         if not os.environ.get("INFINI_FA_INGRAPH", "").strip():
             if not _FA_INGRAPH_SHIM_WARNED:
                 logger.warning(
-                    "INFINI_FA_FORCE_CAPTURE is deprecated; use INFINI_FA_INGRAPH=1"
+                    "INFINI_FA_FORCE_CAPTURE is deprecated; use "
+                    "INFINI_FA_INGRAPH=decode (product) or both/1"
                 )
                 _FA_INGRAPH_SHIM_WARNED = True
-            _setdefault_env("INFINI_FA_INGRAPH", "1")
+            _setdefault_env("INFINI_FA_INGRAPH", "both")
 
 
 def _warn_prefill_native_with_policy() -> None:
@@ -201,14 +218,15 @@ def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
       No CG capture for decode/prefill (``DECODE_GRAPH_ONLY=1``,
       ``DECODE_PIECEWISE=0``). Native prefill off via policy.
     ``full_and_piecewise`` (MetaX contract; matches vLLM dual-mode)
-      Decode monolithic FULL for uniform decode batches; FA **host-break**;
+      Decode monolithic FULL for uniform decode batches; FA in-graph on
+      Decode via ``INFINI_FA_INGRAPH=decode`` (segs≈1; kill-switch ``0``/``off``);
       MoE Triton phase-scoped via ``INFINI_MOE_INGRAPH`` (default off /
       host-break; MetaX needs ``METAX_INGRAPH_UNSAFE``; bisect
       ``INFINI_MOE_FORCE_HOST_BREAK=1``). Prefill **native piecewise**
       for bucket hits including ragged/mixed multi-req (pad-up
-      ``num_tokens``; capture ``max_capture_req ≥ MAX_BATCH_SIZE``). Does
-      **not** set ``FA_INGRAPH``. ``INFINI_PREFILL_NATIVE_CG`` is not written
-      and is ignored when set.
+      ``num_tokens``; capture ``max_capture_req ≥ MAX_BATCH_SIZE``); prefill
+      FA stays host-break under ``decode``. ``INFINI_PREFILL_NATIVE_CG`` is
+      not written and is ignored when set.
     """
     if policy is None:
         p = cudagraph_policy()
@@ -231,10 +249,10 @@ def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
         return p
 
     # full_and_piecewise
-    # Decode FULL: FA host-break by default; MoE host-break on MetaX unless
-    # INFINI_MOE_INGRAPH + METAX_INGRAPH_UNSAFE (diagnose). FA-in-graph via
-    # INFINI_FA_INGRAPH. Prefill: native piecewise from policy (not PREFILL_NATIVE_CG).
-    # Ragged/mixed multi-req → PIECEWISE (pad-up num_tokens); FULL remains uniform decode only.
+    # Decode FULL: FA=decode (segs≈1); MoE host-break on MetaX unless
+    # INFINI_MOE_INGRAPH + METAX_INGRAPH_UNSAFE. Prefill: native piecewise
+    # (FA host-break under FA=decode). Explicit FA=0/off is a kill-switch
+    # (setdefault does not override). Ragged/mixed → PIECEWISE; FULL = uniform decode.
     _setdefault_env("INFINI_DECODE_GRAPH_ONLY", "0")
     _setdefault_env("INFINI_SKIP_MONOLITHIC_DECODE_CG", "0")
     _setdefault_env("INFINI_DECODE_PIECEWISE", "0")
@@ -247,9 +265,10 @@ def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
     )
     _setdefault_env("INFINI_MAX_NUM_BATCHED_TOKENS", "2048")
     _setdefault_env("INFINI_MUL_HOST_BREAK", "0")
+    _setdefault_env("INFINI_FA_INGRAPH", "decode")
     logger.info(
         "cudagraph_policy=full_and_piecewise "
-        "(FULL uniform decode + FA host-break + MetaX MoE host-break; "
+        "(FULL uniform decode + FA_INGRAPH=decode + MetaX MoE host-break; "
         "PIECEWISE prefill/mixed pad-up; MAX_BATCHED=2048)"
     )
     return p

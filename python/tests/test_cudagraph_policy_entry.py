@@ -56,6 +56,7 @@ class TestCudagraphPolicyEnv(unittest.TestCase):
             for k in (
                 "INFINI_CUDAGRAPH_POLICY",
                 "INFINI_FA_FORCE_CAPTURE",
+                "INFINI_FA_INGRAPH",
                 "INFINI_PREFILL_NATIVE_CG",
                 "INFINI_DECODE_GRAPH_ONLY",
                 "INFINI_DECODE_PIECEWISE",
@@ -99,9 +100,15 @@ class TestCudagraphPolicyEnv(unittest.TestCase):
         self.assertEqual(os.environ["INFINI_DECODE_PIECEWISE"], "0")
         self.assertEqual(os.environ["INFINI_DECODE_CG_BATCHES"], "1,2,4")
         self.assertIn("2048", os.environ["INFINI_NATIVE_CG_CAPTURE_BUCKETS"])
+        self.assertEqual(os.environ["INFINI_FA_INGRAPH"], "decode")
         self.assertNotIn("INFINI_FA_FORCE_CAPTURE", os.environ)
         self.assertNotIn("INFINI_MOE_FORCE_HOST_BREAK", os.environ)
         self.assertNotIn("INFINI_MOE_TRITON_CAPTURE", os.environ)
+
+    def test_fa_kill_switch_not_overridden(self) -> None:
+        os.environ["INFINI_FA_INGRAPH"] = "0"
+        self.env.apply_cudagraph_policy_env("full_and_piecewise")
+        self.assertEqual(os.environ["INFINI_FA_INGRAPH"], "0")
 
     def test_prefill_native_ignored_when_policy_set(self) -> None:
         os.environ["INFINI_PREFILL_NATIVE_CG"] = "0"
@@ -196,8 +203,8 @@ class TestEntryCudagraphPolicyCli(unittest.TestCase):
         self.assertIn("full_and_piecewise", text)
         self.assertIn("eager", text)
         self.assertIn("cudagraph-policy", text)
-        self.assertIn("host-break", text)
-        self.assertIn("Decode MoE", text)
+        self.assertIn("FA_INGRAPH=decode", text)
+        self.assertIn("MoE", text)
         self.assertIn("MIXED", text)
 
 
