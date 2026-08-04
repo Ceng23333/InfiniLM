@@ -305,24 +305,60 @@ void MiniCPM5MoeAttention::forward_pre_attn_rope_piecewise(
     auto &piecewise = global_state::get_forward_context().piecewise;
     const size_t seq_len = staging.q_rope->size(1);
     const size_t valid_len = piecewise.valid_seq_len > 0 ? piecewise.valid_seq_len : seq_len;
+    // Same address-stable contract as Attention::forward_pre_attn_rope_piecewise:
+    // no alloc/rebind of position_ids / QK under recording; past/pad via contents.
+    const bool addr_stable = infinicore::context::isGraphRecording()
+        || infinicore::context::isDeviceStreamCapturing()
+        || piecewise.compile_capture_active;
 
     auto pos_shape = position_ids->shape();
     infinicore::Tensor pos_ids_for_rope = position_ids;
     if (pos_shape.size() == 2) {
-        pos_ids_for_rope = position_ids->narrow({{0, 0, 1}})->contiguous()->view({pos_shape[1]});
+        auto pos_narrowed = position_ids->narrow({{0, 0, 1}});
+        if (addr_stable) {
+            pos_ids_for_rope = pos_narrowed->view({pos_shape[1]});
+        } else {
+            pos_ids_for_rope = pos_narrowed->contiguous()->view({pos_shape[1]});
+        }
     } else if (pos_shape.size() == 1) {
-        pos_ids_for_rope = position_ids->contiguous();
+        if (!addr_stable && !position_ids->is_contiguous()) {
+            pos_ids_for_rope = position_ids->contiguous();
+        }
     } else {
         throw std::runtime_error("MiniCPM5MoeAttention: Unexpected position_ids shape");
     }
     if (pos_ids_for_rope->size(0) > valid_len) {
-        pos_ids_for_rope = pos_ids_for_rope->narrow({{0, 0, valid_len}})->contiguous();
+        auto narrowed = pos_ids_for_rope->narrow({{0, 0, valid_len}});
+        if (addr_stable) {
+            if (!narrowed->is_contiguous()) {
+                throw std::runtime_error(
+                    "MiniCPM5MoeAttention::forward_pre_attn_rope_piecewise: "
+                    "position_ids narrow not contiguous under graph recording");
+            }
+            pos_ids_for_rope = narrowed;
+        } else {
+            pos_ids_for_rope = narrowed->contiguous();
+        }
     }
 
     auto q_rope = staging.q_rope->view({seq_len, num_attention_heads_, head_dim_})->narrow({{0, 0, valid_len}});
     auto k_rope = staging.k_rope->view({seq_len, num_key_value_heads_, head_dim_})->narrow({{0, 0, valid_len}});
-    if (!q_rope->is_contiguous()) q_rope = q_rope->contiguous();
-    if (!k_rope->is_contiguous()) k_rope = k_rope->contiguous();
+    if (!q_rope->is_contiguous()) {
+        if (addr_stable) {
+            throw std::runtime_error(
+                "MiniCPM5MoeAttention::forward_pre_attn_rope_piecewise: "
+                "q_rope not contiguous under graph recording");
+        }
+        q_rope = q_rope->contiguous();
+    }
+    if (!k_rope->is_contiguous()) {
+        if (addr_stable) {
+            throw std::runtime_error(
+                "MiniCPM5MoeAttention::forward_pre_attn_rope_piecewise: "
+                "k_rope not contiguous under graph recording");
+        }
+        k_rope = k_rope->contiguous();
+    }
     rotary_emb_->forward(q_rope, pos_ids_for_rope, true);
     rotary_emb_->forward(k_rope, pos_ids_for_rope, true);
 }

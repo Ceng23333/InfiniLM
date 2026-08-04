@@ -33,20 +33,53 @@ inline bool repro_allow_midchunk_cg() {
     return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
-/// MIXED mid dual-capture bisect: force prefer ``compiled_mixed_mid_`` when present
-/// even if row layout is not the capture shape (n_req=2 decode 1 + mid~2047).
-/// Microbench only — do not enable in product defaults.
+/// MIXED mid CG bisect: force prefer final token-bucket PIECEWISE banks for MIXED
+/// exact-width mid (same as ENABLE_MIXED_MID_CG). Microbench only — not a product default.
+/// Legacy name kept; no longer means layout-matched ``compiled_mixed_mid_`` prefer.
 inline bool repro_mixed_mid_cg() {
     const char *v = std::getenv("INFINI_PIECEWISE_REPRO_MIXED_MID_CG");
     return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
-/// Product opt-in for MIXED mid CG replay (default OFF). Capture still runs when
-/// native piecewise is on; prefer requires this or REPRO_MIXED_MID_CG until
-/// LongBench quality gates pass (see midchunk Phase MIXED mid gate notes).
+/// Product opt-in: MIXED exact-width mid may replay final PIECEWISE banks
+/// (``compiled_[bucket]`` QKV+post, eager RoPE/attn/lm_head). Default OFF (kill-switch:
+/// leave unset → MIXED mid stays eager). Does **not** mean layout-matched
+/// ``compiled_mixed_mid_`` prefer — dual-capture is skipped unless KEEP_MIXED_MID_CAPTURE.
 inline bool enable_mixed_mid_cg() {
     const char *v = std::getenv("INFINI_PIECEWISE_ENABLE_MIXED_MID_CG");
     return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+/// Legacy/bisect: still capture decode-first ``compiled_mixed_mid_`` banks (VRAM/time).
+/// Product default skips this dual-capture; prefer uses final ``compiled_`` instead.
+inline bool keep_mixed_mid_capture() {
+    const char *v = std::getenv("INFINI_PIECEWISE_KEEP_MIXED_MID_CAPTURE");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+/// Opt-in: skip host ``syncDevice()`` between QKV CG replay and eager RoPE.
+/// Only relevant when ``PRE_ATTN_QKV_ONLY=1`` (Phase-2c split). Product fused
+/// pre (LN+QKV+RoPE in one CG) does not need this fence. Default: sync ON.
+inline bool skip_qkv_rope_sync() {
+    const char *v = std::getenv("INFINI_PIECEWISE_SKIP_QKV_ROPE_SYNC");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+/// Kill-switch: capture/replay Phase-2c QKV-only pre CG + host-eager RoPE.
+/// Default OFF → product fused pre ``[CG: LN+QKV+RoPE]``.
+inline bool pre_attn_qkv_only() {
+    const char *v = std::getenv("INFINI_PIECEWISE_PRE_ATTN_QKV_ONLY");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+/// Prefill pad-up CG (seq_len < graph_bucket). Default ON when unset;
+/// ``INFINI_PIECEWISE_PAD_UP_CG=0`` restores legacy eager-only pad-up.
+inline bool piecewise_pad_up_cg_enabled() {
+    const char *v = std::getenv("INFINI_PIECEWISE_PAD_UP_CG");
+    if (v != nullptr && v[0] == '0' && v[1] == '\0') {
+        return false;
+    }
+    return true;
 }
 
 inline bool repro_skip_final_inductor() {

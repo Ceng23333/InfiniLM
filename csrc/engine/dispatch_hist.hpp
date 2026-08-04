@@ -8,9 +8,10 @@ namespace infinilm::engine::dispatch_hist {
 void record_mode(CudaGraphRuntimeMode mode, const char *none_reason);
 
 /// One step-level count for a PIECEWISE run_prefill entry after path is known.
-/// Priority: pad_up > mid_chunk_eager > missing_graph > exact_cg.
-/// ``mid_chunk_eager`` is true only when the mid path still ran eager (no mid CG /
-/// missing mid graphs); exact-width mid CG replay counts as exact_cg.
+/// Priority: pad_up_eager > mid_chunk_eager > missing_graph > exact_cg.
+/// ``pad_up`` here means *eager* pad-up (kill-switch / miss); successful pad-up
+/// CG counts as exact_cg. ``mid_chunk_eager`` is true only when the mid path
+/// still ran eager; exact-width / pad-up CG mid replay counts as exact_cg.
 void record_piecewise_eager(bool pad_up, bool mid_chunk_eager, bool missing_graph);
 
 /// Legacy noisy dump gated by INFINI_RANK_WORKER_PROFILE / hang_trace.

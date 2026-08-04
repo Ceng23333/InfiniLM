@@ -95,12 +95,24 @@ bool enable_mixed_mid_cg() {
     return infinilm::global_state::enable_mixed_mid_cg();
 }
 
+bool keep_mixed_mid_capture() {
+    return infinilm::global_state::keep_mixed_mid_capture();
+}
+
 bool scoped_inductor_pre_attn() {
     return infinilm::global_state::scoped_inductor_pre_attn_enabled();
 }
 
 bool repro_skip_final_inductor() {
     return infinilm::global_state::repro_skip_final_inductor();
+}
+
+bool pre_attn_qkv_only() {
+    return infinilm::global_state::pre_attn_qkv_only();
+}
+
+bool piecewise_pad_up_cg_enabled() {
+    return infinilm::global_state::piecewise_pad_up_cg_enabled();
 }
 
 bool bucket_inductor_capture_enabled(size_t bucket) {
@@ -627,12 +639,18 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_cap
 
     // Eager warmup dry-run before capture (NONE-equivalent).
     // Dry-run / capture use valid_seq_len==bucket (exact). Runtime mid-chunk
-    // with seq_len==graph_bucket shares this staging; pad-up does not.
-    // Use QKV+RoPE split explicitly so gate buffers are allocated before CG.
+    // with seq_len==graph_bucket shares this staging; pad-up CG replays the
+    // same banks with valid_seq_len=L + zeroed tails.
+    // Dry-run must allocate MiniCPM gate buffers before CG (outside recording).
+    const bool qkv_only = pre_attn_qkv_only();
     model_->native_piecewise_embed(graphs.input, hidden);
     for (size_t layer = 0; layer < capture_layers; ++layer) {
-        model_->native_piecewise_pre_attn_qkv_layer(layer, graphs.input, hidden, residual);
-        model_->native_piecewise_pre_attn_rope_layer(layer, graphs.input);
+        if (qkv_only) {
+            model_->native_piecewise_pre_attn_qkv_layer(layer, graphs.input, hidden, residual);
+            model_->native_piecewise_pre_attn_rope_layer(layer, graphs.input);
+        } else {
+            model_->native_piecewise_pre_attn_layer(layer, graphs.input, hidden, residual);
+        }
         if (infinilm::global_state::piecewise_inductor_segment_enabled()) {
             infinicore::context::syncDevice();
             barrier_->wait("piecewise_dry_run_pre_attn");
@@ -666,15 +684,23 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_cap
         piecewise.phase = global_state::PiecewiseCapturePhase::PreAttn;
 
         barrier_->wait("piecewise_capture_pre_attn");
-        // Always capture past-independent QKV only. Inductor AOT packages bake RoPE and
-        // must not enter the shape-keyed pre CG (replay always does eager RoPE after).
+        // Product: one pre piece [CG: LN+QKV+RoPE]. Kill-switch QKV_ONLY restores
+        // Phase-2c QKV CG + eager RoPE. Inductor AOT packages bake RoPE — keep
+        // allow_inductor_pre_attn=false so C++ path enters the shape-keyed CG.
         piecewise.allow_inductor_pre_attn = false;
-        infinicore::context::startGraphRecording();
-        model_->native_piecewise_pre_attn_qkv_layer(layer, graphs.input, hidden, residual);
-        graphs.pre_attn[layer] = infinicore::context::stopGraphRecording();
-        infinicore::context::syncStream();
-        model_->native_piecewise_pre_attn_rope_layer(layer, graphs.input);
-        infinicore::context::syncStream();
+        if (qkv_only) {
+            infinicore::context::startGraphRecording();
+            model_->native_piecewise_pre_attn_qkv_layer(layer, graphs.input, hidden, residual);
+            graphs.pre_attn[layer] = infinicore::context::stopGraphRecording();
+            infinicore::context::syncStream();
+            model_->native_piecewise_pre_attn_rope_layer(layer, graphs.input);
+            infinicore::context::syncStream();
+        } else {
+            infinicore::context::startGraphRecording();
+            model_->native_piecewise_pre_attn_layer(layer, graphs.input, hidden, residual);
+            graphs.pre_attn[layer] = infinicore::context::stopGraphRecording();
+            infinicore::context::syncStream();
+        }
 
         piecewise.phase = global_state::PiecewiseCapturePhase::EagerAttn;
         model_->native_piecewise_eager_attn_layer(layer, graphs.input);
@@ -710,11 +736,12 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_cap
     const size_t captured_segments =
         capture_layers * 2 + (mid_chunk_capture ? 0 : 1);
     spdlog::info(
-        "native piecewise CG: captured bucket={} mid={} layers={} segments={} pre=qkv_only",
+        "native piecewise CG: captured bucket={} mid={} layers={} segments={} pre={}",
         bucket,
         mid_chunk_capture,
         capture_layers,
-        captured_segments);
+        captured_segments,
+        qkv_only ? "qkv_only" : "qkv_rope");
 }
 
 void PiecewisePrefillCompiler::capture_mixed_mid_bucket_(size_t bucket) {
@@ -940,11 +967,13 @@ void PiecewisePrefillCompiler::compile() {
     for (size_t bucket : capture_buckets_) {
         capture_bucket_(bucket, /*mid_chunk_capture=*/false);
         infinicore::context::syncDevice();
-        // Dual capture: exact chunk-sized bucket also gets homo mid + MIXED mid keys.
+        // Dual capture: exact chunk-sized bucket also gets homo mid keys.
+        // MIXED dual-capture (compiled_mixed_mid_) is opt-in via KEEP_MIXED_MID_CAPTURE;
+        // product MIXED prefer replays final compiled_ banks (vLLM-like).
         if (bucket == prefill_chunk_size_ && prefill_chunk_size_ > 0) {
             capture_bucket_(bucket, /*mid_chunk_capture=*/true);
             infinicore::context::syncDevice();
-            if (mixed_mid_capture_req_ >= 2 && bucket >= 2) {
+            if (keep_mixed_mid_capture() && mixed_mid_capture_req_ >= 2 && bucket >= 2) {
                 capture_mixed_mid_bucket_(bucket);
                 infinicore::context::syncDevice();
             }
@@ -1099,8 +1128,11 @@ void PiecewisePrefillCompiler::copy_runtime_into_bucket_(BucketGraphs &bucket_gr
         ->narrow({{0, 0, valid_seq_len}})
         ->copy_from(runtime.slot_mapping.value());
     if (valid_seq_len < bucket) {
+        // Prefer decode-style pad hygiene: zero slot tails (not -1). Prefill FA is
+        // eager, but post CG may still touch padded width; -1 slots ATU under
+        // rearrange when pad-up CG is on.
         auto slot_tail = graph_input.slot_mapping.value()->narrow({{0, valid_seq_len, bucket - valid_seq_len}});
-        set_minus_one(slot_tail);
+        set_zeros(slot_tail);
         auto ids_tail = graph_input.input_ids.value()->narrow({{1, valid_seq_len, bucket - valid_seq_len}});
         set_zeros(ids_tail);
         auto pos_tail = graph_input.position_ids.value()->narrow({{0, valid_seq_len, bucket - valid_seq_len}});
@@ -1153,10 +1185,13 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         return std::nullopt;
     }
     const bool inductor_mode = infinilm::global_state::piecewise_inductor_segment_enabled();
-    // Pad-up (seq_len < graph_bucket): CG PlannedMeta bakes valid_len==bucket at
-    // capture; replaying that meta on a short chat SIGSEGVs. Use eager inductor
-    // with runtime piecewise.valid_seq_len instead (same AOT package).
+    // Pad-up (seq_len < graph_bucket): product default replays token-bucket CG with
+    // valid_seq_len=L + zeroed tails (INFINI_PIECEWISE_PAD_UP_CG, default ON).
+    // Kill-switch =0 restores legacy eager-only pad-up (PlannedMeta / SIGSEGV history).
     const bool pad_up = seq_len != graph_bucket;
+    const bool pad_up_cg_on = piecewise_pad_up_cg_enabled();
+    const bool pad_up_blocks_cg = pad_up && !pad_up_cg_on;
+    const bool qkv_only = pre_attn_qkv_only();
 
     const bool have_mid_graphs = [&]() {
         auto it = compiled_mid_.find(graph_bucket);
@@ -1171,13 +1206,14 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         if (it == compiled_mixed_mid_.end()) {
             return false;
         }
-        // MIXED dual-capture stores post + lm_head only; shape-keyed QKV is compiled_[bucket].
+        // Legacy KEEP_MIXED_MID_CAPTURE banks: post + lm_head only.
         return !it->second.post_attn.empty() && it->second.post_attn[0]
             && static_cast<bool>(it->second.lm_head);
     }();
-    // Runtime past of request 0 (representative). Mid dual-capture baked past>0;
-    // past==0 mid (first chunk of a long prompt) still SIGSEGVs under CG (Gate D /
-    // homo_mid 20260731) — keep that case eager. Continuing mids (past>0) use mid graphs.
+    (void)have_mixed_mid_graphs; // telemetry / legacy banks only; prefer uses final compiled_.
+    // Runtime past of request 0 (representative). Continuing homo mids (past>0) use
+    // compiled_mid_; first mid (past==0) uses shape-keyed final compiled_ pre+post
+    // (fused LN+QKV+RoPE CG by default; QKV_ONLY → eager RoPE).
     int32_t runtime_past0 = 0;
     if (input.past_sequence_lengths.has_value()
         && input.past_sequence_lengths.value()->size(0) > 0) {
@@ -1185,13 +1221,21 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         runtime_past0 = reinterpret_cast<const int32_t *>(cpu->data())[0];
     }
     const bool past_matches_mid_capture = runtime_past0 > 0;
-    // MIXED layout must match dual-capture: n_req=2 decode(1) + mid(bucket-1).
-    // v1 RUNNING pack typically emits decode before continuing mid.
+    // Shape-keyed QKV + post live on compiled_[bucket] (final capture).
+    const bool have_shape_qkv =
+        compiled_.count(graph_bucket) > 0
+        && !compiled_.at(graph_bucket).pre_attn.empty()
+        && compiled_.at(graph_bucket).pre_attn[0];
+    const bool have_final_post =
+        compiled_.count(graph_bucket) > 0
+        && !compiled_.at(graph_bucket).post_attn.empty()
+        && compiled_.at(graph_bucket).post_attn[0];
+    // Telemetry only: former layout gate 1+(bucket-1); prefer no longer requires it.
     bool mixed_layout_matches_capture = false;
     int32_t mixed_q0 = -1;
     int32_t mixed_q1 = -1;
     int32_t runtime_mid_past = runtime_past0;
-    if (runtime_n_req == mixed_mid_capture_req_ && input.input_offsets.has_value()
+    if (runtime_n_req >= 2 && input.input_offsets.has_value()
         && input.input_offsets.value()->size(0) >= runtime_n_req + 1) {
         auto off_cpu = input.input_offsets.value()->to(infinicore::Device::cpu());
         const auto *offs = reinterpret_cast<const int32_t *>(off_cpu->data());
@@ -1199,52 +1243,57 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         mixed_q1 = offs[2] - offs[1];
         const int32_t expect_mid_q = static_cast<int32_t>(graph_bucket) - 1;
         mixed_layout_matches_capture = (mixed_q0 == 1 && mixed_q1 == expect_mid_q);
-        if (mixed_layout_matches_capture && input.past_sequence_lengths.has_value()
+        if (input.past_sequence_lengths.has_value()
             && input.past_sequence_lengths.value()->size(0) >= 2) {
             auto past_cpu = input.past_sequence_lengths.value()->to(infinicore::Device::cpu());
-            // Row1 is continuing mid under decode-first capture.
+            // Row1 past under decode-first packs (telemetry).
             runtime_mid_past = reinterpret_cast<const int32_t *>(past_cpu->data())[1];
         }
     }
-    // Product: MIXED mid CG prefer is opt-in (ENABLE_MIXED_MID_CG / REPRO_MIXED_MID_CG).
-    // Default off: ENABLE=1 collapses LongBench EM (215547 lb_em≈0.017 vs Phase2 0.305).
-    const bool prefer_mixed_mid_graphs =
-        mid_chunk && need_lm_head && !pad_up && have_mixed_mid_graphs
-        && runtime_mid_past > 0
-        && (enable_mixed_mid_cg() || repro_mixed_mid_cg())
-        && (mixed_layout_matches_capture || repro_mixed_mid_cg());
+    // vLLM-like: MIXED exact-width (or pad-up CG) PIECEWISE uses final token-bucket
+    // graphs (compiled_[bucket]). ENABLE/REPRO is the product kill-switch.
+    const bool prefer_mixed_piecewise =
+        mid_chunk && need_lm_head && !pad_up_blocks_cg && have_shape_qkv && have_final_post
+        && (enable_mixed_mid_cg() || repro_mixed_mid_cg());
+    // Alias for greppability with prior probe strings.
+    const bool prefer_mixed_mid_graphs = prefer_mixed_piecewise;
     // Product: exact homogeneous mid + past>0 → mid dual-capture graphs.
-    // MIXED without mixed-mid hit stays eager (Phase2 gate 200231 if homo mid reused).
-    // Part A bisect: ALLOW_MIDCHUNK_CG forces final graphs on mid (Gate D / 143915).
+    // Part A bisect: ALLOW_MIDCHUNK_CG forces final graphs on mid.
     const bool prefer_mid_graphs =
-        !prefer_mixed_mid_graphs
-        && mid_chunk && !need_lm_head && !pad_up && have_mid_graphs
+        !prefer_mixed_piecewise
+        && mid_chunk && !need_lm_head && !pad_up_blocks_cg && have_mid_graphs
         && past_matches_mid_capture && !repro_allow_midchunk_cg();
-    auto &bucket_graphs = prefer_mixed_mid_graphs
-        ? compiled_mixed_mid_.at(graph_bucket)
-        : (prefer_mid_graphs ? compiled_mid_.at(graph_bucket) : compiled_.at(graph_bucket));
+    // Product: homogeneous first mid (past==0) → final shape-keyed pre+post (not
+    // compiled_mid_, which was captured with past=chunk_size). Do not route onto mid banks.
+    const bool prefer_past0_mid_final_graphs =
+        !prefer_mixed_piecewise
+        && mid_chunk && !need_lm_head && !pad_up_blocks_cg && have_shape_qkv
+        && runtime_past0 == 0;
+    // bucket_graphs: prefer_mid → compiled_mid_; else compiled_ (mixed + past0 + final).
+    auto &bucket_graphs = prefer_mid_graphs
+        ? compiled_mid_.at(graph_bucket)
+        : compiled_.at(graph_bucket);
 
-    // Mid CG ok when dual mid / mixed-mid graphs selected, or repro lifts the gate onto final graphs.
+    // Mid CG ok: past>0 mid / MIXED final-bank / past0→final, or repro lifts onto final graphs.
     const bool mid_cg_ok =
         prefer_mid_graphs
-        || prefer_mixed_mid_graphs
-        || (mid_chunk && !pad_up
+        || prefer_mixed_piecewise
+        || prefer_past0_mid_final_graphs
+        || (mid_chunk && !pad_up_blocks_cg
             && (repro_allow_midchunk_cg() || repro_skip_midchunk_eager()));
     const bool force_mid_eager = mid_chunk && !mid_cg_ok;
-    // Shape-keyed QKV graphs live on compiled_[bucket] (final capture); MIXED prefer
-    // reuses those for pre and mixed post/lm_head I/O from bucket_graphs.
-    const bool have_shape_qkv =
-        compiled_.count(graph_bucket) > 0
-        && !compiled_.at(graph_bucket).pre_attn.empty()
-        && compiled_.at(graph_bucket).pre_attn[0];
-    // Step-level eager hist: pad_up > mid_chunk > missing > exact_cg.
+    // Step-level eager hist: pad_up_eager > mid_chunk > missing > exact_cg.
+    // Successful pad-up CG counts as exact_cg (not pw_eager_pad_up).
     {
         const bool missing_graph =
             (!have_shape_qkv
              && (bucket_graphs.pre_attn.empty() || !bucket_graphs.pre_attn[0]))
             || bucket_graphs.post_attn.empty() || !bucket_graphs.post_attn[0];
-        const bool mid_chunk_eager = force_mid_eager;
-        dispatch_hist::record_piecewise_eager(pad_up, mid_chunk_eager, missing_graph);
+        const bool use_pad_up_cg =
+            pad_up && pad_up_cg_on && !missing_graph && !force_mid_eager;
+        const bool pad_up_eager = pad_up && !use_pad_up_cg;
+        const bool mid_chunk_eager = force_mid_eager && !pad_up_eager;
+        dispatch_hist::record_piecewise_eager(pad_up_eager, mid_chunk_eager, missing_graph);
     }
     const double t_copy0 = profile ? monotonic_ms() : 0.0;
     copy_runtime_into_bucket_(bucket_graphs, input, seq_len);
@@ -1268,14 +1317,21 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     piecewise.ar_staging = bucket_graphs.ar_staging;
     piecewise.layer_staging = bucket_graphs.layer_staging;
     if (!mid_chunk) {
-        // Exact-width and pad-up final chunks both use inductor when enabled.
+        // Exact-width and pad-up final chunks both use inductor when enabled *and*
+        // not taking native pad-up CG (kill-switch / miss falls back to eager AOT).
         // Pad-up still sets piecewise.valid_seq_len=L; AOT pads positions/hidden to bucket.
-        piecewise.allow_inductor_pre_attn = inductor_mode && !repro_skip_final_inductor();
+        piecewise.allow_inductor_pre_attn =
+            inductor_mode && !repro_skip_final_inductor()
+            && (pad_up_blocks_cg || !pad_up);
+    } else if (prefer_past0_mid_final_graphs || prefer_mixed_piecewise || prefer_mid_graphs) {
+        // Product mid CG prefers: fused pre CG (or QKV_ONLY+eager RoPE) — never
+        // fused PreAttn AOTI (packages bake RoPE; incompatible with host-break RoPE).
+        piecewise.allow_inductor_pre_attn = false;
     } else if (repro_skip_midchunk_eager()) {
         // A2: stress inductor-in-CG mid (out of product default).
         piecewise.allow_inductor_pre_attn = inductor_mode;
     } else {
-        // Mid dual-capture / product mid: keep inductor out of mid path.
+        // Remaining mid paths: keep inductor out.
         piecewise.allow_inductor_pre_attn = false;
     }
 
@@ -1290,54 +1346,71 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     model_->native_piecewise_embed(bucket_graphs.input, piecewise.hidden_states);
 
 
-    // Layer count: MIXED prefer has empty pre_attn; use post_attn / shape QKV size.
+    // Layer count from final/mid banks (MIXED prefer now shares compiled_ with past0/final).
     const size_t num_layers = !bucket_graphs.post_attn.empty()
         ? bucket_graphs.post_attn.size()
         : (have_shape_qkv ? compiled_.at(graph_bucket).pre_attn.size()
                           : bucket_graphs.pre_attn.size());
     // Mid with dual mid graphs: CG replay; inductor-in-CG layers stay eager unless A2.
     // Final-chunk inductor pre-attn needs the same eager post replay (B4 tail).
-    // Pad-up: always eager post/lm_head (CG PlannedMeta bakes full-bucket shapes).
-    // Homo mid graphs omit lm_head — MIXED without mixed-mid hit uses eager lm_head.
-    // MIXED mid prefer: shape-keyed QKV CG + eager RoPE + MIXED post CG; lm_head eager.
-    // Keep inductor→eager-post coupling for final (B4) even though pre is now QKV-only CG.
+    // Pad-up: CG when PAD_UP_CG on; legacy kill-switch forces eager post/lm_head.
+    // MIXED prefer: pre CG + eager attn + post CG from compiled_; lm_head always eager
+    // when mid+need_lm_head (live is_final_prefill_chunk; do not replay capture-baked gather).
     const bool use_eager_post =
-        pad_up
+        pad_up_blocks_cg
         || force_mid_eager
         || (inductor_mode && piecewise.allow_inductor_pre_attn);
     const bool use_eager_lm_head =
-        pad_up
+        pad_up_blocks_cg
         || force_mid_eager
+        || (need_lm_head && mid_chunk)
         || prefer_mid_graphs
-        || prefer_mixed_mid_graphs
+        || prefer_past0_mid_final_graphs
         || !bucket_graphs.lm_head
         || (inductor_mode && piecewise.allow_inductor_pre_attn);
     {
-        // Telemetry for Part A/C: first past=0 mid and first past>0 mid at exact bucket.
+        // Telemetry: first past=0 mid, first past>0 homo mid, first MIXED mid prefer,
+        // and first short final pad-up CG.
         static bool logged_mid_past0 = false;
         static bool logged_mid_past_gt0 = false;
         static bool logged_mixed_mid = false;
-        if (mid_chunk && !pad_up && graph_bucket >= 2048) {
+        static bool logged_pad_up_cg = false;
+        if (pad_up && pad_up_cg_on && !force_mid_eager && !logged_pad_up_cg) {
+            logged_pad_up_cg = true;
+            spdlog::info(
+                "pad_up_cg=true valid_seq_len={} graph_bucket={} mid_chunk={} "
+                "pre_rope_in_cg={}",
+                seq_len,
+                graph_bucket,
+                mid_chunk,
+                !qkv_only);
+        }
+        if (mid_chunk && !pad_up_blocks_cg && graph_bucket >= 2048) {
             const bool do_log = (runtime_past0 <= 0 && !logged_mid_past0)
-                || (runtime_past0 > 0 && !logged_mid_past_gt0)
-                || (prefer_mixed_mid_graphs && !logged_mixed_mid)
-                || (need_lm_head && runtime_past0 > 0 && !logged_mixed_mid);
+                || (runtime_past0 > 0 && !need_lm_head && !logged_mid_past_gt0)
+                || (prefer_mixed_piecewise && !logged_mixed_mid)
+                || (need_lm_head && !logged_mixed_mid);
             if (do_log) {
-                if (runtime_past0 <= 0) {
+                if (runtime_past0 <= 0 && !need_lm_head) {
                     logged_mid_past0 = true;
                 } else if (!need_lm_head) {
                     logged_mid_past_gt0 = true;
                 }
-                if (need_lm_head && runtime_past0 > 0) {
+                if (prefer_mixed_piecewise || need_lm_head) {
                     logged_mixed_mid = true;
                 }
+                const bool pre_cg =
+                    have_shape_qkv && !pad_up_blocks_cg && !force_mid_eager;
                 spdlog::info(
                     "mid_chunk_cg_probe: mid_chunk={} past_len={} mid_past={} seq_len={} "
                     "graph_bucket={} force_mid_eager={} prefer_mid_graphs={} "
-                    "prefer_mixed_mid_graphs={} mid_cg_ok={} past_matches_mid_capture={} "
+                    "prefer_past0_mid_final_graphs={} prefer_mixed_piecewise={} "
+                    "prefer_mixed_mid_graphs={} "
+                    "mid_cg_ok={} past_matches_mid_capture={} "
                     "mixed_layout_matches_capture={} mixed_q0={} mixed_q1={} n_req={} "
-                    "allow_inductor_pre_attn={} use_eager_post={} "
-                    "pre_qkv_cg={} pre_rope_eager=1 have_shape_qkv={}",
+                    "allow_inductor_pre_attn={} use_eager_post={} use_eager_lm_head={} "
+                    "pre_qkv_cg={} pre_rope_in_cg={} pre_rope_eager={} "
+                    "have_shape_qkv={} have_final_post={} pad_up={} pad_up_cg_on={}",
                     mid_chunk,
                     runtime_past0,
                     runtime_mid_past,
@@ -1345,6 +1418,8 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
                     graph_bucket,
                     force_mid_eager,
                     prefer_mid_graphs,
+                    prefer_past0_mid_final_graphs,
+                    prefer_mixed_piecewise,
                     prefer_mixed_mid_graphs,
                     mid_cg_ok,
                     past_matches_mid_capture,
@@ -1354,8 +1429,14 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
                     runtime_n_req,
                     piecewise.allow_inductor_pre_attn,
                     use_eager_post,
-                    have_shape_qkv && !pad_up && !force_mid_eager,
-                    have_shape_qkv);
+                    use_eager_lm_head,
+                    pre_cg,
+                    pre_cg && !qkv_only,
+                    pre_cg && qkv_only,
+                    have_shape_qkv,
+                    have_final_post,
+                    pad_up,
+                    pad_up_cg_on);
             }
         }
     }
@@ -1367,38 +1448,39 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         const bool inductor_layer_mid =
             mid_chunk && layer_capture_inductor_pre_attn(layer, graph_bucket)
             && !repro_skip_midchunk_eager();
-        // Shape-keyed QKV CG is RoPE-free; always follow with eager RoPE when used.
-        // Prefer QKV CG over inductor-in-pre (AOT packages bake RoPE and cannot split).
-        // Pad-up / force_mid_eager / mid-inductor stress still take eager full pre.
+        // Product: fused pre CG (LN+QKV+RoPE). QKV_ONLY kill-switch: QKV CG + eager RoPE.
+        // Prefer shape-keyed CG over inductor-in-pre (AOT packages bake RoPE).
+        // Legacy pad-up kill-switch / force_mid_eager / mid-inductor stress → eager full pre.
         const bool force_eager_pre =
-            pad_up
+            pad_up_blocks_cg
             || force_mid_eager
             || inductor_layer_mid;
 
-        // Prefer path QKV selection:
-        // - MIXED prefer: shape-keyed final compiled_[bucket] QKV (MIXED capture skips pre)
-        // - else: bucket_graphs.pre_attn (final / homo mid — same addresses as that I/O binding)
-        std::shared_ptr<infinicore::graph::Graph> qkv_graph;
+        // Prefer path pre: bucket_graphs is compiled_ for MIXED/past0/final, or
+        // compiled_mid_ for homo continuing mid.
+        std::shared_ptr<infinicore::graph::Graph> pre_graph;
         if (!force_eager_pre) {
-            if (prefer_mixed_mid_graphs && have_shape_qkv
-                && layer < compiled_.at(graph_bucket).pre_attn.size()
-                && compiled_.at(graph_bucket).pre_attn[layer]) {
-                qkv_graph = compiled_.at(graph_bucket).pre_attn[layer];
-            } else if (layer < bucket_graphs.pre_attn.size()
-                       && bucket_graphs.pre_attn[layer]) {
-                qkv_graph = bucket_graphs.pre_attn[layer];
+            if (layer < bucket_graphs.pre_attn.size()
+                && bucket_graphs.pre_attn[layer]) {
+                pre_graph = bucket_graphs.pre_attn[layer];
             } else if (have_shape_qkv && layer < compiled_.at(graph_bucket).pre_attn.size()
                        && compiled_.at(graph_bucket).pre_attn[layer]) {
-                qkv_graph = compiled_.at(graph_bucket).pre_attn[layer];
+                pre_graph = compiled_.at(graph_bucket).pre_attn[layer];
             }
         }
 
-        if (qkv_graph) {
-            qkv_graph->run();
+        if (pre_graph) {
+            pre_graph->run();
             ++segment_replays_;
-            // RoPE must see QKV staging writes; graph replay may be async on MetaX.
-            infinicore::context::syncDevice();
-            model_->native_piecewise_pre_attn_rope_layer(layer, bucket_graphs.input);
+            if (qkv_only) {
+                // Phase-2c: RoPE must see QKV staging writes; graph replay may be async.
+                // Opt-in skip via INFINI_PIECEWISE_SKIP_QKV_ROPE_SYNC=1.
+                if (!global_state::skip_qkv_rope_sync()) {
+                    infinicore::context::syncDevice();
+                }
+                model_->native_piecewise_pre_attn_rope_layer(layer, bucket_graphs.input);
+            }
+            // else: fused pre already includes RoPE — no host break / sync.
         } else {
             // Eager full pre (QKV+RoPE / inductor package when allowed).
             model_->native_piecewise_pre_attn_layer(
