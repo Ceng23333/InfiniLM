@@ -3,8 +3,9 @@
 """Minimal FusedMoE microbench for hcTracer (no vLLM, no serve).
 
 Modes:
-  launcher    — fused_moe_routed only for M in {1,16}, TOP_K=16
+  launcher    — fused_moe_routed only for M in {1,16,256,2048}, TOP_K=16
   align_only  — moe_align_block_size x2 (stage1+stage2 block sizes), no Triton
+  align_tax   — E_align (eager) vs C_align (capture path) @ M (default 2048)
   aoti_b16    — aoti_load_package(moe_B16/segment.pt2) with hidden [1,16,H]
   cpp_pad_m1  — C++ inductor_moe_ path: hidden [1,1,H] → pad to B16 (decode pad tax)
   host_split  — Phase 0 attribution: timed align/.item/opaque + mode grid (M=1)
@@ -26,6 +27,7 @@ from pathlib import Path
 
 
 H, E, N, TOP_K = 2048, 160, 512, 16
+LAUNCHER_M_ALLOWED = (1, 16, 256, 2048)
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
 
@@ -113,8 +115,10 @@ def _run_launcher(args) -> int:
     device = torch.device("cuda", 0)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     M = int(args.M)
-    if M not in (1, 16):
-        raise ValueError(f"launcher mode expects M in {{1,16}}, got {M}")
+    if M not in LAUNCHER_M_ALLOWED:
+        raise ValueError(
+            f"launcher mode expects M in {LAUNCHER_M_ALLOWED}, got {M}"
+        )
 
     print(f"[profile-moe] mode=launcher M={M} TOP_K={TOP_K} H={H} E={E} N={N}")
     print(f"[profile-moe] launcher_hash={launcher_hash()}")
@@ -126,13 +130,27 @@ def _run_launcher(args) -> int:
     def once():
         return fused_moe_routed(x, topk_w, topk_ids, w_gu, w_d)
 
-    _run_timed(
+    ms = _run_timed(
         f"launcher_m{M}",
         once,
         warmup=args.warmup,
         iters=args.iters,
         device=device,
     )
+    if args.out_dir:
+        import json
+
+        out = {
+            "mode": "launcher",
+            "M": M,
+            "host_ms_per_iter": ms,
+            "warmup": args.warmup,
+            "iters": args.iters,
+            "launcher_hash": launcher_hash(),
+        }
+        path = Path(args.out_dir) / f"launcher_m{M}_summary.json"
+        path.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
+        print(f"[profile-moe] wrote {path}", flush=True)
     return 0
 
 
@@ -146,8 +164,10 @@ def _run_align_only(args) -> int:
     _refuse_vllm()
     device = __import__("torch").device("cuda", 0)
     M = int(args.M)
-    if M not in (1, 16):
-        raise ValueError(f"align_only mode expects M in {{1,16}}, got {M}")
+    if M not in LAUNCHER_M_ALLOWED:
+        raise ValueError(
+            f"align_only mode expects M in {LAUNCHER_M_ALLOWED}, got {M}"
+        )
 
     print(f"[profile-moe] mode=align_only M={M} TOP_K={TOP_K} H={H} E={E} N={N}")
     print(f"[profile-moe] launcher_hash={launcher_hash()}")
@@ -172,6 +192,102 @@ def _run_align_only(args) -> int:
         device=device,
     )
     return 0
+
+
+def _run_align_tax(args) -> int:
+    """E_align (eager argsort) vs C_align (capture O(n²)/kernel path) @ M."""
+    import json
+
+    import torch
+
+    from infinilm.kernels.fused_moe_runtime import (
+        _moe_align_block_size_capture,
+        get_moe_config_for_m,
+        launcher_hash,
+        moe_align_block_size,
+    )
+
+    _refuse_vllm()
+    device = torch.device("cuda", 0)
+    M = int(args.M)
+    if M not in LAUNCHER_M_ALLOWED:
+        raise ValueError(
+            f"align_tax mode expects M in {LAUNCHER_M_ALLOWED}, got {M}"
+        )
+
+    print(f"[profile-moe] mode=align_tax M={M} TOP_K={TOP_K} E={E} N={N}")
+    print(f"[profile-moe] launcher_hash={launcher_hash()}")
+    print(
+        "[profile-moe] C_align calls _moe_align_block_size_capture directly "
+        "(same device algo as under hcStream capture; arena→torch.empty fallback)",
+        flush=True,
+    )
+
+    topk_ids = torch.randint(0, E, (M, TOP_K), device=device, dtype=torch.int32)
+    cfg1 = get_moe_config_for_m(M, E=E, N=N, H=H, stage="stage1")
+    cfg2 = get_moe_config_for_m(M, E=E, N=N, H=H, stage="stage2")
+    bs1 = int(cfg1["BLOCK_SIZE_M"])
+    bs2 = int(cfg2["BLOCK_SIZE_M"])
+    numel = M * TOP_K
+    graph_eager_delta_ms = 22.0  # ~post_graph_run A0−A1 MoE layer (pw_graph_tax)
+
+    def eager_once():
+        moe_align_block_size(topk_ids, bs1, E)
+        moe_align_block_size(topk_ids, bs2, E)
+
+    def capture_once():
+        # Force capture algorithm without TLS/CaptureArena (empty→torch.empty).
+        _moe_align_block_size_capture(topk_ids, bs1, E)
+        _moe_align_block_size_capture(topk_ids, bs2, E)
+
+    e_ms = _run_timed(
+        f"E_align_m{M}",
+        eager_once,
+        warmup=args.warmup,
+        iters=args.iters,
+        device=device,
+    )
+    c_ms = _run_timed(
+        f"C_align_m{M}",
+        capture_once,
+        warmup=args.warmup,
+        iters=args.iters,
+        device=device,
+    )
+    ratio = (c_ms / e_ms) if e_ms > 0 else float("inf")
+    explains = (c_ms / graph_eager_delta_ms) if graph_eager_delta_ms > 0 else None
+    gate_ratio_ok = ratio >= 3.0
+    gate_explain_ok = explains is not None and explains >= 0.5
+    gate_pass = bool(gate_ratio_ok or gate_explain_ok)
+
+    out = {
+        "mode": "align_tax",
+        "M": M,
+        "TOP_K": TOP_K,
+        "E": E,
+        "numel": numel,
+        "BLOCK_SIZE_M_stage1": bs1,
+        "BLOCK_SIZE_M_stage2": bs2,
+        "E_align_ms": e_ms,
+        "C_align_ms": c_ms,
+        "C_over_E": ratio,
+        "graph_eager_delta_ms_ref": graph_eager_delta_ms,
+        "C_align_frac_of_delta": explains,
+        "gate": {
+            "C_over_E_ge_3": gate_ratio_ok,
+            "C_explains_ge_50pct_delta": gate_explain_ok,
+            "pass": gate_pass,
+        },
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "launcher_hash": launcher_hash(),
+    }
+    print("[profile-moe] ALIGN_TAX " + json.dumps(out, sort_keys=True), flush=True)
+    if args.out_dir:
+        path = Path(args.out_dir) / "ALIGN_TAX.json"
+        path.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
+        print(f"[profile-moe] wrote {path}", flush=True)
+    return 0 if gate_pass else 2
 
 
 def _run_aoti_b16(args) -> int:
@@ -572,9 +688,21 @@ def main() -> int:
     ap.add_argument(
         "--mode",
         required=True,
-        choices=("launcher", "align_only", "aoti_b16", "cpp_pad_m1", "host_split"),
+        choices=(
+            "launcher",
+            "align_only",
+            "align_tax",
+            "aoti_b16",
+            "cpp_pad_m1",
+            "host_split",
+        ),
     )
-    ap.add_argument("--M", type=int, default=1, help="launcher/align_only token count (1 or 16)")
+    ap.add_argument(
+        "--M",
+        type=int,
+        default=1,
+        help=f"launcher/align_only token count {LAUNCHER_M_ALLOWED}",
+    )
     ap.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float16"))
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     ap.add_argument("--iters", type=int, default=DEFAULT_ITERS)
@@ -611,6 +739,8 @@ def main() -> int:
             rc = _run_launcher(args)
         elif args.mode == "align_only":
             rc = _run_align_only(args)
+        elif args.mode == "align_tax":
+            rc = _run_align_tax(args)
         elif args.mode == "host_split":
             if not args.segment_pt2:
                 # Allow host_split without AOTI if segment missing; warn.
@@ -633,7 +763,7 @@ def main() -> int:
             f"[profile-moe] cache_files before={before} after={after}",
             flush=True,
         )
-        if after > before and args.mode not in ("align_only", "host_split"):
+        if after > before and args.mode not in ("align_only", "align_tax", "host_split"):
             raise RuntimeError(
                 f"Triton cache grew during JIT-off profile ({before} → {after}); "
                 "cubins incomplete for this shape/TOP_K"

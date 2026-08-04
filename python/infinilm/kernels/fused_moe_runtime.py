@@ -194,6 +194,35 @@ def _write_zeros_to_output(
 
 
 @triton.jit
+def _moe_align_capture_place_kernel(
+    flat_ptr,
+    padded_offsets_ptr,
+    cursor_ptr,
+    sorted_ids_ptr,
+    expert_ids_ptr,
+    n,
+    block_size,
+    BLOCK: tl.constexpr,
+):
+    """O(n) capture-safe placement: per-expert atomicAdd within-count → out_pos.
+
+    Parallel over tokens. Within-expert order may differ from stable-argsort (atomics),
+    but MoE tiles remain a correct partition by expert; pad slots stay sentinel.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    e = tl.load(flat_ptr + offs, mask=mask, other=0)
+    ones = tl.full((BLOCK,), 1, dtype=tl.int64)
+    within = tl.atomic_add(cursor_ptr + e, ones, mask=mask)
+    base = tl.load(padded_offsets_ptr + e, mask=mask, other=0)
+    pos = base + within
+    tl.store(sorted_ids_ptr + pos, offs.to(tl.int32), mask=mask)
+    bidx = pos // block_size
+    tl.store(expert_ids_ptr + bidx, e.to(tl.int32), mask=mask)
+
+
+@triton.jit
 def _fused_moe_kernel(
     a_ptr,
     b_ptr,
@@ -672,9 +701,10 @@ def _moe_align_block_size_capture(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Device align under hcStream capture — arena temps, no ``torch.bincount``/``argsort``.
 
-    Decode-sized path uses an O(n²) counting-sort placement (no ATen ``argsort`` /
-    ``FillFunctor<long>`` scratch) so MetaX graph replay does not ATU. Host D2H of
-    ids under capture is unsafe on MetaX (garbage reads).
+    Large ``numel`` uses an O(n) Triton ``atomic_add`` placement kernel (one GraphExec
+    node). Decode-sized ``numel ≤ 64`` keeps a small O(n²) counting-sort placement (no
+    ATen ``argsort`` / ``FillFunctor<long>`` scratch) so MetaX graph replay does not
+    ATU. Host D2H of ids under capture is unsafe on MetaX (garbage reads).
     """
     device = topk_ids.device
     numel = int(topk_ids.numel())
@@ -694,10 +724,6 @@ def _moe_align_block_size_capture(
         flat_i32 = _capture_safe_to_dtype(flat_i32, torch.int32)
     # Scatter index API wants Long — arena cast (no ``.to(int64)`` FillFunctor).
     flat = _capture_safe_to_dtype(flat_i32, torch.int64)
-    idx = _empty_capture(numel, dtype=torch.int64, device=device)
-    host_idx = torch.arange(numel, dtype=torch.int64, device="cpu").contiguous()
-    _retain_capture(host_idx)
-    idx.copy_(host_idx, non_blocking=False)
 
     counts = _empty_capture(num_experts, dtype=torch.int64, device=device)
     _zero_capture(counts)
@@ -715,16 +741,8 @@ def _moe_align_block_size_capture(
     padded_offsets_tail = padded_counts.cumsum(0)
     padded_offsets[1:] = padded_offsets_tail
 
-    # within[i] = #{j < i | flat[j]==flat[i]} via lower-triangular eq sum (no argsort).
-    fi = flat.unsqueeze(0).expand(numel, numel)
-    fj = flat.unsqueeze(1).expand(numel, numel)
-    j_idx = idx.unsqueeze(0).expand(numel, numel)
-    i_idx = idx.unsqueeze(1).expand(numel, numel)
-    # Avoid ``torch.where`` under capture — MetaX records Fill/where nodes that ATU on
-    # probe/replay. Bool compare + sum is enough for the O(n²) within-count.
-    within = ((fi == fj) & (j_idx < i_idx)).sum(dim=1)
-
-    out_pos = padded_offsets[flat] + within
+    # Host-known upper bound (no ``.item()`` under capture). Prefer E-pad over
+    # numel*(B-1) once numel is large so Triton grid stays tight.
     if numel <= 64:
         max_num_tokens_padded = numel + numel * (block_size - 1)
     else:
@@ -733,19 +751,75 @@ def _moe_align_block_size_capture(
 
     sorted_ids = _empty_capture(max_num_tokens_padded, dtype=torch.int32, device=device)
     _fill_capture(sorted_ids, numel)
-    order_i32 = _capture_safe_to_dtype(idx, torch.int32)
-    sorted_ids.scatter_(0, out_pos, order_i32)
-
     expert_ids_out = _empty_capture(n_m_blocks, dtype=torch.int32, device=device)
     _fill_capture(expert_ids_out, -1)
-    block_idx = out_pos // block_size
-    flat_i32_out = _capture_safe_to_dtype(flat, torch.int32)
-    expert_ids_out.scatter_(0, block_idx, flat_i32_out)
 
+    if numel <= 64:
+        # Small O(n²) within-count (decode ILU); avoid new Triton node for tiny n.
+        idx = _empty_capture(numel, dtype=torch.int64, device=device)
+        # Prefer device arange (no blocking CPU H2D) when not under capture TLS;
+        # under capture MetaX may reject arange FillFunctor — fall back to H2D.
+        if _under_device_stream_capture():
+            host_idx = torch.arange(numel, dtype=torch.int64, device="cpu").contiguous()
+            _retain_capture(host_idx)
+            idx.copy_(host_idx, non_blocking=False)
+        else:
+            idx.copy_(torch.arange(numel, dtype=torch.int64, device=device))
+        fi = flat.unsqueeze(0).expand(numel, numel)
+        fj = flat.unsqueeze(1).expand(numel, numel)
+        j_idx = idx.unsqueeze(0).expand(numel, numel)
+        i_idx = idx.unsqueeze(1).expand(numel, numel)
+        within = ((fi == fj) & (j_idx < i_idx)).sum(dim=1)
+        out_pos = padded_offsets[flat] + within
+        order_i32 = _capture_safe_to_dtype(idx, torch.int32)
+        sorted_ids.scatter_(0, out_pos, order_i32)
+        block_idx = out_pos // block_size
+        flat_i32_out = _capture_safe_to_dtype(flat, torch.int32)
+        expert_ids_out.scatter_(0, block_idx, flat_i32_out)
+        _retain_capture(
+            flat,
+            flat_i32,
+            idx,
+            ones,
+            counts,
+            rem,
+            pad,
+            padded_counts,
+            num_tokens_post_pad,
+            padded_offsets,
+            padded_offsets_tail,
+            fi,
+            fj,
+            j_idx,
+            i_idx,
+            within,
+            out_pos,
+            sorted_ids,
+            expert_ids_out,
+            block_idx,
+            order_i32,
+            flat_i32_out,
+        )
+        return sorted_ids, expert_ids_out, num_tokens_post_pad
+
+    # O(n) place kernel — cursor[e] atomicAdd returns within-expert rank.
+    cursor = _empty_capture(num_experts, dtype=torch.int64, device=device)
+    _zero_capture(cursor)
+    block = 256
+    grid = (triton.cdiv(numel, block),)
+    _moe_align_capture_place_kernel[grid](
+        flat,
+        padded_offsets,
+        cursor,
+        sorted_ids,
+        expert_ids_out,
+        numel,
+        int(block_size),
+        BLOCK=block,
+    )
     _retain_capture(
         flat,
         flat_i32,
-        idx,
         ones,
         counts,
         rem,
@@ -754,17 +828,9 @@ def _moe_align_block_size_capture(
         num_tokens_post_pad,
         padded_offsets,
         padded_offsets_tail,
-        fi,
-        fj,
-        j_idx,
-        i_idx,
-        within,
-        out_pos,
+        cursor,
         sorted_ids,
         expert_ids_out,
-        block_idx,
-        order_i32,
-        flat_i32_out,
     )
     return sorted_ids, expert_ids_out, num_tokens_post_pad
 

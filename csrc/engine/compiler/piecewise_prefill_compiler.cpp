@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <numeric>
 #include <optional>
@@ -35,6 +36,7 @@ bool graph_capture_audit_enabled_() {
 
 /// When MoE is device-capturable, post_attn must be a single hcGraph segment
 /// (true one-piece: o_proj+AR+LN+MoE). Fail fast under capture audit.
+/// FORCE_OP_LIST skips device capture on purpose → device_segments=0 is OK.
 void assert_post_one_device_seg_(
     const char *where,
     size_t layer,
@@ -42,6 +44,10 @@ void assert_post_one_device_seg_(
     if (!graph_capture_audit_enabled_()
         || !infinicore::context::moeTritonCaptureAllowed()
         || !g) {
+        return;
+    }
+    if (const char *fol = std::getenv("INFINI_GRAPH_FORCE_OP_LIST");
+        fol != nullptr && fol[0] != '\0' && std::string(fol) != "0") {
         return;
     }
     const size_t n = g->device_segment_count();
@@ -66,6 +72,48 @@ bool rank_worker_profile_enabled() {
         cached = (raw != nullptr && raw[0] == '1' && raw[1] == '\0') ? 1 : 0;
     }
     return cached == 1;
+}
+
+/// When set with RANK_WORKER_PROFILE, syncDevice after each Graph::run so
+/// *_graph_run_ms is exclusive GPU+host (mirrors decode_phase_profile exclusive_sync).
+bool rank_worker_profile_sync() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *raw = std::getenv("INFINI_RANK_WORKER_PROFILE_SYNC");
+        cached = (raw != nullptr && raw[0] == '1' && raw[1] == '\0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+/// Prefill TP=1: Graph::run may skip its end syncStream (INFINI_GRAPH_SKIP_TAIL_SYNC).
+/// Callers must drain once before logits / sample D2H (Gate C).
+bool graph_skip_tail_sync_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *raw = std::getenv("INFINI_GRAPH_SKIP_TAIL_SYNC");
+        cached = (raw != nullptr && raw[0] != '\0' && std::string(raw) != "0") ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+void append_graph_run_split(
+    std::string &out,
+    const char *prefix,
+    const infinicore::graph::Graph::LastRunProfile &p) {
+    char buf[256];
+    std::snprintf(
+        buf,
+        sizeof(buf),
+        " %s_launch_ms=%.3f %s_tail_sync_ms=%.3f %s_hostop_ms=%.3f %s_op_list_ms=%.3f",
+        prefix,
+        p.launch_ms,
+        prefix,
+        p.tail_sync_ms,
+        prefix,
+        p.hostop_ms,
+        prefix,
+        p.op_list_ms);
+    out.append(buf);
 }
 
 /// Trim redundant post-allreduce barrier (next layer's pre-graph barrier subsumes it).
@@ -1469,8 +1517,26 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
             }
         }
 
+        double pre_graph_run_ms = 0.0;
+        double pre_eager_ms = 0.0;
+        infinicore::graph::Graph::LastRunProfile pre_split{};
         if (pre_graph) {
+            const double t_pre_g0 = profile ? monotonic_ms() : 0.0;
             pre_graph->run();
+            pre_split = pre_graph->last_run_profile();
+            // When Graph::run skips its tail sync, PROFILE_SYNC still needs a drain
+            // for exclusive graph_run_ms; otherwise FA must see pre outputs.
+            if (profile && rank_worker_profile_sync()) {
+                if (pre_split.skipped_tail_sync || !pre_split.used_device) {
+                    infinicore::context::syncDevice();
+                }
+            } else if (pre_split.skipped_tail_sync) {
+                // FA is eager and reads QKV from pre CG — one stream drain.
+                infinicore::context::syncStream();
+            }
+            if (profile) {
+                pre_graph_run_ms = monotonic_ms() - t_pre_g0;
+            }
             ++segment_replays_;
             if (qkv_only) {
                 // Phase-2c: RoPE must see QKV staging writes; graph replay may be async.
@@ -1478,37 +1544,83 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
                 if (!global_state::skip_qkv_rope_sync()) {
                     infinicore::context::syncDevice();
                 }
+                const double t_rope0 = profile ? monotonic_ms() : 0.0;
                 model_->native_piecewise_pre_attn_rope_layer(layer, bucket_graphs.input);
+                if (profile) {
+                    pre_eager_ms = monotonic_ms() - t_rope0;
+                }
             }
             // else: fused pre already includes RoPE — no host break / sync.
         } else {
             // Eager full pre (QKV+RoPE / inductor package when allowed).
+            const double t_pre_e0 = profile ? monotonic_ms() : 0.0;
             model_->native_piecewise_pre_attn_layer(
                 layer, bucket_graphs.input, piecewise.hidden_states, piecewise.residual);
+            if (profile) {
+                pre_eager_ms = monotonic_ms() - t_pre_e0;
+            }
         }
         const double t_pre_attn = profile ? monotonic_ms() : 0.0;
         piecewise.phase = global_state::PiecewiseCapturePhase::EagerAttn;
         model_->native_piecewise_eager_attn_layer(layer, bucket_graphs.input);
         const double t_eager_attn = profile ? monotonic_ms() : 0.0;
         barrier_->wait("piecewise_replay_post_attn");
+        double post_graph_run_ms = 0.0;
+        double post_eager_ms = 0.0;
+        infinicore::graph::Graph::LastRunProfile post_split{};
         if (use_eager_post || inductor_layer_mid || !bucket_graphs.post_attn[layer]) {
+            const double t_post_e0 = profile ? monotonic_ms() : 0.0;
             model_->native_piecewise_post_attn_cg_layer(
                 layer, bucket_graphs.input, piecewise.hidden_states, piecewise.residual);
             barrier_->wait("piecewise_replay_post_attn_sync");
+            if (profile) {
+                post_eager_ms = monotonic_ms() - t_post_e0;
+            }
         } else {
+            const double t_post_g0 = profile ? monotonic_ms() : 0.0;
             bucket_graphs.post_attn[layer]->run();
+            post_split = bucket_graphs.post_attn[layer]->last_run_profile();
+            // Double-sync cut: Graph::run already synced unless SKIP_TAIL_SYNC.
+            // PROFILE_SYNC exclusive timing: skip redundant syncDevice when Graph
+            // already drained the stream (LIGHT_SYNC spirit / TP=1).
+            if (profile && rank_worker_profile_sync()) {
+                if (post_split.skipped_tail_sync || !post_split.used_device) {
+                    infinicore::context::syncDevice();
+                }
+            }
+            // Mid-layer: next consumer is another Graph::run / FA on same stream —
+            // SKIP_TAIL_SYNC leaves work ordered; drain once before lm_head below.
+            if (profile) {
+                post_graph_run_ms = monotonic_ms() - t_post_g0;
+            }
             ++segment_replays_;
             barrier_->wait("piecewise_replay_post_attn_sync");
         }
         if (profile) {
+            // Barrier after Graph::run folds into post_attn_ms only; graph_run stays
+            // Graph::run(+optional sync) exclusive.
+            std::string extra;
+            if (pre_graph) {
+                append_graph_run_split(extra, "pre_graph", pre_split);
+            }
+            if (post_graph_run_ms > 0.0 || post_split.used_device || post_split.forced_op_list) {
+                append_graph_run_split(extra, "post_graph", post_split);
+            }
             spdlog::info(
-                "rank_worker_profile: piecewise layer={} pre_attn_ms={:.3f} eager_attn_ms={:.3f} "
-                "post_attn_ms={:.3f} layer_total_ms={:.3f}",
+                "rank_worker_profile: piecewise layer={} pre_attn_ms={:.3f} "
+                "pre_graph_run_ms={:.3f} pre_eager_ms={:.3f} eager_attn_ms={:.3f} "
+                "post_attn_ms={:.3f} post_graph_run_ms={:.3f} post_eager_ms={:.3f} "
+                "layer_total_ms={:.3f}{}",
                 layer,
                 t_pre_attn - t_layer0,
+                pre_graph_run_ms,
+                pre_eager_ms,
                 t_eager_attn - t_pre_attn,
                 monotonic_ms() - t_eager_attn,
-                monotonic_ms() - t_layer0);
+                post_graph_run_ms,
+                post_eager_ms,
+                monotonic_ms() - t_layer0,
+                extra);
         }
     }
     if (profile) {
@@ -1516,20 +1628,46 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     }
     if (need_lm_head) {
         const double t_lm0 = profile ? monotonic_ms() : 0.0;
+        double lm_graph_run_ms = 0.0;
+        double lm_eager_ms = 0.0;
         barrier_->wait("piecewise_replay_lm_head");
+        // Gate C: one stream drain before logits when post GraphExec stayed async.
+        if (graph_skip_tail_sync_enabled()) {
+            infinicore::context::syncStream();
+        }
         if (use_eager_lm_head) {
+            const double t_e0 = profile ? monotonic_ms() : 0.0;
             model_->native_piecewise_lm_head(
                 bucket_graphs.input, piecewise.hidden_states, piecewise.residual, bucket_graphs.logits_holder);
+            if (profile) {
+                lm_eager_ms = monotonic_ms() - t_e0;
+            }
         } else {
+            const double t_g0 = profile ? monotonic_ms() : 0.0;
             bucket_graphs.lm_head->run();
+            if (profile && rank_worker_profile_sync()) {
+                const auto &lm_split = bucket_graphs.lm_head->last_run_profile();
+                if (lm_split.skipped_tail_sync || !lm_split.used_device) {
+                    infinicore::context::syncDevice();
+                }
+            }
+            if (profile) {
+                lm_graph_run_ms = monotonic_ms() - t_g0;
+            }
             ++segment_replays_;
         }
         barrier_->wait("piecewise_replay_lm_head_sync");
         if (profile) {
             spdlog::info(
-                "rank_worker_profile: piecewise lm_head_ms={:.3f}",
-                monotonic_ms() - t_lm0);
+                "rank_worker_profile: piecewise lm_head_ms={:.3f} "
+                "lm_head_graph_run_ms={:.3f} lm_head_eager_ms={:.3f}",
+                monotonic_ms() - t_lm0,
+                lm_graph_run_ms,
+                lm_eager_ms);
         }
+    } else if (graph_skip_tail_sync_enabled()) {
+        // Mid-chunk without lm_head: still drain before returning (KV consumers).
+        infinicore::context::syncStream();
     }
 
     piecewise.phase = global_state::PiecewiseCapturePhase::None;
