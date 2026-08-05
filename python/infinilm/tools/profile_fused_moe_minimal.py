@@ -8,13 +8,16 @@ Modes:
   align_tax   — E_align (eager) vs C_align (capture path) @ M (default 2048)
   aoti_b16    — aoti_load_package(moe_B16/segment.pt2) with hidden [1,16,H]
   cpp_pad_m1  — C++ inductor_moe_ path: hidden [1,1,H] → pad to B16 (decode pad tax)
-  host_split  — Phase 0 attribution: timed align/.item/opaque + mode grid (M=1)
+  host_split  — Phase 0 attribution: timed align/.item/opaque + capture-align @ M
+  kernel_only — precompute align+silu once; time `_invoke_kernel` x2 only
 
 Env (required; wrapper sets defaults):
   INFINI_MOE_CONFIGS, INFINI_MOE_TRITON_CACHE / TRITON_CACHE_DIR,
-  INFINI_MOE_ALLOW_JIT=0
+  INFINI_MOE_ALLOW_JIT=0 (default). Set to 1 only for raised-SMEM /
+  side-cache experiments that must JIT missing cubins.
 
-Refuses if Triton cache grows during the run (G4 spirit).
+Refuses if Triton cache grows during JIT-off runs (G4 spirit).
+When INFINI_MOE_ALLOW_JIT=1, cache growth is expected and not refused.
 """
 
 from __future__ import annotations
@@ -48,12 +51,16 @@ def _cache_dir() -> Path:
     return Path(raw)
 
 
-def _require_jit_off() -> None:
-    if os.environ.get("INFINI_MOE_ALLOW_JIT", "0").strip() not in ("0", ""):
-        raise RuntimeError(
-            "INFINI_MOE_ALLOW_JIT must be 0 for profiling (got "
-            f"{os.environ.get('INFINI_MOE_ALLOW_JIT')!r})"
-        )
+def _jit_allowed() -> bool:
+    return os.environ.get("INFINI_MOE_ALLOW_JIT", "0").strip() in ("1", "true", "TRUE", "yes")
+
+
+def _require_jit_off_or_allow() -> None:
+    """Default: force JIT off. Opt-in ALLOW_JIT=1 for side-cache SMEM experiments."""
+    if _jit_allowed():
+        os.environ["INFINI_MOE_ALLOW_JIT"] = "1"
+        print("[profile-moe] INFINI_MOE_ALLOW_JIT=1 (side-cache / raised-SMEM path)", flush=True)
+        return
     os.environ["INFINI_MOE_ALLOW_JIT"] = "0"
 
 
@@ -440,11 +447,13 @@ def _run_cpp_pad_m1(args) -> int:
 
 
 def _run_host_split(args) -> int:
-    """Phase 0: attribute align/.item/opaque + AOTI vs launcher vs cpp_pad (M=1)."""
+    """Phase 0: attribute align/.item/opaque + AOTI vs launcher vs cpp_pad @ M."""
     import json
 
     import torch
     from infinilm.kernels.fused_moe_runtime import (
+        _HOST_SPLIT,
+        _moe_align_block_size_capture,
         fused_moe_routed,
         get_moe_config_for_m,
         host_split_report,
@@ -460,7 +469,11 @@ def _run_host_split(args) -> int:
 
     device = torch.device("cuda", 0)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    M = 1
+    M = int(args.M)
+    if M not in LAUNCHER_M_ALLOWED:
+        raise ValueError(
+            f"host_split mode expects M in {LAUNCHER_M_ALLOWED}, got {M}"
+        )
     warmup = max(int(args.warmup), 3)
     iters = max(int(args.iters), 10)
 
@@ -472,18 +485,20 @@ def _run_host_split(args) -> int:
     x, topk_w, topk_ids, w_gu, w_d = _make_launcher_inputs(M, device, dtype)
     cfg1 = get_moe_config_for_m(M, E=E, N=N, H=H, stage="stage1")
     cfg2 = get_moe_config_for_m(M, E=E, N=N, H=H, stage="stage2")
+    bs1 = int(cfg1["BLOCK_SIZE_M"])
+    bs2 = int(cfg2["BLOCK_SIZE_M"])
 
     # --- align_only with .item split ---
     def align_once():
-        moe_align_block_size(topk_ids, int(cfg1["BLOCK_SIZE_M"]), E)
-        moe_align_block_size(topk_ids, int(cfg2["BLOCK_SIZE_M"]), E)
+        moe_align_block_size(topk_ids, bs1, E)
+        moe_align_block_size(topk_ids, bs2, E)
 
-    print(f"=== WARMUP_BEGIN mode=align_only_m1 warmup={warmup} ===", flush=True)
+    print(f"=== WARMUP_BEGIN mode=align_only_m{M} warmup={warmup} ===", flush=True)
     with torch.no_grad():
         for _ in range(warmup):
             align_once()
         torch.cuda.synchronize()
-    print("=== WARMUP_END mode=align_only_m1 ===", flush=True)
+    print(f"=== WARMUP_END mode=align_only_m{M} ===", flush=True)
 
     host_split_reset()
     torch.cuda.synchronize()
@@ -493,12 +508,47 @@ def _run_host_split(args) -> int:
             align_once()
         torch.cuda.synchronize()
     align_ms = (time.perf_counter() - t0) * 1000.0 / iters
-    align_split = host_split_report(f"align_only_m1 x{iters}")
+    align_split = host_split_report(f"align_only_m{M} x{iters}")
     align_per = {k: v / iters for k, v in align_split.items()}
-    print(f"[profile-moe] align_only_m1 host_ms/iter={align_ms:.3f}", flush=True)
+    print(f"[profile-moe] align_only_m{M} host_ms/iter={align_ms:.3f}", flush=True)
     print(
-        "[moe-host-split] align_only_m1 per_iter_ms "
+        f"[moe-host-split] align_only_m{M} per_iter_ms "
         + " ".join(f"{k}={v:.3f}" for k, v in sorted(align_per.items())),
+        flush=True,
+    )
+
+    # --- capture-align residual (GraphExec path; no TLS capture needed) ---
+    def capture_align_once():
+        _moe_align_block_size_capture(topk_ids, bs1, E)
+        _moe_align_block_size_capture(topk_ids, bs2, E)
+
+    print(f"=== WARMUP_BEGIN mode=align_capture_m{M} warmup={warmup} ===", flush=True)
+    with torch.no_grad():
+        for _ in range(warmup):
+            capture_align_once()
+        torch.cuda.synchronize()
+    print(f"=== WARMUP_END mode=align_capture_m{M} ===", flush=True)
+
+    host_split_reset()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(iters):
+            # Mirror fused_moe_runtime HOST_SPLIT key used under hcStream capture.
+            _HOST_SPLIT.begin("align_capture")
+            capture_align_once()
+            _HOST_SPLIT.end("align_capture")
+        torch.cuda.synchronize()
+    align_capture_ms = (time.perf_counter() - t0) * 1000.0 / iters
+    capture_split = host_split_report(f"align_capture_m{M} x{iters}")
+    capture_per = {k: v / iters for k, v in capture_split.items()}
+    print(
+        f"[profile-moe] align_capture_m{M} host_ms/iter={align_capture_ms:.3f}",
+        flush=True,
+    )
+    print(
+        f"[moe-host-split] align_capture_m{M} per_iter_ms "
+        + " ".join(f"{k}={v:.3f}" for k, v in sorted(capture_per.items())),
         flush=True,
     )
 
@@ -506,12 +556,12 @@ def _run_host_split(args) -> int:
     def launch_once():
         return fused_moe_routed(x, topk_w, topk_ids, w_gu, w_d)
 
-    print(f"=== WARMUP_BEGIN mode=launcher_m1 warmup={warmup} ===", flush=True)
+    print(f"=== WARMUP_BEGIN mode=launcher_m{M} warmup={warmup} ===", flush=True)
     with torch.no_grad():
         for _ in range(warmup):
             launch_once()
         torch.cuda.synchronize()
-    print("=== WARMUP_END mode=launcher_m1 ===", flush=True)
+    print(f"=== WARMUP_END mode=launcher_m{M} ===", flush=True)
 
     host_split_reset()
     torch.cuda.synchronize()
@@ -521,33 +571,22 @@ def _run_host_split(args) -> int:
             launch_once()
         torch.cuda.synchronize()
     launcher_ms = (time.perf_counter() - t0) * 1000.0 / iters
-    launcher_split = host_split_report(f"launcher_m1 x{iters}")
+    launcher_split = host_split_report(f"launcher_m{M} x{iters}")
     launcher_per = {k: v / iters for k, v in launcher_split.items()}
-    print(f"[profile-moe] launcher_m1 host_ms/iter={launcher_ms:.3f}", flush=True)
+    print(f"[profile-moe] launcher_m{M} host_ms/iter={launcher_ms:.3f}", flush=True)
     print(
-        "[moe-host-split] launcher_m1 per_iter_ms "
+        f"[moe-host-split] launcher_m{M} per_iter_ms "
         + " ".join(f"{k}={v:.3f}" for k, v in sorted(launcher_per.items())),
         flush=True,
     )
 
-    # --- aoti_b16 / cpp_pad_m1 wall (AOTI tax) ---
+    # --- aoti_b16 / cpp_pad_m1 wall (decode-pad tax; M=1 only) ---
     aoti_ms = None
     cpp_ms = None
-    if args.segment_pt2:
+    if args.segment_pt2 and M == 1:
         # Reuse existing runners without host-split noise inside Triton.
         os.environ["INFINI_MOE_HOST_SPLIT"] = "0"
         host_split_reset()
-        # Build lightweight arg namespace for sub-modes.
-        sub = argparse.Namespace(
-            dtype=args.dtype,
-            warmup=warmup,
-            iters=iters,
-            segment_pt2=args.segment_pt2,
-            seed=args.seed,
-            M=1,
-            out_dir=args.out_dir,
-        )
-        # Capture TIMED lines via return values by calling timed helpers inline.
         from torch._inductor import aoti_load_package
 
         from infinilm.compile.piecewise_moe_segment import make_moe_example_inputs
@@ -579,10 +618,8 @@ def _run_host_split(args) -> int:
             device=device,
         )
 
-        # cpp_pad via existing helper (registers package again — fine).
         cpp_ms = None
         try:
-            # Inline minimal cpp pad timing to return ms.
             import infinicore
             from infinicore.lib import _infinicore as _ic
             from infinilm.compile.piecewise_segments import (
@@ -624,6 +661,11 @@ def _run_host_split(args) -> int:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[profile-moe] cpp_pad_m1 skipped: {exc}", flush=True)
+    elif M != 1:
+        print(
+            f"[profile-moe] skip aoti_b16/cpp_pad_m1 (decode-pad tax; M={M})",
+            flush=True,
+        )
 
     # Derived AOTI / pad taxes (plan Phase 0).
     aoti_tax = (aoti_ms - launcher_ms) if aoti_ms is not None else None
@@ -658,9 +700,14 @@ def _run_host_split(args) -> int:
         "opaque_kernel2", 0.0
     )
 
+    align_capture_key_ms = capture_per.get("align_capture", align_capture_ms)
     summary = {
-        "align_only_m1_ms": align_ms,
-        "launcher_m1_ms": launcher_ms,
+        "M": M,
+        "align_only_ms": align_ms,
+        "align_only_m1_ms": align_ms if M == 1 else None,
+        "align_capture_ms": align_capture_key_ms,
+        "launcher_ms": launcher_ms,
+        "launcher_m1_ms": launcher_ms if M == 1 else None,
         "aoti_b16_ms": aoti_ms,
         "cpp_pad_m1_ms": cpp_ms,
         "aoti_minus_launcher_ms": aoti_tax,
@@ -671,6 +718,13 @@ def _run_host_split(args) -> int:
         "launcher_opaque_ms": {k: launcher_per.get(k, 0.0) for k in opaque_keys},
         "launcher_opaque_sum_ms": opaque_sum,
         "launcher_kernel_stages_ms": kernel_ms,
+        "opaque_kernel1_ms": launcher_per.get("opaque_kernel1", 0.0),
+        "opaque_kernel2_ms": launcher_per.get("opaque_kernel2", 0.0),
+        "opaque_silu_ms": launcher_per.get("opaque_silu", 0.0),
+        "opaque_moe_sum_ms": launcher_per.get("opaque_moe_sum", 0.0),
+        "align_capture_vs_opaque_kernels": (
+            (align_capture_key_ms / kernel_ms) if kernel_ms > 0 else None
+        ),
         "launcher_hash": launcher_hash(),
         "iters": iters,
         "warmup": warmup,
@@ -680,6 +734,103 @@ def _run_host_split(args) -> int:
         out_path = Path(args.out_dir) / "host_split_summary.json"
         out_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
         print(f"[moe-host-split] wrote {out_path}", flush=True)
+    return 0
+
+
+def _run_kernel_only(args) -> int:
+    """Time InfiniLM Triton GEMMs only (align+silu precomputed outside timed loop)."""
+    import json
+
+    import torch
+    import triton.language as tl
+    from infinilm.kernels.fused_moe_runtime import (
+        _invoke_kernel,
+        get_moe_config_for_m,
+        launcher_hash,
+        moe_align_block_size,
+    )
+
+    _refuse_vllm()
+    os.environ["INFINI_MOE_PROFILE_PHASES"] = "0"
+
+    device = torch.device("cuda", 0)
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    M = int(args.M)
+    if M not in LAUNCHER_M_ALLOWED:
+        raise ValueError(f"kernel_only expects M in {LAUNCHER_M_ALLOWED}, got {M}")
+
+    compute_type = tl.bfloat16 if dtype == torch.bfloat16 else tl.float16
+    x, topk_w, topk_ids, w_gu, w_d = _make_launcher_inputs(M, device, dtype)
+    cfg1 = get_moe_config_for_m(M, E=E, N=N, H=H, stage="stage1")
+    cfg2 = get_moe_config_for_m(M, E=E, N=N, H=H, stage="stage2")
+
+    sorted1, expert1, npost1 = moe_align_block_size(topk_ids, int(cfg1["BLOCK_SIZE_M"]), E)
+    if int(cfg2["BLOCK_SIZE_M"]) == int(cfg1["BLOCK_SIZE_M"]):
+        sorted2, expert2, npost2 = sorted1, expert1, npost1
+    else:
+        sorted2, expert2, npost2 = moe_align_block_size(
+            topk_ids, int(cfg2["BLOCK_SIZE_M"]), E
+        )
+
+    cache1 = torch.empty(M, TOP_K, 2 * N, device=device, dtype=dtype)
+    cache2 = torch.empty(M * TOP_K, N, device=device, dtype=dtype)
+    cache3 = torch.empty(M, TOP_K, H, device=device, dtype=dtype)
+
+    # One setup pass so cache2 is a valid stage2 input (not timed).
+    with torch.no_grad():
+        _invoke_kernel(
+            x, w_gu, cache1, topk_w, sorted1, expert1, npost1, False, TOP_K, cfg1, compute_type
+        )
+        gate, up = cache1.view(-1, 2 * N).chunk(2, dim=-1)
+        torch.mul(torch.nn.functional.silu(gate), up, out=cache2)
+
+    def once():
+        _invoke_kernel(
+            x, w_gu, cache1, topk_w, sorted1, expert1, npost1, False, TOP_K, cfg1, compute_type
+        )
+        _invoke_kernel(
+            cache2, w_d, cache3, topk_w, sorted2, expert2, npost2, True, 1, cfg2, compute_type
+        )
+
+    print(f"[profile-moe] mode=kernel_only M={M} TOP_K={TOP_K}")
+    print(f"[profile-moe] launcher_hash={launcher_hash()}")
+    print(
+        f"[profile-moe] cfg1={cfg1.get('BLOCK_SIZE_M')}x{cfg1.get('BLOCK_SIZE_N')}x"
+        f"{cfg1.get('BLOCK_SIZE_K')} s={cfg1.get('num_stages')} w={cfg1.get('num_warps')}"
+    )
+    host_ms = _run_timed(
+        f"kernel_only_m{M}",
+        once,
+        warmup=args.warmup,
+        iters=args.iters,
+        device=device,
+    )
+    summary = {
+        "M": M,
+        "mode": "kernel_only",
+        "host_ms_per_iter": host_ms,
+        "iters": int(args.iters),
+        "warmup": int(args.warmup),
+        "cfg1": {
+            "BLOCK_SIZE_M": cfg1.get("BLOCK_SIZE_M"),
+            "BLOCK_SIZE_N": cfg1.get("BLOCK_SIZE_N"),
+            "BLOCK_SIZE_K": cfg1.get("BLOCK_SIZE_K"),
+            "num_stages": cfg1.get("num_stages"),
+            "num_warps": cfg1.get("num_warps"),
+        },
+        "cfg2": {
+            "BLOCK_SIZE_M": cfg2.get("BLOCK_SIZE_M"),
+            "BLOCK_SIZE_N": cfg2.get("BLOCK_SIZE_N"),
+            "BLOCK_SIZE_K": cfg2.get("BLOCK_SIZE_K"),
+            "num_stages": cfg2.get("num_stages"),
+            "num_warps": cfg2.get("num_warps"),
+        },
+        "launcher_hash": launcher_hash(),
+    }
+    if args.out_dir:
+        out_path = Path(args.out_dir) / f"kernel_only_m{M}_summary.json"
+        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        print(f"[profile-moe] wrote {out_path}", flush=True)
     return 0
 
 
@@ -695,6 +846,7 @@ def main() -> int:
             "aoti_b16",
             "cpp_pad_m1",
             "host_split",
+            "kernel_only",
         ),
     )
     ap.add_argument(
@@ -720,11 +872,12 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        _require_jit_off()
+        _require_jit_off_or_allow()
         if not os.environ.get("INFINI_MOE_CONFIGS", "").strip():
             raise RuntimeError("INFINI_MOE_CONFIGS unset")
         cache = _cache_dir()
         before = _count_cache_entries(cache)
+        jit_on = _jit_allowed()
 
         import torch
 
@@ -741,6 +894,8 @@ def main() -> int:
             rc = _run_align_only(args)
         elif args.mode == "align_tax":
             rc = _run_align_tax(args)
+        elif args.mode == "kernel_only":
+            rc = _run_kernel_only(args)
         elif args.mode == "host_split":
             if not args.segment_pt2:
                 # Allow host_split without AOTI if segment missing; warn.
@@ -760,10 +915,14 @@ def main() -> int:
 
         after = _count_cache_entries(cache)
         print(
-            f"[profile-moe] cache_files before={before} after={after}",
+            f"[profile-moe] cache_files before={before} after={after} jit={int(jit_on)}",
             flush=True,
         )
-        if after > before and args.mode not in ("align_only", "align_tax", "host_split"):
+        if (
+            after > before
+            and not jit_on
+            and args.mode not in ("align_only", "align_tax", "host_split")
+        ):
             raise RuntimeError(
                 f"Triton cache grew during JIT-off profile ({before} → {after}); "
                 "cubins incomplete for this shape/TOP_K"

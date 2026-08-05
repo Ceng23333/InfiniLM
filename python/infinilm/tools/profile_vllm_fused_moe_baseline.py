@@ -8,12 +8,15 @@ Not used on InfiniLM serve path. Compare host ms/iter vs InfiniLM launcher modes
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
+from pathlib import Path
 
 H, E, N, TOP_K = 2048, 160, 512, 16
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
+ALLOWED_M = (1, 16, 2048)
 
 
 def _run_timed(label: str, fn, *, warmup: int, iters: int, device) -> float:
@@ -49,16 +52,21 @@ def _run_timed(label: str, fn, *, warmup: int, iters: int, device) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--M", type=int, required=True, help="token count (1 or 16)")
+    ap.add_argument("--M", type=int, required=True, help="token count (1, 16, or 2048)")
     ap.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float16"))
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     ap.add_argument("--iters", type=int, default=DEFAULT_ITERS)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--out-dir",
+        default="",
+        help="optional dir for vllm_m${M}_summary.json",
+    )
     args = ap.parse_args()
 
     M = int(args.M)
-    if M not in (1, 16):
-        raise ValueError(f"expected M in {{1,16}}, got {M}")
+    if M not in ALLOWED_M:
+        raise ValueError(f"expected M in {set(ALLOWED_M)}, got {M}")
 
     try:
         import torch
@@ -95,13 +103,32 @@ def main() -> int:
             inplace=False,
         )
 
-    _run_timed(
+    host_ms = _run_timed(
         f"vllm_m{M}",
         once,
         warmup=args.warmup,
         iters=args.iters,
         device=device,
     )
+
+    out_dir = (args.out_dir or "").strip()
+    if out_dir:
+        path = Path(out_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "M": M,
+            "host_ms_per_iter": host_ms,
+            "iters": int(args.iters),
+            "warmup": int(args.warmup),
+            "mode": "vllm",
+            "H": H,
+            "E": E,
+            "N": N,
+            "TOP_K": TOP_K,
+        }
+        out_path = path / f"vllm_m{M}_summary.json"
+        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        print(f"[profile-vllm-moe] wrote {out_path}", flush=True)
     return 0
 
 

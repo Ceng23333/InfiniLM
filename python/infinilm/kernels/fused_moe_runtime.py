@@ -143,7 +143,11 @@ def _sanitize_moe_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Clamp Triton tile/pipeline knobs to fit Mars (~64KiB) shared memory.
 
     Seeded MetaX configs for large M often use 128^3 + cpasync + num_stages=4,
-    which requests >64KiB SMEM and fails at launch.
+    which requests >64KiB SMEM and fails at launch under the default
+    ``INFINI_MOE_SMEM_LIMIT=65536``. When the estimated footprint fits the
+    limit, pass through unchanged (including ``pipeline=cpasync`` /
+    ``scenario`` / ``num_stages``) so a raised env can keep the seed path.
+    Raising the limit beyond HW SMEM risks launch crashes on Mars.
     """
     out = dict(cfg)
     bm = int(out["BLOCK_SIZE_M"])
@@ -153,7 +157,7 @@ def _sanitize_moe_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # Conservative bf16 tile estimate (A+B) * stages; leave headroom.
     est = (bm * bk + bk * bn) * 2 * max(stages, 1)
     limit = int(os.environ.get("INFINI_MOE_SMEM_LIMIT", "65536"))
-    if est <= limit and out.get("pipeline", "basic") in ("basic", "", None):
+    if est <= limit:
         return out
     # Fall back to a proven small-M tile (matches working M<=512 configs).
     out["BLOCK_SIZE_M"] = min(bm, 64)
