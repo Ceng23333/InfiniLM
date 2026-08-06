@@ -140,22 +140,28 @@ def get_moe_config_for_m(
 
 
 def _sanitize_moe_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Clamp Triton tile/pipeline knobs to fit Mars (~64KiB) shared memory.
+    """Clamp Triton tile/pipeline knobs to fit Mars HW SMEM (capped at 64 KiB).
 
-    Seeded MetaX configs for large M often use 128^3 + cpasync + num_stages=4,
-    which requests >64KiB SMEM and fails at launch under the default
-    ``INFINI_MOE_SMEM_LIMIT=65536``. When the estimated footprint fits the
-    limit, pass through unchanged (including ``pipeline=cpasync`` /
-    ``scenario`` / ``num_stages``) so a raised env can keep the seed path.
-    Raising the limit beyond HW SMEM risks launch crashes on Mars.
+    Default ``INFINI_MOE_SMEM_LIMIT=65536`` matches the validated Mars cap — do
+    not raise it on the product path. Seeded MetaX large-M configs often use
+    128^3 + cpasync + num_stages≥3, which still exceeds 64 KiB and demotes.
+
+    Basic-pipeline estimate is ``(BM*BK+BK*BN)*2`` (no stages multiply): the
+    stages factor was over-conservative and false-demoted Mars-safe tiles such
+    as 128×128×64 / basic / s=3 (est 32768 ≤ 65536). Cpasync keeps the full
+    ``(…)*2*stages`` estimate so seed 128³ remains demoted under 64 KiB.
     """
     out = dict(cfg)
     bm = int(out["BLOCK_SIZE_M"])
     bn = int(out["BLOCK_SIZE_N"])
     bk = int(out["BLOCK_SIZE_K"])
     stages = int(out.get("num_stages", 2))
-    # Conservative bf16 tile estimate (A+B) * stages; leave headroom.
-    est = (bm * bk + bk * bn) * 2 * max(stages, 1)
+    pipeline = out.get("pipeline", "basic")
+    # basic: bf16 A+B tiles only; cpasync (and other non-basic): * stages.
+    if pipeline in ("basic", "", None):
+        est = (bm * bk + bk * bn) * 2
+    else:
+        est = (bm * bk + bk * bn) * 2 * max(stages, 1)
     limit = int(os.environ.get("INFINI_MOE_SMEM_LIMIT", "65536"))
     if est <= limit:
         return out
@@ -224,6 +230,219 @@ def _moe_align_capture_place_kernel(
     tl.store(sorted_ids_ptr + pos, offs.to(tl.int32), mask=mask)
     bidx = pos // block_size
     tl.store(expert_ids_ptr + bidx, e.to(tl.int32), mask=mask)
+
+
+@triton.jit
+def _moe_align_fast_count_kernel(
+    flat_ptr,
+    counts_ptr,
+    n,
+    BLOCK: tl.constexpr,
+):
+    """Per-expert histogram via atomic_add (capture-safe; no ATen scatter_add)."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    e = tl.load(flat_ptr + offs, mask=mask, other=0)
+    ones = tl.full((BLOCK,), 1, dtype=tl.int64)
+    tl.atomic_add(counts_ptr + e, ones, mask=mask)
+
+
+@triton.jit
+def _moe_align_fast_pad_scan_kernel(
+    counts_ptr,
+    padded_offsets_ptr,
+    num_tokens_post_pad_ptr,
+    num_experts,
+    block_size,
+    BLOCK_E: tl.constexpr,
+):
+    """Pad counts to block_size and exclusive-scan → offsets + n_post (device-only)."""
+    offs = tl.arange(0, BLOCK_E)
+    mask = offs < num_experts
+    c = tl.load(counts_ptr + offs, mask=mask, other=0).to(tl.int64)
+    rem = c % block_size
+    pad = tl.where(rem == 0, 0, block_size - rem)
+    padded = tl.where(mask, c + pad, 0)
+    incl = tl.cumsum(padded, axis=0)
+    excl = incl - padded
+    tl.store(padded_offsets_ptr + offs, excl, mask=mask)
+    total = tl.sum(padded)
+    # Redundant same-value stores from all lanes are fine under capture.
+    tl.store(padded_offsets_ptr + num_experts, total)
+    tl.store(num_tokens_post_pad_ptr, total.to(tl.int32))
+
+
+def _fast_align_enabled() -> bool:
+    """INFINI_MOE_FAST_ALIGN: default off (KEEP_LEGACY); set 1 to enable; 0/false/off kill-switch."""
+    raw = os.environ.get("INFINI_MOE_FAST_ALIGN", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _moe_align_block_e(num_experts: int) -> int:
+    """Next power-of-two ≥ num_experts for pad-scan BLOCK_E (min 1)."""
+    n = max(int(num_experts), 1)
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def moe_align_fast(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Capture-safe fast MoE align: Triton count + pad-scan + O(n) place.
+
+    Same contract as ``moe_align_block_size`` / capture path: pad sentinel ``numel``,
+    expert block ids, no host ``.item()``. Within-expert order may differ from
+    stable-argsort (atomics) — semantic match for MoE tiles.
+
+    Eager (not under capture): ``bincount`` + pad/cumsum + Triton place — drops
+    Torch ``argsort`` (MetaX launch tax) while keeping one place kernel.
+    """
+    if not _under_device_stream_capture():
+        return _moe_align_fast_eager(topk_ids, block_size, num_experts)
+    return _moe_align_fast_capture(topk_ids, block_size, num_experts)
+
+
+def _moe_align_fast_eager(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Eager fast align: Torch histogram + Triton O(n) place (no argsort)."""
+    device = topk_ids.device
+    numel = int(topk_ids.numel())
+    block_size = int(block_size)
+    num_experts = int(num_experts)
+
+    if numel == 0:
+        max_num_tokens_padded = num_experts * (block_size - 1)
+        sorted_ids = torch.full(
+            (max(max_num_tokens_padded, 0),), 0, dtype=torch.int32, device=device
+        )
+        expert_ids_out = torch.full((1,), -1, dtype=torch.int32, device=device)
+        num_tokens_post_pad = torch.zeros(1, dtype=torch.int32, device=device)
+        return sorted_ids, expert_ids_out, num_tokens_post_pad
+
+    flat_i32 = topk_ids.reshape(-1)
+    if flat_i32.dtype != torch.int32:
+        flat_i32 = flat_i32.to(torch.int32)
+
+    counts = torch.bincount(flat_i32.to(torch.int64), minlength=num_experts)
+    padded_counts = counts + (block_size - counts % block_size) % block_size
+    num_tokens_post_pad = padded_counts.sum().to(dtype=torch.int32).reshape(1)
+
+    padded_offsets = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    padded_offsets[1:] = padded_counts.cumsum(0)
+
+    max_num_tokens_padded = numel + num_experts * max(block_size - 1, 0)
+    n_m_blocks = max(max_num_tokens_padded // max(block_size, 1), 1)
+
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,), numel, dtype=torch.int32, device=device
+    )
+    expert_ids_out = torch.full((n_m_blocks,), -1, dtype=torch.int32, device=device)
+    cursor = torch.zeros(num_experts, dtype=torch.int64, device=device)
+
+    block = 256
+    grid = (triton.cdiv(numel, block),)
+    _moe_align_capture_place_kernel[grid](
+        flat_i32,
+        padded_offsets,
+        cursor,
+        sorted_ids,
+        expert_ids_out,
+        numel,
+        block_size,
+        BLOCK=block,
+    )
+    return sorted_ids, expert_ids_out, num_tokens_post_pad
+
+
+def _moe_align_fast_capture(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Capture fast align: Triton count + pad-scan + place (no ATen preamble)."""
+    device = topk_ids.device
+    numel = int(topk_ids.numel())
+    block_size = int(block_size)
+    num_experts = int(num_experts)
+
+    if numel == 0:
+        max_num_tokens_padded = num_experts * (block_size - 1)
+        sorted_ids = _empty_capture(
+            max(max_num_tokens_padded, 0), dtype=torch.int32, device=device
+        )
+        _zero_capture(sorted_ids)
+        expert_ids_out = _empty_capture(1, dtype=torch.int32, device=device)
+        _fill_capture(expert_ids_out, -1)
+        num_tokens_post_pad = _empty_capture(1, dtype=torch.int32, device=device)
+        _zero_capture(num_tokens_post_pad)
+        return sorted_ids, expert_ids_out, num_tokens_post_pad
+
+    flat = topk_ids.reshape(-1)
+    if flat.dtype != torch.int32:
+        flat = _capture_safe_to_dtype(flat, torch.int32)
+
+    # Host-known upper bound (no ``.item()``): real + ≤(B-1) pad per expert.
+    max_num_tokens_padded = numel + num_experts * max(block_size - 1, 0)
+    n_m_blocks = max(max_num_tokens_padded // max(block_size, 1), 1)
+
+    counts = _empty_capture(num_experts, dtype=torch.int64, device=device)
+    _zero_capture(counts)
+    padded_offsets = _empty_capture(num_experts + 1, dtype=torch.int64, device=device)
+    _zero_capture(padded_offsets)
+    num_tokens_post_pad = _empty_capture(1, dtype=torch.int32, device=device)
+    _zero_capture(num_tokens_post_pad)
+    sorted_ids = _empty_capture(max_num_tokens_padded, dtype=torch.int32, device=device)
+    _fill_capture(sorted_ids, numel)
+    expert_ids_out = _empty_capture(n_m_blocks, dtype=torch.int32, device=device)
+    _fill_capture(expert_ids_out, -1)
+    cursor = _empty_capture(num_experts, dtype=torch.int64, device=device)
+    _zero_capture(cursor)
+
+    block = 256
+    grid = (triton.cdiv(numel, block),)
+    _moe_align_fast_count_kernel[grid](
+        flat,
+        counts,
+        numel,
+        BLOCK=block,
+    )
+    block_e = _moe_align_block_e(num_experts)
+    _moe_align_fast_pad_scan_kernel[(1,)](
+        counts,
+        padded_offsets,
+        num_tokens_post_pad,
+        num_experts,
+        block_size,
+        BLOCK_E=block_e,
+    )
+    _moe_align_capture_place_kernel[grid](
+        flat,
+        padded_offsets,
+        cursor,
+        sorted_ids,
+        expert_ids_out,
+        numel,
+        block_size,
+        BLOCK=block,
+    )
+    _retain_capture(
+        flat,
+        counts,
+        padded_offsets,
+        num_tokens_post_pad,
+        cursor,
+        sorted_ids,
+        expert_ids_out,
+    )
+    return sorted_ids, expert_ids_out, num_tokens_post_pad
 
 
 @triton.jit
@@ -322,6 +541,47 @@ def _fused_moe_kernel(
 def _phase_marker(name: str) -> None:
     if os.environ.get("INFINI_MOE_PROFILE_PHASES", "").strip() in ("1", "true", "yes"):
         print(f"=== PHASE {name} ===", flush=True)
+
+
+def _moe_stub_enabled(stage: str) -> bool:
+    """Bisect-only: ``INFINI_MOE_STUB_{ALIGN,SILU,SUM,KERNEL}=1`` (not product defaults)."""
+    key = f"INFINI_MOE_STUB_{stage.upper()}"
+    return os.environ.get(key, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Precomputed align buffers for STUB_ALIGN (same topology: reuse pointers, skip align ops).
+# Key: (numel, block_size, num_experts) — shape only so router-varying ids still stub.
+_STUB_ALIGN_CACHE: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def clear_moe_stub_align_cache() -> None:
+    _STUB_ALIGN_CACHE.clear()
+
+
+def _stub_align_precomputed(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Eager-compute align once; reuse under capture/replay stub (no align graph nodes).
+
+    Keyed by shape (not topk content) so router-varying ids still skip align ops.
+    """
+    key = (
+        int(topk_ids.numel()),
+        int(block_size),
+        int(num_experts),
+    )
+    hit = _STUB_ALIGN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    # Always eager (never capture-align) so stub precompute works before/during graph.
+    if _fast_align_enabled():
+        out = _moe_align_fast_eager(topk_ids, int(block_size), int(num_experts))
+    else:
+        out = _moe_align_block_size_eager_legacy(
+            topk_ids, int(block_size), int(num_experts)
+        )
+    _STUB_ALIGN_CACHE[key] = out
+    return out
 
 
 def _host_split_enabled() -> bool:
@@ -698,17 +958,14 @@ def _capture_safe_to_dtype(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return out
 
 
-def _moe_align_block_size_capture(
+def _moe_align_block_size_capture_legacy(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Device align under hcStream capture — arena temps, no ``torch.bincount``/``argsort``.
+    """Legacy capture align: ATen count/pad preamble + O(n) place (or O(n²) for tiny n).
 
-    Large ``numel`` uses an O(n) Triton ``atomic_add`` placement kernel (one GraphExec
-    node). Decode-sized ``numel ≤ 64`` keeps a small O(n²) counting-sort placement (no
-    ATen ``argsort`` / ``FillFunctor<long>`` scratch) so MetaX graph replay does not
-    ATU. Host D2H of ids under capture is unsafe on MetaX (garbage reads).
+    Kill-switch path when ``INFINI_MOE_FAST_ALIGN=0``. Prefer ``moe_align_fast``.
     """
     device = topk_ids.device
     numel = int(topk_ids.numel())
@@ -839,34 +1096,29 @@ def _moe_align_block_size_capture(
     return sorted_ids, expert_ids_out, num_tokens_post_pad
 
 
-def moe_align_block_size(
+def _moe_align_block_size_capture(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Vectorized align (no vLLM ``_custom_ops``, no mid-align ``.item()`` syncs).
+    """Device align under hcStream capture — arena temps, no host D2H.
 
-    For small token counts (decode ``M=1``, ``TOP_K=16`` → 16 ids) uses a host
-    path: one D2H of ids + CPU align + H2D of outputs — avoids MetaX launch tax
-    from argsort/bincount/scatter storms. Larger ``numel`` stays on-device with
-    pad-sentinel init (no redundant pad_fill / ``repeat_interleave``).
+    Default: ``_moe_align_fast_capture`` (Triton count+scan+place). Kill-switch
+    ``INFINI_MOE_FAST_ALIGN=0`` restores ATen preamble + place/O(n²) legacy.
     """
+    if _fast_align_enabled():
+        return _moe_align_fast_capture(topk_ids, block_size, num_experts)
+    return _moe_align_block_size_capture_legacy(topk_ids, block_size, num_experts)
+
+
+def _moe_align_block_size_eager_legacy(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Legacy eager large-M align: Torch argsort / bincount / scatter."""
     device = topk_ids.device
     numel = int(topk_ids.numel())
-    # Under hcStream capture: arena-backed path (no host D2H, no bincount).
-    if _under_device_stream_capture():
-        _HOST_SPLIT.begin("align_capture")
-        out = _moe_align_block_size_capture(topk_ids, block_size, num_experts)
-        _HOST_SPLIT.end("align_capture")
-        return out
-    # Decode-sized (e.g. M=1,TOP_K=16 → 16 ids): host path wins on MetaX.
-    # Keep larger prefill-like aligns on-device (avoid big D2H).
-    if numel > 0 and numel <= 64 and topk_ids.is_cuda:
-        _HOST_SPLIT.begin("align_host_small")
-        out = _moe_align_block_size_host(topk_ids, block_size, num_experts)
-        _HOST_SPLIT.end("align_host_small")
-        return out
-
     flat = topk_ids.reshape(-1).to(torch.int64)
     max_num_tokens_padded = numel + num_experts * (block_size - 1)
     # Host-known: #blocks with ≥1 real token ≤ numel (ceil(c/B) ≤ c).
@@ -880,7 +1132,6 @@ def moe_align_block_size(
         num_tokens_post_pad = torch.zeros(1, dtype=torch.int32, device=device)
         return sorted_ids, expert_ids_out, num_tokens_post_pad
 
-    _HOST_SPLIT.begin("align_pre_item")
     order = torch.argsort(flat, stable=True)
     sorted_experts = flat[order]
     idx = torch.arange(numel, device=device, dtype=torch.int64)
@@ -901,14 +1152,51 @@ def moe_align_block_size(
 
     # Init to pad sentinel; real tokens overwrite via scatter. Trailing pad
     # slots in each expert region remain ``numel`` — no explicit pad_fill.
-    sorted_ids = torch.full((max_num_tokens_padded,), numel, dtype=torch.int32, device=device)
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,), numel, dtype=torch.int32, device=device
+    )
     sorted_ids.scatter_(0, out_pos, order.to(torch.int32))
 
     expert_ids_out = torch.full((n_m_blocks,), -1, dtype=torch.int32, device=device)
     block_idx = out_pos // block_size
     expert_ids_out.scatter_(0, block_idx, sorted_experts.to(torch.int32))
-    _HOST_SPLIT.end("align_pre_item")
     return sorted_ids, expert_ids_out, num_tokens_post_pad
+
+
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized align (no vLLM ``_custom_ops``, no mid-align ``.item()`` syncs).
+
+    For small token counts (decode ``M=1``, ``TOP_K=16`` → 16 ids) uses a host
+    path: one D2H of ids + CPU align + H2D of outputs — avoids MetaX launch tax
+    from argsort/bincount/scatter storms. Larger ``numel`` uses ``moe_align_fast``
+    (``INFINI_MOE_FAST_ALIGN`` default on; ``=0`` restores Torch argsort).
+    """
+    numel = int(topk_ids.numel())
+    # Under hcStream capture: arena-backed path (no host D2H, no bincount).
+    if _under_device_stream_capture():
+        _HOST_SPLIT.begin("align_capture")
+        out = _moe_align_block_size_capture(topk_ids, block_size, num_experts)
+        _HOST_SPLIT.end("align_capture")
+        return out
+    # Decode-sized (e.g. M=1,TOP_K=16 → 16 ids): host path wins on MetaX.
+    # Keep larger prefill-like aligns on-device (avoid big D2H).
+    if numel > 0 and numel <= 64 and topk_ids.is_cuda:
+        _HOST_SPLIT.begin("align_host_small")
+        out = _moe_align_block_size_host(topk_ids, block_size, num_experts)
+        _HOST_SPLIT.end("align_host_small")
+        return out
+
+    _HOST_SPLIT.begin("align_pre_item")
+    if _fast_align_enabled():
+        out = _moe_align_fast_eager(topk_ids, block_size, num_experts)
+    else:
+        out = _moe_align_block_size_eager_legacy(topk_ids, block_size, num_experts)
+    _HOST_SPLIT.end("align_pre_item")
+    return out
 
 
 def moe_sum(input_3d: torch.Tensor, output: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1162,34 +1450,44 @@ def fused_moe_routed(
 
     _phase_marker("align1")
     _HOST_SPLIT.begin("opaque_align1_wall")
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, int(cfg1["BLOCK_SIZE_M"]), E
-    )
+    if _moe_stub_enabled("ALIGN"):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _stub_align_precomputed(
+            topk_ids, int(cfg1["BLOCK_SIZE_M"]), E
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, int(cfg1["BLOCK_SIZE_M"]), E
+        )
     _HOST_SPLIT.end("opaque_align1_wall")
     _retain_capture(sorted_token_ids, expert_ids, num_tokens_post_padded)
 
     _phase_marker("kernel1")
     _HOST_SPLIT.begin("opaque_kernel1")
-    _invoke_kernel(
-        x,
-        w_gate_up,
-        intermediate_cache1,
-        topk_w,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        False,
-        top_k,
-        cfg1,
-        compute_type,
-    )
+    if not _moe_stub_enabled("KERNEL"):
+        _invoke_kernel(
+            x,
+            w_gate_up,
+            intermediate_cache1,
+            topk_w,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            False,
+            top_k,
+            cfg1,
+            compute_type,
+        )
     _HOST_SPLIT.end("opaque_kernel1")
 
     _phase_marker("silu")
     _HOST_SPLIT.begin("opaque_silu")
     gate, up = intermediate_cache1.view(-1, N2).chunk(2, dim=-1)
-    # Write silu*up into workspace cache2 (avoid extra temporary + copy_).
-    torch.mul(F.silu(gate), up, out=intermediate_cache2)
+    if _moe_stub_enabled("SILU"):
+        # Identity/copy stub: take gate half into cache2 (no silu_and_mul).
+        intermediate_cache2.copy_(gate)
+    else:
+        # Write silu*up into workspace cache2 (avoid extra temporary + copy_).
+        torch.mul(F.silu(gate), up, out=intermediate_cache2)
     _HOST_SPLIT.end("opaque_silu")
 
     _phase_marker("align2")
@@ -1199,6 +1497,11 @@ def fused_moe_routed(
         sorted_token_ids2 = sorted_token_ids
         expert_ids2 = expert_ids
         num_tokens_post_padded2 = num_tokens_post_padded
+    elif _moe_stub_enabled("ALIGN"):
+        sorted_token_ids2, expert_ids2, num_tokens_post_padded2 = (
+            _stub_align_precomputed(topk_ids, int(cfg2["BLOCK_SIZE_M"]), E)
+        )
+        _retain_capture(sorted_token_ids2, expert_ids2, num_tokens_post_padded2)
     else:
         sorted_token_ids2, expert_ids2, num_tokens_post_padded2 = moe_align_block_size(
             topk_ids, int(cfg2["BLOCK_SIZE_M"]), E
@@ -1207,24 +1510,29 @@ def fused_moe_routed(
     _HOST_SPLIT.end("opaque_align2_wall")
     _phase_marker("kernel2")
     _HOST_SPLIT.begin("opaque_kernel2")
-    _invoke_kernel(
-        intermediate_cache2,
-        w_down,
-        intermediate_cache3,
-        topk_w,
-        sorted_token_ids2,
-        expert_ids2,
-        num_tokens_post_padded2,
-        True,
-        1,
-        cfg2,
-        compute_type,
-    )
+    if not _moe_stub_enabled("KERNEL"):
+        _invoke_kernel(
+            intermediate_cache2,
+            w_down,
+            intermediate_cache3,
+            topk_w,
+            sorted_token_ids2,
+            expert_ids2,
+            num_tokens_post_padded2,
+            True,
+            1,
+            cfg2,
+            compute_type,
+        )
     _HOST_SPLIT.end("opaque_kernel2")
 
     _phase_marker("moe_sum")
     _HOST_SPLIT.begin("opaque_moe_sum")
-    moe_sum(intermediate_cache3, out)
+    if _moe_stub_enabled("SUM"):
+        # Cheap reduce stub: first expert slot only (no full moe_sum).
+        out.copy_(intermediate_cache3[:, 0, :])
+    else:
+        moe_sum(intermediate_cache3, out)
     _HOST_SPLIT.end("opaque_moe_sum")
     # Workspace ``out`` is IC-arena-owned under capture; eager path reuses cache.
     return out

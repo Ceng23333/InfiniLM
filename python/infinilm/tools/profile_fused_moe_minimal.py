@@ -10,6 +10,8 @@ Modes:
   cpp_pad_m1  — C++ inductor_moe_ path: hidden [1,1,H] → pad to B16 (decode pad tax)
   host_split  — Phase 0 attribution: timed align/.item/opaque + capture-align @ M
   kernel_only — precompute align+silu once; time `_invoke_kernel` x2 only
+  capture_replay — BeginCapture → one fused_moe_routed → EndCapture/Instantiate
+                   → timed Launch×N (optional INFINI_MOE_STUB_* stage stubs)
 
 Env (required; wrapper sets defaults):
   INFINI_MOE_CONFIGS, INFINI_MOE_TRITON_CACHE / TRITON_CACHE_DIR,
@@ -834,6 +836,237 @@ def _run_kernel_only(args) -> int:
     return 0
 
 
+def _set_device_stream_capturing(on: bool) -> None:
+    """Bridge INFINI_DEVICE_STREAM_CAPTURING for capture-path align (no InfiniCore TLS)."""
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+    if on:
+        os.environ["INFINI_DEVICE_STREAM_CAPTURING"] = "1"
+        libc.setenv(b"INFINI_DEVICE_STREAM_CAPTURING", b"1", 1)
+    else:
+        os.environ.pop("INFINI_DEVICE_STREAM_CAPTURING", None)
+        try:
+            libc.unsetenv(b"INFINI_DEVICE_STREAM_CAPTURING")
+        except Exception:  # noqa: BLE001
+            libc.setenv(b"INFINI_DEVICE_STREAM_CAPTURING", b"0", 1)
+
+
+def _run_capture_replay(args) -> int:
+    """Capture InductorMoe (fused_moe_routed body) via InfiniCore GraphExec; time replay.
+
+    Product-faithful path: ``start_graph_recording`` → ``inductor_moe_`` →
+    ``stop_graph_recording`` (BeginCapture/Instantiate inside) → ``graph.run()``×N.
+
+    Record-time stubs via ``INFINI_MOE_STUB_{ALIGN,SILU,SUM,KERNEL}``.
+    ``torch.cuda.CUDAGraph`` around raw ``fused_moe_routed`` hangs on MetaX;
+    InfiniCore hcGraph is the supported capture path.
+    """
+    import json
+
+    import torch
+    from infinilm.kernels import fused_moe_runtime as fmr
+    from infinilm.kernels.fused_moe_runtime import launcher_hash
+
+    _refuse_vllm()
+    os.environ["INFINI_MOE_PROFILE_PHASES"] = "0"
+    _set_device_stream_capturing(False)
+    fmr.clear_moe_stub_align_cache()
+
+    M = int(args.M)
+    if M not in LAUNCHER_M_ALLOWED:
+        raise ValueError(f"capture_replay expects M in {LAUNCHER_M_ALLOWED}, got {M}")
+
+    stubs = {
+        "ALIGN": fmr._moe_stub_enabled("ALIGN"),
+        "SILU": fmr._moe_stub_enabled("SILU"),
+        "SUM": fmr._moe_stub_enabled("SUM"),
+        "KERNEL": fmr._moe_stub_enabled("KERNEL"),
+    }
+
+    # Product MoE-in-graph env (match serve Decode / METAX UNSAFE).
+    os.environ.setdefault("INFINI_CUDAGRAPH_POLICY", "full_and_piecewise")
+    os.environ.setdefault("INFINI_MOE_INGRAPH", "both")
+    os.environ.setdefault("INFINI_MOE_METAX_INGRAPH_UNSAFE", "1")
+    os.environ.setdefault("INFINI_GRAPH_STRICT_REPLAY", "1")
+    os.environ["INFINI_PIECEWISE_VALID_LEN"] = str(M)
+    os.environ["INFINI_PIECEWISE_INDUCTOR_SEGMENT"] = "1"
+    os.environ.pop("INFINI_MOE_FORCE_HOST_BREAK", None)
+    os.environ.pop("INFINI_MOE_CAPTURE_SAFE", None)
+
+    segment = (args.segment_pt2 or "").strip()
+    if not segment:
+        cache_root = os.environ.get(
+            "INFINI_PIECEWISE_CACHE",
+            str(_cache_dir().parent),
+        )
+        # Prefer moe_B{M}/segment.pt2 under deploy cache.
+        for cand in (
+            Path(cache_root) / "tp1" / "rank0" / f"moe_B{M}" / "segment.pt2",
+            Path(os.environ.get("INFINI_MOE_CONFIGS", "")).resolve().parent
+            / "tp1"
+            / "rank0"
+            / f"moe_B{M}"
+            / "segment.pt2",
+        ):
+            if cand.is_file():
+                segment = str(cand)
+                break
+    if not segment or not Path(segment).is_file():
+        raise RuntimeError(
+            f"capture_replay needs moe_B{M}/segment.pt2 (--segment-pt2 or deploy cache)"
+        )
+
+    import infinicore
+    from infinicore.lib import _infinicore as _ic
+    from infinilm.compile.piecewise_moe_segment import make_moe_example_inputs
+    from infinilm.compile.piecewise_segments import LAYER_AGNOSTIC_IDX, SEGMENT_MOE
+    from infinilm.torch_llama.moe_ops import register_fused_moe_routed_op
+
+    register_fused_moe_routed_op()
+    device_index = 0
+    device = infinicore.device("cuda", device_index)
+    infinicore.set_device(device)
+    cuda_dev = f"cuda:{device_index}"
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    layer_idx = 0
+    bucket = int(M)
+
+    _ic.register_piecewise_inductor_package(
+        SEGMENT_MOE,
+        LAYER_AGNOSTIC_IDX,
+        bucket,
+        str(Path(segment).resolve()),
+        0,
+        True,
+    )
+    if hasattr(_ic, "set_piecewise_inductor_lookup_tp_rank"):
+        _ic.set_piecewise_inductor_lookup_tp_rank(0)
+
+    examples = make_moe_example_inputs(
+        bucket=bucket,
+        hidden_size=H,
+        moe_intermediate_size=N,
+        n_routed_experts=E,
+        device=torch.device(cuda_dev),
+        dtype=dtype,
+    )
+    _hidden_ex, gate_w, bias, w_gu, w_d, shared_gu, shared_d = examples
+    _ic.register_moe_external_weights(
+        int(layer_idx),
+        *[
+            infinicore.from_torch(t.contiguous())._underlying
+            for t in (gate_w, bias, w_gu, w_d, shared_gu, shared_d)
+        ],
+    )
+
+    seq = bucket
+    hidden_t = torch.randn(1, seq, H, device=cuda_dev, dtype=dtype)
+    out_t = torch.empty(1, seq, H, device=cuda_dev, dtype=dtype)
+    hidden = infinicore.from_torch(hidden_t)
+    out = infinicore.from_torch(out_t)
+
+    def sync():
+        torch.cuda.synchronize(device_index)
+        infinicore.sync_stream()
+
+    def eager_once():
+        _ic.inductor_moe_(
+            hidden._underlying,
+            out._underlying,
+            int(layer_idx),
+            int(bucket),
+        )
+
+    # Warm stub-align cache outside capture if needed (routed path uses topk from router).
+    if stubs["ALIGN"]:
+        # Prefill stub cache with a representative topk shape; router may differ
+        # per call but stub skips align ops once precomputed for first ids.
+        pass
+
+    print(
+        f"[profile-moe] mode=capture_replay M={M} TOP_K={TOP_K} stubs={stubs} "
+        f"path=inductor_moe_graph",
+        flush=True,
+    )
+    print(f"[profile-moe] launcher_hash={launcher_hash()}")
+    print(f"[profile-moe] segment={segment}")
+    print(f"[profile-moe] configs={os.environ.get('INFINI_MOE_CONFIGS')}")
+    print(f"[profile-moe] triton_cache={_cache_dir()}")
+
+    print("=== WARMUP_BEGIN mode=capture_replay_eager ===", flush=True)
+    for _ in range(max(int(args.warmup), 2)):
+        eager_once()
+    sync()
+    print("=== WARMUP_END mode=capture_replay_eager ===", flush=True)
+
+    print("=== CAPTURE_BEGIN mode=capture_replay ===", flush=True)
+    if hasattr(_ic, "set_inference_phase"):
+        _ic.set_inference_phase("decode")
+    try:
+        infinicore.start_graph_recording(device)
+        _ic.inductor_moe_(
+            hidden._underlying,
+            out._underlying,
+            int(layer_idx),
+            int(bucket),
+        )
+        graph = infinicore.stop_graph_recording()
+    finally:
+        if hasattr(_ic, "set_inference_phase"):
+            try:
+                _ic.set_inference_phase("unknown")
+            except Exception:  # noqa: BLE001
+                pass
+    print("=== CAPTURE_END mode=capture_replay ===", flush=True)
+
+    has_exec = bool(graph.has_device_exec())
+    seg_count = int(graph.device_segment_count())
+    log_msg = graph.device_graph_log() or ""
+    print(
+        f"[profile-moe] has_device_exec={int(has_exec)} device_segment_count={seg_count}",
+        flush=True,
+    )
+    if log_msg:
+        print(f"[profile-moe] device_graph_log={log_msg[:500]}", flush=True)
+    if not has_exec:
+        raise RuntimeError(
+            "capture_replay: has_device_exec=false (MoE host-break or capture failed)"
+        )
+
+    def once():
+        graph.run()
+
+    host_ms = _run_timed(
+        f"capture_replay_m{M}",
+        once,
+        warmup=args.warmup,
+        iters=args.iters,
+        device=torch.device(cuda_dev),
+    )
+    summary = {
+        "M": M,
+        "mode": "capture_replay",
+        "capture_path": "inductor_moe_graph",
+        "host_ms_per_iter": host_ms,
+        "iters": int(args.iters),
+        "warmup": int(args.warmup),
+        "stubs": stubs,
+        "launcher_hash": launcher_hash(),
+        "fast_align": os.environ.get("INFINI_MOE_FAST_ALIGN", ""),
+        "has_device_exec": has_exec,
+        "device_segment_count": seg_count,
+        "segment_pt2": segment,
+        "last_replay_used_device": bool(graph.last_replay_used_device()),
+        "replay_op_list_fallback": int(graph.replay_op_list_fallback()),
+    }
+    if args.out_dir:
+        out_path = Path(args.out_dir) / f"capture_replay_m{M}_summary.json"
+        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        print(f"[profile-moe] wrote {out_path}", flush=True)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -847,6 +1080,7 @@ def main() -> int:
             "cpp_pad_m1",
             "host_split",
             "kernel_only",
+            "capture_replay",
         ),
     )
     ap.add_argument(
@@ -896,6 +1130,8 @@ def main() -> int:
             rc = _run_align_tax(args)
         elif args.mode == "kernel_only":
             rc = _run_kernel_only(args)
+        elif args.mode == "capture_replay":
+            rc = _run_capture_replay(args)
         elif args.mode == "host_split":
             if not args.segment_pt2:
                 # Allow host_split without AOTI if segment missing; warn.
