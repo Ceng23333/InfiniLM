@@ -16,11 +16,11 @@ std::shared_ptr<infinilm::config::ModelConfig> ConfigFactory::createConfig(const
         throw std::invalid_argument("infinilm::config::ConfigFactory::createConfig: Unsupported model config type: " + model_type);
     }
 
-    static const std::unordered_set<std::string> kModernModelTypes{"qwen3"};
+    static const std::unordered_set<std::string> kModernModelTypes{"qwen3", "llama"};
     if (kModernModelTypes.find(model_type) == kModernModelTypes.end()) {
         throw std::invalid_argument(
             "infinilm::config::ConfigFactory::createConfig: model type `" + model_type
-            + "` is unavailable with the modern InfiniOps backend; supported model types: qwen3");
+            + "` is unavailable with the modern InfiniOps backend; supported model types: qwen3, llama");
     }
 
     it->second(model_config);

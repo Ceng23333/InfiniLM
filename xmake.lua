@@ -2,6 +2,7 @@ add_requires("pybind11")
 
 local INFINI_ROOT = os.getenv("INFINI_ROOT") or (os.getenv(is_host("windows") and "HOMEPATH" or "HOME") .. "/.infini")
 local CUDA_ROOT = os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH") or "/usr/local/cuda"
+local HPCC_PATH = os.getenv("HPCC_PATH") or "/opt/hpcc"
 
 set_toolchains("gcc")
 
@@ -9,6 +10,12 @@ add_includedirs("third_party/spdlog/include")
 add_includedirs("third_party/json/single_include/")
 if os.isdir(CUDA_ROOT .. "/include") then
     add_includedirs(CUDA_ROOT .. "/include")
+end
+if os.isdir(HPCC_PATH .. "/include") then
+    add_includedirs(HPCC_PATH .. "/include")
+end
+if os.isdir(HPCC_PATH .. "/tools/cu-bridge/include") then
+    add_includedirs(HPCC_PATH .. "/tools/cu-bridge/include")
 end
 
 target("infinicore_runtime")
@@ -57,7 +64,7 @@ target_end()
 target("_infinicore")
     add_packages("pybind11")
     set_default(false)
-    add_rules("python.module", { soabi = true })
+    add_rules("python.library", { soabi = true })
     set_languages("cxx17")
     set_kind("shared")
 
@@ -83,7 +90,7 @@ target_end()
 target("_infinilm")
     add_packages("pybind11")
     set_default(false)
-    add_rules("python.module", { soabi = true })
+    add_rules("python.library", { soabi = true })
     set_languages("cxx17")
     set_kind("shared")
 
@@ -103,6 +110,7 @@ target("_infinilm")
     add_files("csrc/**.cc|infinicore/**.cc|models/**.cc")
     add_files("csrc/models/*.cpp")
     add_files("csrc/models/qwen3/*.cpp")
+    add_files("csrc/models/llama/*.cpp")
 
     set_installdir("python/infinilm")
 target_end()

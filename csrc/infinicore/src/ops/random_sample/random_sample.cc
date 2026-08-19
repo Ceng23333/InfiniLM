@@ -1,6 +1,10 @@
 #include "infinicore/ops/random_sample.hpp"
 
 #include "../../utils.hpp"
+#include "custom_types.h"
+
+#include <cmath>
+#include <cstdint>
 
 #ifdef ENABLE_INFINIOPS_API
 #include "../infiniops_impl.hpp"
@@ -10,6 +14,65 @@
 
 namespace infinicore::op {
 namespace {
+
+bool tryGreedyHost(
+    Tensor indices, Tensor logits,
+    float /*random_value*/, float /*top_p*/, int top_k, float /*temperature*/) {
+    if (top_k != 1
+        || logits->ndim() != 1
+        || logits->numel() == 0
+        || !logits->is_contiguous()
+        || indices->numel() != 1
+        || !indices->is_contiguous()) {
+        return false;
+    }
+
+    auto cpu_logits = logits->contiguous()->to(Device{Device::Type::kCpu});
+    const size_t n = cpu_logits->numel();
+    size_t best = 0;
+    float best_v = -INFINITY;
+    auto consider = [&](size_t i, float v) {
+        if (v > best_v) {
+            best_v = v;
+            best = i;
+        }
+    };
+
+    if (cpu_logits->dtype() == DataType::kFloat32) {
+        const auto *p = reinterpret_cast<const float *>(cpu_logits->data());
+        for (size_t i = 0; i < n; ++i) {
+            consider(i, p[i]);
+        }
+    } else if (cpu_logits->dtype() == DataType::kFloat16) {
+        const auto *p = reinterpret_cast<const fp16_t *>(cpu_logits->data());
+        for (size_t i = 0; i < n; ++i) {
+            consider(i, _f16_to_f32(p[i]));
+        }
+    } else if (cpu_logits->dtype() == DataType::kBFloat16) {
+        const auto *p = reinterpret_cast<const bf16_t *>(cpu_logits->data());
+        for (size_t i = 0; i < n; ++i) {
+            consider(i, _bf16_to_f32(p[i]));
+        }
+    } else {
+        return false;
+    }
+
+    if (indices->dtype() == DataType::kInt64) {
+        int64_t value = static_cast<int64_t>(best);
+        auto cpu_idx = Tensor::from_blob(
+            &value, {}, DataType::kInt64, Device{Device::Type::kCpu});
+        indices->copy_from(cpu_idx);
+        return true;
+    }
+    if (indices->dtype() == DataType::kInt32) {
+        int32_t value = static_cast<int32_t>(best);
+        auto cpu_idx = Tensor::from_blob(
+            &value, {}, DataType::kInt32, Device{Device::Type::kCpu});
+        indices->copy_from(cpu_idx);
+        return true;
+    }
+    return false;
+}
 
 #ifdef ENABLE_INFINIOPS_API
 bool tryGreedyWithInfiniOps(
@@ -65,6 +128,9 @@ void RandomSample::execute(
         return;
     }
 #endif
+    if (tryGreedyHost(indices, logits, random_val, topp, topk, temperature)) {
+        return;
+    }
 
     dispatcher().lookup(logits->device().type())(
         indices, logits, random_val, topp, topk, temperature);

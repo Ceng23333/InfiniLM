@@ -47,7 +47,7 @@ static and paged attention, eager and graph execution, single-request and
 batch-2 inference, greedy and non-greedy sampling, TP2, PP2, and combined
 TP2+PP2. Paged attention was validated with the default 256-token block size.
 
-Only `qwen3` can be instantiated by the modern model factory. Other model
+Only `qwen3` and `llama` can be instantiated by the modern model factory. Other model
 families, quantized models, and biased Qwen3 configurations remain gated.
 Other platforms and custom paged-cache block sizes have not yet been
 validated.

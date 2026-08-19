@@ -136,6 +136,7 @@ class InfiniCorePythonContractsTest(unittest.TestCase):
             "kCambricon",
             "kAscend",
             "kMetax",
+            "kMars",
             "kMoore",
             "kIluvatar",
             "kHygon",

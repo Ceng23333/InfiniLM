@@ -31,7 +31,7 @@ void *plan(const Tensor &positions,
            bool is_neox,
            int64_t rope_dim_offset,
            bool inverse) {
-    INFINICORE_ASSERT(query->device().type() == Device::Type::kNvidia);
+    INFINICORE_ASSERT(::infinicore::op::infiniops::isSupportedDevice(query->device().type()));
     return new PlannedMeta{
         TensorMeta(positions),
         TensorMeta(query),
@@ -74,9 +74,9 @@ void cleanup(void **planned_meta_ptr) {
 }
 
 static bool registered = []() {
-    RotaryEmbedding::plan_dispatcher().registerDevice(Device::Type::kNvidia, &plan);
-    RotaryEmbedding::run_dispatcher().registerDevice(Device::Type::kNvidia, &run);
-    RotaryEmbedding::cleanup_dispatcher().registerDevice(Device::Type::kNvidia, &cleanup);
+    ::infinicore::op::infiniops::registerSupportedDevices(RotaryEmbedding::plan_dispatcher(), &plan);
+    ::infinicore::op::infiniops::registerSupportedDevices(RotaryEmbedding::run_dispatcher(), &run);
+    ::infinicore::op::infiniops::registerSupportedDevices(RotaryEmbedding::cleanup_dispatcher(), &cleanup);
     return true;
 }();
 

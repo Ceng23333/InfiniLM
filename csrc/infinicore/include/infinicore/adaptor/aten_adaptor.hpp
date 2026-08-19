@@ -41,7 +41,7 @@ inline at::ScalarType to_at_dtype(DataType dtype) {
 inline at::Device to_at_device(const Device &device) {
     // PyTorch ATen only exposes standard device types (e.g. kCPU/kCUDA).
     // Treat CUDA-compatible devices as CUDA devices for ATen interoperability.
-    if (device.type() == Device::Type::kNvidia || device.type() == Device::Type::kMetax || device.type() == Device::Type::kHygon) {
+    if (device.type() == Device::Type::kNvidia || device.type() == Device::Type::kMetax || device.type() == Device::Type::kMars || device.type() == Device::Type::kHygon) {
         return at::Device(at::kCUDA, device.index());
     } else if (device.type() == Device::Type::kCpu) {
         return at::Device(at::kCPU);
