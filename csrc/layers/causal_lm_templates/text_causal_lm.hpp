@@ -57,7 +57,10 @@ public:
         }
 
         auto lm_head_input = hidden_states;
-        if (!input.sample_all_positions && input.input_offsets.has_value()) {
+        // MetaX has no InfiniOp backend for select_last_token_hidden; keep packed
+        // hidden_states and let RankWorker index last-token logits via offsets.
+        if (!input.sample_all_positions && input.input_offsets.has_value()
+            && hidden_states->device().getType() != infinicore::Device::Type::METAX) {
             const size_t num_requests = input.input_offsets.value()->numel() - 1;
             const bool is_packed_prefill = hidden_states->ndim() == 3
                                         && hidden_states->size(0) == 1
