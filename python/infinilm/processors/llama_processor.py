@@ -12,20 +12,26 @@ class LlamaProcessor(BasicLLMProcessor):
 
     @staticmethod
     def _fix_tokenizer_decoder(tokenizer):
-        """Fix tokenizer decoder for llama models."""
+        """Fix tokenizer decoder for llama models.
+
+        Fast tokenizers often end with Strip(content=" ", start=1), which drops the
+        leading space produced by ▁→" " when decoding a *single* token. Incremental
+        generation then concatenates words (Thecorrectansweris...) and thinking
+        fills max_tokens=128 so extract_answer returns empty.
+
+        Older trees also had a Prepend("▁") normalizer; require Strip alone so the
+        fix still applies when normalizer is None (9g_8b_thinking / FM9G llama).
+        """
         backend = getattr(tokenizer, "backend_tokenizer", None)
         target = getattr(backend, "_tokenizer", backend)
-        norm = getattr(target, "normalizer", None)
         dec = getattr(target, "decoder", None)
-        sn = repr(norm)[:800] if norm is not None else ""
         sd = repr(dec)[:800] if dec is not None else ""
-        has_prepend = "Prepend" in sn
-        has_strip = "Strip" in sd
-        if has_prepend and has_strip:
-            target.decoder = _dec.Sequence(
-                [
-                    _dec.Replace("▁", " "),
-                    _dec.ByteFallback(),
-                    _dec.Fuse(),
-                ]
-            )
+        if "Strip" not in sd:
+            return
+        target.decoder = _dec.Sequence(
+            [
+                _dec.Replace("▁", " "),
+                _dec.ByteFallback(),
+                _dec.Fuse(),
+            ]
+        )

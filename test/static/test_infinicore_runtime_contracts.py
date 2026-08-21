@@ -207,8 +207,8 @@ class InfiniCoreRuntimeContractsTest(unittest.TestCase):
             "ConfigFactory::createConfig",
         )
 
-        self.assertIn('kModernModelTypes{"qwen3"}', create)
-        self.assertIn("supported model types: qwen3", create)
+        self.assertIn('kModernModelTypes{"qwen3", "llama"}', create)
+        self.assertIn("supported model types: qwen3, llama", create)
         self.assertLess(
             create.index("if (it == config_map.end())"),
             create.index("kModernModelTypes.find(model_type)"),
@@ -221,7 +221,7 @@ class InfiniCoreRuntimeContractsTest(unittest.TestCase):
 
         readme = read_source("README.md")
         self.assertIn(
-            "Only `qwen3` can be instantiated by the modern model factory",
+            "Only `qwen3` and `llama` can be instantiated by the modern model factory",
             readme,
         )
 
@@ -239,7 +239,7 @@ class InfiniCoreRuntimeContractsTest(unittest.TestCase):
         )
         self.assertEqual(
             set(re.findall(r'"(csrc/models/[^"\n]+)"', model_target)),
-            {"csrc/models/*.cpp", "csrc/models/qwen3/*.cpp"},
+            {"csrc/models/*.cpp", "csrc/models/qwen3/*.cpp", "csrc/models/llama/*.cpp"},
         )
         self.assertNotIn('add_files("csrc/**.cpp")', model_target)
         self.assertNotIn('add_files("csrc/**.cc")', model_target)
@@ -899,6 +899,7 @@ class InfiniCoreRuntimeContractsTest(unittest.TestCase):
             "kCambricon",
             "kAscend",
             "kMetax",
+            "kMars",
             "kMoore",
             "kIluvatar",
             "kHygon",
