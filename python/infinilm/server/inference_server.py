@@ -17,6 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from infinilm.llm import AsyncLLMEngine, SamplingParams, FinishReason
+from infinilm.server.openai_protocol import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,12 @@ DEFAULT_REQUEST_TIMEOUT = 1000.0
 
 
 def chunk_json(
-    id_, content=None, role=None, finish_reason=None, model: str = "unknown"
+    id_,
+    content=None,
+    role=None,
+    finish_reason=None,
+    model: str = "unknown",
+    tool_calls=None,
 ):
     """Generate JSON chunk for streaming response."""
     delta = {}
@@ -33,6 +39,8 @@ def chunk_json(
         delta["content"] = content
     if role:
         delta["role"] = role
+    if tool_calls:
+        delta["tool_calls"] = tool_calls
     return {
         "id": id_,
         "object": "chat.completion.chunk",
@@ -60,8 +68,15 @@ def completion_json(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     total_tokens: int = 0,
+    tool_calls=None,
 ):
     """Generate JSON response for non-streaming completion."""
+    message = {
+        "role": role,
+        "content": content,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "id": id_,
         "object": "chat.completion",
@@ -71,10 +86,7 @@ def completion_json(
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": role,
-                    "content": content,
-                },
+                "message": message,
                 "logprobs": None,
                 "finish_reason": finish_reason,
             }
@@ -220,6 +232,14 @@ class InferenceServer:
             # Normalize messages to handle multimodal content (list format)
             data["messages"] = self._normalize_messages(data.get("messages", []))
 
+            # Forward OpenAI tools into chat_template_kwargs for tokenizer templates.
+            chat_template_kwargs = dict(data.get("chat_template_kwargs") or {})
+            tools = data.get("tools")
+            tool_choice = data.get("tool_choice", "auto")
+            if tools and tool_choice != "none":
+                chat_template_kwargs["tools"] = tools
+            data["chat_template_kwargs"] = chat_template_kwargs
+
             stream = data.get("stream", False)
             request_id = f"cmpl-{uuid.uuid4().hex}"
 
@@ -354,6 +374,13 @@ class InferenceServer:
                 chat_template_kwargs=data.get("chat_template_kwargs") or {},
             )
 
+            tool_parser = (
+                ToolCallStreamParser()
+                if (data.get("chat_template_kwargs") or {}).get("tools")
+                else None
+            )
+            tool_call_index = 0
+
             async for token_output in self.engine.stream_request(
                 req,
                 timeout=DEFAULT_STREAM_TIMEOUT,
@@ -392,21 +419,69 @@ class InferenceServer:
                 )
 
                 if not is_eos_token and token_output.token_text:
-                    # Send token
-                    chunk = json.dumps(
-                        chunk_json(
-                            request_id,
-                            content=token_output.token_text,
-                            model=self.model_id,
-                        ),
-                        ensure_ascii=False,
-                    )
-                    yield f"data: {chunk}\n\n"
+                    if tool_parser is None:
+                        content_parts, tool_calls = [token_output.token_text], []
+                    else:
+                        content_parts, tool_calls = tool_parser.feed(
+                            token_output.token_text
+                        )
+                    for part in content_parts:
+                        if not part:
+                            continue
+                        chunk = json.dumps(
+                            chunk_json(
+                                request_id,
+                                content=part,
+                                model=self.model_id,
+                            ),
+                            ensure_ascii=False,
+                        )
+                        yield f"data: {chunk}\n\n"
+                    for tool_call in tool_calls:
+                        delta_call = {"index": tool_call_index, **tool_call}
+                        tool_call_index += 1
+                        chunk = json.dumps(
+                            chunk_json(
+                                request_id,
+                                tool_calls=[delta_call],
+                                model=self.model_id,
+                            ),
+                            ensure_ascii=False,
+                        )
+                        yield f"data: {chunk}\n\n"
 
                 if token_output.finished:
+                    if tool_parser is not None:
+                        content_parts, tool_calls = tool_parser.finalize()
+                        for part in content_parts:
+                            if not part:
+                                continue
+                            chunk = json.dumps(
+                                chunk_json(
+                                    request_id,
+                                    content=part,
+                                    model=self.model_id,
+                                ),
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {chunk}\n\n"
+                        for tool_call in tool_calls:
+                            delta_call = {"index": tool_call_index, **tool_call}
+                            tool_call_index += 1
+                            chunk = json.dumps(
+                                chunk_json(
+                                    request_id,
+                                    tool_calls=[delta_call],
+                                    model=self.model_id,
+                                ),
+                                ensure_ascii=False,
+                            )
+                            yield f"data: {chunk}\n\n"
                     finish_reason = self._convert_finish_reason(
                         token_output.finish_reason
                     )
+                    if tool_parser is not None and tool_parser.has_tool_calls:
+                        finish_reason = "tool_calls"
                     chunk = json.dumps(
                         chunk_json(
                             request_id, finish_reason=finish_reason, model=self.model_id
@@ -493,6 +568,11 @@ class InferenceServer:
 
             output_text = output_text.strip()
             finish_reason = self._convert_finish_reason(req.finish_reason)
+            tool_calls = None
+            if (data.get("chat_template_kwargs") or {}).get("tools"):
+                output_text, tool_calls = parse_tool_calls(output_text)
+                if tool_calls:
+                    finish_reason = "tool_calls"
 
             response = completion_json(
                 request_id,
@@ -503,6 +583,7 @@ class InferenceServer:
                 prompt_tokens=req.get_prompt_length(),
                 completion_tokens=req.get_num_generated_tokens(),
                 total_tokens=req.get_total_length(),
+                tool_calls=tool_calls,
             )
             return response
 
