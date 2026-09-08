@@ -15,6 +15,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace infinilm::engine {
@@ -25,6 +26,8 @@ class RankWorker {
     enum class Command {
         INIT,
         LOAD,
+        LOAD_BATCH,
+        PREPROCESS,
         RUN,
         RESET_CACHE,
         COMPILE,
@@ -35,8 +38,6 @@ public:
     struct Input {
         /// Token IDs tensor of shape `[batch, seq_len]`.
         std::optional<infinicore::Tensor> input_ids;
-        /// Image pixel values for multi-modal models.
-        std::optional<infinicore::Tensor> pixel_values;
         /// Position IDs tensor of shape `[batch, seq_len]` or `[seq_len]`.
         std::optional<infinicore::Tensor> position_ids;
         /// Past Lengths of cached sequence for each request, of shape `[num_requests]`.
@@ -51,10 +52,26 @@ public:
         std::optional<infinicore::Tensor> block_tables;
         /// Slot ids for each token `[seq]`. Used for paged cache.
         std::optional<infinicore::Tensor> slot_mapping;
+        /// Mamba state cache indices read at the start of each request forward.
+        std::optional<infinicore::Tensor> mamba_init_state_indices;
+        /// Mamba state cache indices written with the final state of each request forward.
+        std::optional<infinicore::Tensor> mamba_final_state_indices;
+        /// Image pixel values for multi-modal models.
+        std::optional<std::vector<infinicore::Tensor>> pixel_values;
         /// Image placeholder bounds for MiniCPM-V style replacement.
-        std::optional<infinicore::Tensor> image_bound;
+        std::optional<std::vector<infinicore::Tensor>> image_bound;
         /// Target patch sizes for each image (MiniCPM-V).
-        std::optional<infinicore::Tensor> tgt_sizes;
+        std::optional<std::vector<infinicore::Tensor>> tgt_sizes;
+        /// Qwen-style image grids. Vector of tensors shape: [3] with temporal, height, width.
+        std::optional<std::vector<infinicore::Tensor>> image_grid_thw;
+        /// req_id for each pixel_values among a batch
+        std::optional<std::vector<size_t>> image_req_ids;
+        /// Flattened [start, end) visual token ranges in the packed language sequence.
+        std::optional<std::vector<size_t>> visual_token_ranges;
+        /// Target model hidden states for draft/MTP models.
+        std::optional<infinicore::Tensor> target_hidden_states;
+        /// Sample logits at every packed input position instead of one token per request.
+        bool sample_all_positions{false};
 
         float temperature{1};
 
@@ -67,14 +84,9 @@ public:
 
     struct Output {
         infinicore::Tensor output_ids;
+        infinicore::Tensor logits;
+        infinicore::Tensor hidden_states;
     };
-
-    RankWorker(const InfinilmModel::Config &model_config,
-               const distributed::RankInfo &rank_info,
-               const cache::CacheConfig *cache_config,
-               RankBarrier *barrier,
-               bool enable_graph_compiling,
-               backends::AttentionBackend attention_backend);
 
     RankWorker(std::shared_ptr<infinilm::global_state::InfinilmConfig> infinilm_config,
                const distributed::RankInfo &rank_info,
@@ -83,18 +95,30 @@ public:
                bool enable_graph_compiling,
                backends::AttentionBackend attention_backend);
 
+    void wait_for_init();
+
+    ~RankWorker();
+
     // Submit a parameter load job and wait until the load completes on the worker thread.
     void load_param(const std::string &name,
                     const infinicore::Tensor &param);
 
+    void load_params(const std::unordered_map<std::string, infinicore::Tensor> &params, bool strict = true);
+
+    void process_weights_after_loading();
+
     // return the parameters (i.e. weights and biases).
     std::unordered_map<std::string, infinicore::nn::Parameter> state_dict();
 
-    // Submit a run (forward) job.
+    std::vector<std::string> state_dict_keys();
+
+    // Submit a run (forward + sampling) job.
     void run(const Input &args);
 
     // Reset the internal cache with a new configuration
     void reset_cache(const cache::CacheConfig *new_config);
+
+    std::vector<infinicore::Tensor> get_kv_cache();
 
     // Compile the model graph if enabled.
     void compile();
@@ -115,7 +139,6 @@ private:
 
 private:
     // Worker properties
-    const InfinilmModel::Config &legacy_model_config_ = InfinilmModel::Config();
     std::shared_ptr<infinilm::global_state::InfinilmConfig> infinilm_config_;
     std::shared_ptr<infinilm::config::ModelConfig> model_config_;
     engine::distributed::RankInfo rank_info_;
@@ -142,6 +165,8 @@ private:
     // Task payloads (protected by mutex)
     std::string pending_param_name_;
     infinicore::Tensor pending_param_;
+    std::unordered_map<std::string, infinicore::Tensor> pending_params_;
+    bool pending_params_strict_ = true;
     Input pending_args_;
     std::unique_ptr<cache::CacheConfig> pending_cache_config_;
 

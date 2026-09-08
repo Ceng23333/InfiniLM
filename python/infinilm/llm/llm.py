@@ -7,73 +7,32 @@ This module provides:
 """
 
 import asyncio
+import logging
+import os
+import threading
 import time
 import uuid
-import logging
-import threading
-from typing import List, Optional, Union, AsyncIterator
-from dataclasses import dataclass
+from typing import AsyncIterator, List, Optional, Union
 
-from transformers import AutoTokenizer
-from tokenizers import decoders as _dec
+import janus
 
-import infinicore
-
+from infinilm.config.engine_config import EngineConfig
+from infinilm.config.kv_transfer import KVTransferConfig
+from infinilm.infer_engine import model_uses_mamba_cache, read_hf_config
+from infinilm.kv_connector import KVConnectorFactory, KVConnectorRole
+from infinilm.llm.model_runner.model_runner import ModelRunner
 from infinilm.llm.request import (
+    FinishReason,
     InferenceRequest,
     RequestOutput,
     TokenOutput,
-    FinishReason,
 )
 from infinilm.llm.sampling_params import SamplingParams
 from infinilm.llm.scheduler import Scheduler
 from infinilm.llm.static_scheduler import StaticScheduler
-
-from infinilm.distributed import DistConfig
-from infinilm.infer_engine import InferEngine
-from infinilm.cache.cache import PagedKVCacheConfig, StaticKVCacheConfig
-from infinilm.modeling_utils import load_model_state_dict_by_file
+from infinilm.multimodal.multimodal import resolve_multimodal_inputs
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class EngineConfig:
-    """Configuration for LLM Engine.
-
-    Attributes:
-        model_path: Path to the model directory.
-        device: Device type string ('cpu', 'cuda', 'mlu', etc.).
-        dtype: Data type string ('float16', 'bfloat16', 'float32').
-        tensor_parallel_size: Number of devices for tensor parallelism.
-        cache_type: Cache type ('paged' or 'static').
-        max_batch_size: Maximum batch size for inference (only for paged cache).
-        max_tokens: Default maximum tokens to generate.
-        num_blocks: Number of KV cache blocks (only for paged cache).
-        block_size: Size of each KV cache block (only for paged cache).
-        max_cache_len: Maximum sequence length (only for static cache).
-        temperature: Default sampling temperature.
-        top_p: Default top-p sampling parameter.
-        top_k: Default top-k sampling parameter.
-        enable_graph: Whether to enable graph compiling.
-        attn_backend: Attention backend to use ('default', 'flash-attn').
-    """
-
-    model_path: str
-    device: str = "cuda"
-    dtype: str = "float16"
-    tensor_parallel_size: int = 1
-    cache_type: str = "paged"  # "paged" or "static"
-    max_batch_size: int = 16
-    max_tokens: int = 4096
-    num_blocks: int = 512
-    block_size: int = 256
-    max_cache_len: int = 4096
-    temperature: float = 1.0
-    top_p: float = 0.8
-    top_k: int = 1
-    enable_graph: bool = False
-    attn_backend: str = "default"
 
 
 class LLMEngine:
@@ -81,248 +40,238 @@ class LLMEngine:
 
     def __init__(self, config: EngineConfig):
         self.config = config
+        hf_config = read_hf_config(config.model_path)
+        has_mamba_cache = model_uses_mamba_cache(hf_config)
+        if has_mamba_cache and config.enable_prefix_caching:
+            model_type = hf_config["model_type"]
+            raise RuntimeError(
+                "Prefix caching is not supported for Mamba-cache model "
+                f"{model_type!r} yet. Restart with "
+                "--disable-prefix-caching."
+            )
 
-        # Initialize device and dtype
-        self._init_device()
+        if config.pipeline_parallel_size > 1 and config.pipeline_parallel_stage != 0:
+            raise ValueError(
+                "LLMEngine can only run pipeline stage 0; launch non-host nodes "
+                "with inference_server.py --node-rank=N"
+            )
 
-        # Initialize model engine
-        self.model_engine = InferEngine(
-            model_path=config.model_path,
-            device=self.device,
-            distributed_config=DistConfig(config.tensor_parallel_size),
-            enable_graph_compiling=config.enable_graph,
-            attention_backend=config.attn_backend,
-        )
+        self.model_runner = ModelRunner(config)
 
-        # Load model weights
-        load_model_state_dict_by_file(
-            self.model_engine, config.model_path, dtype=self.model_engine.dtype
-        )
+        self.device = self.model_runner.device
+        self.dtype = self.model_runner.dtype
 
-        # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.model_path, trust_remote_code=True
-        )
-        self._fix_tokenizer_decoder()
+        # Initialize processor
+        self.processor = self.model_runner.processor
+        self.tokenizer = self.processor.get_tokenizer()
 
         # Initialize KV cache based on cache type
         if config.cache_type == "static":
-            cache_config = StaticKVCacheConfig(
-                max_batch_size=1, max_cache_len=config.max_cache_len
+            self.scheduler = StaticScheduler(
+                max_cache_len=config.max_cache_len,
+                enable_prefix_caching=config.enable_prefix_caching,
             )
-            self.scheduler = StaticScheduler(max_cache_len=config.max_cache_len)
             logger.info(
                 f"Using Static KV Cache with max_cache_len={config.max_cache_len}"
             )
         elif config.cache_type == "paged":
-            cache_config = PagedKVCacheConfig(
-                num_blocks=config.num_blocks, block_size=config.block_size
+            connector = None
+            if config.kv_transfer_config and config.kv_transfer_config.kv_connector:
+                connector = KVConnectorFactory.create_connector(
+                    connector_name=config.kv_transfer_config.kv_connector,
+                    role=KVConnectorRole.SCHEDULER,
+                    kv_transfer_config=config.kv_transfer_config,
+                )
+                logger.info(
+                    f"KV Connector created: {config.kv_transfer_config.kv_connector} "
+                    f"(role={config.kv_transfer_config.kv_role})"
+                )
+            model_engine = self.model_runner.model_engine
+            llm_config = model_engine.hf_config
+            if "text_config" in llm_config:
+                llm_config = llm_config["text_config"]
+
+            max_position_embeddings = llm_config.get(
+                "max_position_embeddings", config.max_cache_len
             )
+            num_mamba_cache_blocks = max(2, config.num_blocks // 4)
+
+            max_num_batched_tokens = int(
+                os.getenv("INFINILM_MAX_NUM_BATCHED_TOKENS", max_position_embeddings)
+            )
+            assert 1024 <= max_num_batched_tokens <= max_position_embeddings
+
             self.scheduler = Scheduler(
                 max_batch_size=config.max_batch_size,
                 num_blocks=config.num_blocks,
                 block_size=config.block_size,
+                max_num_batched_tokens=max_num_batched_tokens,
+                connector=connector,
+                has_mamba_cache=has_mamba_cache,
+                num_mamba_cache_blocks=num_mamba_cache_blocks,
+                enable_prefix_caching=config.enable_prefix_caching,
             )
             logger.info(f"Using Paged KV Cache with num_blocks={config.num_blocks}")
+            if has_mamba_cache:
+                logger.info(
+                    "Using Mamba cache with num_blocks=%s, zero_state_index=0",
+                    num_mamba_cache_blocks,
+                )
         else:
             raise ValueError(f"Unsupported cache_type: {config.cache_type}")
 
-        self.model_engine.reset_cache(cache_config)
         self.cache_type = config.cache_type
 
         # Get EOS token IDs from model config
-        self.eos_token_ids = self.model_engine.eos_token_id or []
+        self.eos_token_ids = self.model_runner.eos_token_id or []
         if isinstance(self.eos_token_ids, int):
             self.eos_token_ids = [self.eos_token_ids]
 
         logger.info(
             f"LLMEngine initialized with model at {config.model_path} "
-            f"on device {config.device}"
+            f"on device {config.device}, "
             f"enable_graph={config.enable_graph}"
         )
-
-    def _init_device(self):
-        """Initialize infinicore device and dtype."""
-        supported_devices = ["cpu", "cuda", "mlu", "musa"]
-        device_str = self.config.device
-        if device_str not in supported_devices:
-            raise ValueError(
-                f"Unsupported device: '{device_str}'. "
-                f"Supported devices: {supported_devices}"
-            )
-        self.device = infinicore.device(device_str, 0)
-
-        dtype_map = {
-            "float32": infinicore.float32,
-            "float16": infinicore.float16,
-            "bfloat16": infinicore.bfloat16,
-        }
-
-        if self.config.dtype not in dtype_map:
-            raise ValueError(
-                f"Unsupported dtype: '{self.config.dtype}'. "
-                f"Supported dtypes: {list(dtype_map.keys())}"
-            )
-
-        self.dtype = dtype_map[self.config.dtype]
-
-    def _fix_tokenizer_decoder(self):
-        """Fix tokenizer decoder for llama models."""
-        if "llama" in self.model_engine.model_type.lower():
-            backend = getattr(self.tokenizer, "backend_tokenizer", None)
-            target = getattr(backend, "_tokenizer", backend)
-            norm = getattr(target, "normalizer", None)
-            dec = getattr(target, "decoder", None)
-            sn = repr(norm)[:800] if norm is not None else ""
-            sd = repr(dec)[:800] if dec is not None else ""
-            has_prepend = "Prepend" in sn
-            has_strip = "Strip" in sd
-            if has_prepend and has_strip:
-                target.decoder = _dec.Sequence(
-                    [
-                        _dec.Replace("▁", " "),
-                        _dec.ByteFallback(),
-                        _dec.Fuse(),
-                    ]
-                )
 
     def add_request(self, request: InferenceRequest):
         """Add a request to the scheduler."""
         self.scheduler.add_request(request)
 
-    def step(self) -> tuple[list[InferenceRequest], list[tuple]]:
+    def close(self):
+        self.model_runner.close()
+
+    def step(self) -> tuple[bool, list[tuple]]:
         """Run one inference step.
 
         Returns:
             A tuple of:
-            - scheduled_requests: Requests that were scheduled and processed in this step.
+            - did_work
             - pending: Pending streaming outputs as (async_queue, TokenOutput) pairs.
         """
-        # Schedule requests
+        # Schedule the next unit of work, which may be model execution,
+        # connector control metadata, or both.
         scheduler_output = self.scheduler.schedule()
-        if scheduler_output is None or not scheduler_output.scheduled_requests:
-            return [], []
+        if scheduler_output is None:
+            return False, []
 
-        # Build model inputs
-        model_input_dict = scheduler_output.build_model_inputs(
-            self.config.temperature, self.config.top_p, self.config.top_k
-        )
-        model_input = self._prepare_model_input(model_input_dict)
-
-        # Run inference
-        sampled_tokens = self.model_engine.forward(**model_input)
-        sampled_tokens_list = sampled_tokens.to_numpy().tolist()
-
-        # Update request status
+        runner_output = self.model_runner.execute_model(scheduler_output)
+        sampled_token_ids = runner_output.sampled_token_ids
+        self.scheduler.update_from_output(runner_output)
         pending = self._update_requests(
-            scheduler_output.is_prefill,
             scheduler_output.scheduled_requests,
-            sampled_tokens_list,
+            sampled_token_ids,
         )
 
-        return scheduler_output.scheduled_requests, pending
+        # Return False (no immediate work) only when no requests were scheduled
+        # and no KV transfers completed in this step.
+        if not scheduler_output.scheduled_requests:
+            if not runner_output.kv_connector_output or (
+                not getattr(runner_output.kv_connector_output, "finished_sending", None)
+                and not getattr(
+                    runner_output.kv_connector_output, "finished_recving", None
+                )
+            ):
+                return False, pending
 
-    def _prepare_model_input(self, model_input_dict: dict) -> dict:
-        """Convert model input dict to infinicore tensors."""
-        model_input = {}
-        for key, value in model_input_dict.items():
-            if value is None:
-                # Skip None values (block_tables/slot_mapping for static cache)
-                model_input[key] = None
-            elif key in ["input_ids", "position_ids", "slot_mapping"]:
-                model_input[key] = infinicore.from_list(value, dtype=infinicore.int64)
-            elif key in [
-                "past_kv_lengths",
-                "total_kv_lengths",
-                "input_offsets",
-                "cu_seqlens",
-                "block_tables",
-            ]:
-                model_input[key] = infinicore.from_list(value, dtype=infinicore.int32)
-            else:
-                # temperature, top_k, top_p, etc.
-                model_input[key] = value
-        return model_input
+        return True, pending
 
     def _update_requests(
         self,
-        is_prefill: bool,
         requests: List[InferenceRequest],
-        sampled_tokens: List[int],
+        sampled_token_ids: list[int | list[int]],
     ) -> List[tuple]:
-        """Update request status after inference step."""
-        if is_prefill:
-            match self.cache_type:
-                case "paged":
-                    self.scheduler.cache_manager.reset_req_blocks()
-                case "static":
-                    self.scheduler.update_cache()
-                case _:
-                    raise ValueError(f"Unsupported cache_type: {self.cache_type}")
+        """Apply sampled tokens and publish their target-model KV boundary."""
+        if len(requests) != len(sampled_token_ids):
+            raise RuntimeError(
+                "model output count does not match the scheduled request count: "
+                f"requests={len(requests)}, outputs={len(sampled_token_ids)}"
+            )
         pending = []
-        for req, token_id in zip(requests, sampled_tokens):
+        for req, token_ids in zip(requests, sampled_token_ids):
+            # The model successfully consumed the request's current logical tokens.
+            # Commit this boundary before observing a concurrent client abort.
+            pre_output_computed_tokens = req.get_total_length()
+            self.scheduler.commit_computed_tokens(req, pre_output_computed_tokens)
+
             if req.is_aborted():
                 logger.info(
                     f"Request {req.request_id} aborted by client, skipping update"
                 )
+                # close() may have set _aborted=True without setting a terminal status
+                # (status still RUNNING).
+                if not req.is_finished():
+                    req.mark_canceled()
                 continue
 
-            if req.is_prefill:
-                req.is_prefill = False
-
-            req.generated_token_ids.append(token_id)
-            pending_tokens = req.generated_token_ids[req._pending_token_offset :]
-            delta = self.tokenizer.decode(pending_tokens)
-            holds_back = bool(delta) and delta.endswith("\ufffd")
-
-            last_committed_text = req.generated_text
-
-            if not holds_back:
-                req.generated_text = last_committed_text + delta
-                req._pending_token_offset = len(req.generated_token_ids)
-
-            is_finished = self._check_request_finished(req, token_id)
-
-            # vLLM-style replacement character handling is primarily relevant for streaming.
-            # For offline generation (no output queue), keep the fast incremental path.
-            if req._output_queue is None:
-                if is_finished:
-                    req.mark_finished(req.finish_reason)
-
+            if isinstance(token_ids, list):
+                num_computed_output_tokens = max(len(token_ids) - 1, 0)
             else:
-                if holds_back and not is_finished:
-                    token_text = ""
-                else:
-                    if is_finished and req.finish_reason in (
-                        FinishReason.EOS_TOKEN,
-                        FinishReason.LENGTH,
-                        FinishReason.STOP_STRING,
-                    ):
-                        token_text = ""
-                    else:
-                        token_text = req.generated_text[
-                            req._stream_last_yielded_length :
-                        ]
-                        if token_text:
-                            req._stream_last_yielded_length = len(req.generated_text)
+                num_computed_output_tokens = 0
+                token_ids = [token_ids]
 
+            num_appended_tokens = 0
+            for token_id in token_ids:
+                if req.is_finished():
+                    break
+                req.append_generated_token_id(token_id)
+                num_appended_tokens += 1
+                pending_tokens = req.generated_token_ids[req._token_decode_offset :]
+                delta = self.tokenizer.decode(pending_tokens)
+                holds_back = bool(delta) and delta.endswith("\ufffd")
+
+                last_committed_text = req.generated_text
+
+                if not holds_back:
+                    req.generated_text = last_committed_text + delta
+                    req._token_decode_offset = len(req.generated_token_ids)
+
+                is_finished = self._check_request_finished(req, token_id)
+
+                # vLLM-style replacement character handling is primarily relevant for streaming.
+                # For offline generation (no output queue), keep the fast incremental path.
+                if req._output_queue is None:
                     if is_finished:
                         req.mark_finished(req.finish_reason)
 
-                output = TokenOutput(
-                    request_id=req.request_id,
-                    token_id=token_id,
-                    token_text=token_text,
-                    finished=is_finished,
-                    finish_reason=req.finish_reason if is_finished else None,
-                    generated_text=req.generated_text,
-                )
-                if req.is_aborted():
-                    logger.info(
-                        f"Request {req.request_id} aborted before putting token"
+                else:
+                    if holds_back and not is_finished:
+                        token_text = ""
+                    else:
+                        if is_finished and req.finish_reason in (
+                            FinishReason.EOS_TOKEN,
+                            FinishReason.LENGTH,
+                            FinishReason.STOP_STRING,
+                        ):
+                            token_text = ""
+                        else:
+                            token_text = req.generated_text[req._text_output_offset :]
+                            if token_text:
+                                req._text_output_offset = len(req.generated_text)
+
+                        if is_finished:
+                            req.mark_finished(req.finish_reason)
+
+                    output = TokenOutput(
+                        request_id=req.request_id,
+                        token_id=token_id,
+                        token_text=token_text,
+                        finished=is_finished,
+                        finish_reason=req.finish_reason if is_finished else None,
+                        generated_text=req.generated_text,
                     )
-                    continue
-                pending.append((req.output_queue.async_q, output))
+                    if req.is_aborted():
+                        logger.info(
+                            f"Request {req.request_id} aborted before putting token"
+                        )
+                        continue
+                    pending.append((req.output_queue.async_q, output))
+
+            post_output_computed_tokens = pre_output_computed_tokens + min(
+                num_appended_tokens,
+                num_computed_output_tokens,
+            )
+            if post_output_computed_tokens > pre_output_computed_tokens:
+                self.scheduler.commit_computed_tokens(req, post_output_computed_tokens)
 
         self.scheduler.complete_requests(requests)
         return pending
@@ -361,6 +310,12 @@ class LLMEngine:
         """Detokenize token IDs to text."""
         return self.tokenizer.decode(token_ids)
 
+    def process(self, prompt, images, videos, audios, **kwargs) -> dict:
+        """Process the input prompt and media into final model inputs."""
+        return self.processor(
+            prompt, images=images, videos=videos, audios=audios, **kwargs
+        )
+
     def apply_chat_template(
         self,
         messages: List[dict],
@@ -369,7 +324,7 @@ class LLMEngine:
     ) -> str:
         """Apply chat template to messages."""
         chat_template_kwargs = chat_template_kwargs or {}
-        return self.tokenizer.apply_chat_template(
+        return self.processor.apply_chat_template(
             conversation=messages,
             add_generation_prompt=add_generation_prompt,
             tokenize=False,
@@ -383,9 +338,17 @@ class LLM:
     def __init__(
         self,
         model_path: str,
+        draft_model_path: Optional[str] = None,
+        num_draft_tokens: int = 4,
         device: str = "cuda",
         dtype: str = "float16",
         tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        pipeline_parallel_stage: int = 0,
+        master_addr: str = "127.0.0.1",
+        master_port: int = 29500,
+        moe_ep_backend: str = "disabled",
+        moe_ep_size: int = 1,
         cache_type: str = "paged",
         max_batch_size: int = 16,
         max_tokens: int = 4096,
@@ -397,6 +360,12 @@ class LLM:
         top_k: int = 1,
         enable_graph: bool = False,
         attn_backend: str = "default",
+        use_mla: bool = False,
+        pre_transpose: bool = False,
+        weight_load_mode: str = "async",
+        skip_load: bool = False,
+        use_legacy_moe: bool = False,
+        enable_prefix_caching: bool = True,
     ):
         """Initialize LLM.
 
@@ -416,12 +385,22 @@ class LLM:
             top_k: Default top-k sampling parameter.
             enable_graph: Whether to enable graph compiling.
             attn_backend: Attention backend to use ('default', 'flash-attn').
+            use_mla: Whether to use DeepSeek V2 MLA attention when supported.
+            weight_load_mode: Weight loading mode across tensor-parallel workers.
         """
         config = EngineConfig(
             model_path=model_path,
+            draft_model_path=draft_model_path,
+            num_draft_tokens=num_draft_tokens,
             device=device,
             dtype=dtype,
             tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            pipeline_parallel_stage=pipeline_parallel_stage,
+            master_addr=master_addr,
+            master_port=master_port,
+            moe_ep_backend=moe_ep_backend,
+            moe_ep_size=moe_ep_size,
             cache_type=cache_type,
             max_batch_size=max_batch_size,
             max_tokens=max_tokens,
@@ -433,13 +412,23 @@ class LLM:
             top_k=top_k,
             enable_graph=enable_graph,
             attn_backend=attn_backend,
+            use_mla=use_mla,
+            pre_transpose=pre_transpose,
+            weight_load_mode=weight_load_mode,
+            skip_load=skip_load,
+            use_legacy_moe=use_legacy_moe,
+            enable_prefix_caching=enable_prefix_caching,
         )
         self.engine = LLMEngine(config)
         self.config = config
 
+    def close(self):
+        self.engine.close()
+
     def generate(
         self,
-        prompts: Union[str, List[str]],
+        prompts: Union[str, List[str]] = None,
+        messages: Union[List[dict], List[List[dict]]] = None,
         sampling_params: Optional[SamplingParams] = None,
         use_tqdm: bool = True,
     ) -> List[RequestOutput]:
@@ -455,6 +444,14 @@ class LLM:
         """
         if isinstance(prompts, str):
             prompts = [prompts]
+        if isinstance(messages, list) and isinstance(messages[0], dict):
+            messages = [messages]
+
+        contents = prompts
+        apply_chat_template = False
+        if messages:
+            contents = messages
+            apply_chat_template = True
 
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=self.config.max_tokens)
@@ -463,13 +460,47 @@ class LLM:
             sampling_params.max_tokens = self.config.max_tokens
 
         requests = []
-        for prompt in prompts:
+        for content in contents:
             request_id = f"cmpl-{uuid.uuid4().hex}"
-            token_ids = self.engine.tokenize(prompt)
+            processed_inputs = None
+            mm_index_mappings = None
+            has_multimodal_inputs = False
+            if apply_chat_template:
+                prompt = self.engine.apply_chat_template(
+                    content, add_generation_prompt=True
+                )
+
+                mm_inputs = resolve_multimodal_inputs(content)
+
+                has_multimodal_inputs = any(
+                    mm_inputs[key] for key in ("images", "videos", "audios")
+                )
+                processed_inputs = self.engine.process(
+                    prompt,
+                    mm_inputs["images"],
+                    mm_inputs["videos"],
+                    mm_inputs["audios"],
+                    return_tensors="pt",
+                )
+
+                prompt_token_ids = processed_inputs.get("input_ids").flatten().tolist()
+                mm_index_mappings = self.engine.processor.get_mm_token_index_list(
+                    prompt_token_ids,
+                    image_ids=mm_inputs["image_urls"],
+                    video_ids=mm_inputs["video_urls"],
+                    audio_ids=mm_inputs["audio_urls"],
+                )
+            else:
+                prompt = content
+                prompt_token_ids = self.engine.tokenize(prompt)
+
             req = InferenceRequest(
                 request_id=request_id,
                 prompt=prompt,
-                prompt_token_ids=token_ids,
+                prompt_token_ids=prompt_token_ids,
+                processed_inputs=processed_inputs,
+                mm_token_index_mappings=mm_index_mappings,
+                has_multimodal_inputs=has_multimodal_inputs,
                 sampling_params=sampling_params,
                 eos_token_ids=self.engine.eos_token_ids,
             )
@@ -523,14 +554,9 @@ class LLM:
         if messages and isinstance(messages[0], dict):
             messages = [messages]
 
-        prompts = []
-        for conversation in messages:
-            prompt = self.engine.apply_chat_template(
-                conversation, add_generation_prompt=True
-            )
-            prompts.append(prompt)
-
-        return self.generate(prompts, sampling_params, use_tqdm)
+        return self.generate(
+            messages=messages, sampling_params=sampling_params, use_tqdm=use_tqdm
+        )
 
 
 class AsyncLLMEngine:
@@ -539,9 +565,17 @@ class AsyncLLMEngine:
     def __init__(
         self,
         model_path: str,
+        draft_model_path: Optional[str] = None,
+        num_draft_tokens: int = 4,
         device: str = "cuda",
         dtype: str = "float16",
         tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        pipeline_parallel_stage: int = 0,
+        master_addr: str = "127.0.0.1",
+        master_port: int = 29500,
+        moe_ep_backend: str = "disabled",
+        moe_ep_size: int = 1,
         cache_type: str = "paged",
         max_batch_size: int = 16,
         max_tokens: int = 512,
@@ -553,6 +587,13 @@ class AsyncLLMEngine:
         top_k: int = 1,
         enable_graph: bool = False,
         attn_backend: str = "default",
+        kv_transfer_config: Optional[KVTransferConfig] = None,
+        use_mla: bool = False,
+        pre_transpose: bool = False,
+        skip_load: bool = False,
+        weight_load_mode: str = "async",
+        use_legacy_moe: bool = False,
+        enable_prefix_caching: bool = True,
     ):
         """Initialize AsyncLLMEngine.
 
@@ -572,12 +613,26 @@ class AsyncLLMEngine:
             top_k: Default top-k sampling parameter.
             enable_graph: Whether to enable graph compiling.
             attn_backend: Attention backend to use ('default', 'flash-attn').
+            kv_connector: KV connector type ('MooncakeConnector').
+            kv_role: Role in KV connector ('kv_producer' or 'kv_consumer').
+            kv_connector_extra_config: Extra config dict for KV connector.
+            use_mla: Whether to use DeepSeek V2 MLA attention when supported.
+            skip_load: Whether to skip loading model weights.
+            weight_load_mode: Weight loading mode across tensor-parallel workers.
         """
         config = EngineConfig(
             model_path=model_path,
+            draft_model_path=draft_model_path,
+            num_draft_tokens=num_draft_tokens,
             device=device,
             dtype=dtype,
             tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            pipeline_parallel_stage=pipeline_parallel_stage,
+            master_addr=master_addr,
+            master_port=master_port,
+            moe_ep_backend=moe_ep_backend,
+            moe_ep_size=moe_ep_size,
             cache_type=cache_type,
             max_batch_size=max_batch_size,
             max_tokens=max_tokens,
@@ -589,6 +644,13 @@ class AsyncLLMEngine:
             top_k=top_k,
             enable_graph=enable_graph,
             attn_backend=attn_backend,
+            kv_transfer_config=kv_transfer_config,
+            use_mla=use_mla,
+            pre_transpose=pre_transpose,
+            skip_load=skip_load,
+            weight_load_mode=weight_load_mode,
+            use_legacy_moe=use_legacy_moe,
+            enable_prefix_caching=enable_prefix_caching,
         )
         self.engine = LLMEngine(config)
         self.config = config
@@ -597,6 +659,7 @@ class AsyncLLMEngine:
         self._step_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._healthy = True
+        self._abort_queue: Optional[janus.Queue] = None
 
     def is_healthy(self) -> bool:
         return bool(self._healthy)
@@ -608,6 +671,7 @@ class AsyncLLMEngine:
             return
 
         self._loop = asyncio.get_running_loop()
+        self._abort_queue = janus.Queue()
         self._running = True
         self._step_thread = threading.Thread(
             target=self._step_loop, daemon=True, name="AsyncLLMEngineStepThread"
@@ -624,15 +688,72 @@ class AsyncLLMEngine:
         self._running = False
         if self._step_thread:
             self._step_thread.join(timeout=5)
+        self.engine.close()
         logger.info("AsyncLLMEngine stopped")
+
+    def add_aborted_req(
+        self,
+        req: InferenceRequest,
+        reason: FinishReason = FinishReason.CANCELED,
+    ):
+        """Submit an abort request from async side to the step thread.
+
+        The step thread processes this in _drain_abort_queue() before each schedule().
+        """
+        if self._abort_queue is not None:
+            self._abort_queue.sync_q.put((req, reason))
+
+    def _drain_abort_queue(self):
+        """Process all pending abort requests before each schedule() call.
+
+        Runs in the step thread (sync context). Guarantees mark_*() is called
+        before schedule() so is_finished() checks in waiting/running queue loops
+        work correctly. Puts a final TokenOutput into the output queue to unblock
+        stream_request when _stream_chat is still alive after abort.
+        """
+        if self._abort_queue is None:
+            return
+        while True:
+            try:
+                req, reason = self._abort_queue.sync_q.get_nowait()
+            except Exception:
+                break
+
+            if req.is_finished():
+                continue
+
+            if reason == FinishReason.CANCELED:
+                req.mark_canceled()
+            elif reason == FinishReason.TIMEOUT:
+                req.mark_timeout()
+            else:
+                req.mark_failed(reason)
+
+            # Put a final token to unblock stream_request.
+            # If Starlette already cancelled _stream_chat, aclose() may have closed
+            # the queue; put_nowait will raise and we silently ignore it.
+            if req._output_queue is not None:
+                final = TokenOutput(
+                    request_id=req.request_id,
+                    token_id=-1,
+                    token_text="",
+                    finished=True,
+                    finish_reason=req.finish_reason,
+                    generated_text=req.generated_text,
+                )
+                try:
+                    req.output_queue.sync_q.put_nowait(final)
+                except Exception:
+                    pass
 
     def _step_loop(self):
         """Background loop that runs inference steps."""
         while self._running:
             try:
-                requests, pending = self.engine.step()
-                if not requests:
-                    time.sleep(0.01)
+                self._drain_abort_queue()
+                did_work, pending = self.engine.step()
+                if not did_work:
+                    time.sleep(0.003)
                 elif pending:
                     self._loop.call_soon_threadsafe(self._batch_put, pending)
             except Exception as e:
@@ -654,23 +775,45 @@ class AsyncLLMEngine:
 
     def add_request(
         self,
+        messages: Optional[List[dict]],
+        apply_chat_template: bool = True,
+        add_generation_prompt: bool = True,
         prompt: Optional[str] = None,
         prompt_token_ids: Optional[List[int]] = None,
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
         # For server use
         request_data: Optional[dict] = None,
-        http_request: Optional[any] = None,
+        chat_template_kwargs: Optional[dict] = None,
     ) -> InferenceRequest:
         """Add a request to the engine.
 
         Args:
-            prompt: Text prompt for generation.
-            prompt_token_ids: Pre-tokenized prompt.
+            messages: List of message dicts (chat conversation). Following this format:
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                            {
+                                "type": "text",
+                                "text": "xxxxxxxxx"
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                "url": "xxx.jpg"
+                                }
+                            },
+                            ]
+                        },
+                    ]
+            apply_chat_template: Whether to apply the chat template.
+            add_generation_prompt: Whether to add a generation prompt.
+            prompt: Text prompt for generation. If provided, it will be used directly after encoded by tokenizer, ignoring messages.
+            prompt_token_ids: Pre-tokenized prompt. If provided, it will be used directly as input.
             sampling_params: Sampling parameters.
             request_id: Optional request ID.
             request_data: Optional request data dict (for server use).
-            http_request: Optional HTTP request object (for server use).
 
         Returns:
             The created InferenceRequest object.
@@ -678,8 +821,49 @@ class AsyncLLMEngine:
         if request_id is None:
             request_id = f"cmpl-{uuid.uuid4().hex}"
 
-        if prompt_token_ids is None and prompt is not None:
+        mm_index_mappings = None
+        processed_inputs = None
+        has_multimodal_inputs = False
+
+        if prompt_token_ids is not None:
+            prompt = self.engine.detokenize(prompt_token_ids)
+        elif prompt is not None:
             prompt_token_ids = self.engine.tokenize(prompt)
+        else:
+            assert messages is not None, (
+                "Either messages or prompt/prompt_token_ids must be provided"
+            )
+
+            assert apply_chat_template, (
+                "apply_chat_template needs to be true for multi-role conversation"
+            )
+
+            prompt = self.engine.apply_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+
+            mm_inputs = resolve_multimodal_inputs(messages)
+
+            has_multimodal_inputs = any(
+                mm_inputs[key] for key in ("images", "videos", "audios")
+            )
+            processed_inputs = self.engine.process(
+                prompt,
+                mm_inputs["images"],
+                mm_inputs["videos"],
+                mm_inputs["audios"],
+                return_tensors="pt",
+            )
+
+            prompt_token_ids = processed_inputs.get("input_ids").flatten().tolist()
+            mm_index_mappings = self.engine.processor.get_mm_token_index_list(
+                prompt_token_ids,
+                image_ids=mm_inputs["image_urls"],
+                video_ids=mm_inputs["video_urls"],
+                audio_ids=mm_inputs["audio_urls"],
+            )
 
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=self.config.max_tokens)
@@ -691,11 +875,17 @@ class AsyncLLMEngine:
             request_id=request_id,
             prompt=prompt,
             prompt_token_ids=prompt_token_ids,
+            processed_inputs=processed_inputs,
+            mm_token_index_mappings=mm_index_mappings,
+            has_multimodal_inputs=has_multimodal_inputs,
             sampling_params=sampling_params,
             eos_token_ids=self.engine.eos_token_ids,
             request_data=request_data,
-            http_request=http_request,
         )
+
+        if request_data and "kv_transfer_params" in request_data:
+            kv_params = request_data["kv_transfer_params"]
+            request.kv_transfer_params = kv_params
 
         # Initialize output queue for streaming
         _ = request.output_queue
@@ -709,9 +899,9 @@ class AsyncLLMEngine:
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
         request_data: Optional[dict] = None,
-        http_request: Optional[any] = None,
         add_generation_prompt: bool = True,
         chat_template_kwargs: Optional[dict] = None,
+        **kwargs,
     ) -> InferenceRequest:
         """Add a chat request to the engine.
 
@@ -720,22 +910,19 @@ class AsyncLLMEngine:
             sampling_params: Sampling parameters.
             request_id: Optional request ID.
             request_data: Optional request data dict.
-            http_request: Optional HTTP request object.
 
         Returns:
             The created InferenceRequest object.
         """
-        prompt = self.engine.apply_chat_template(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            chat_template_kwargs=chat_template_kwargs,
-        )
+
         return self.add_request(
-            prompt=prompt,
+            messages=messages,
+            apply_chat_template=True,
+            add_generation_prompt=add_generation_prompt,
             sampling_params=sampling_params,
             request_id=request_id,
             request_data=request_data,
-            http_request=http_request,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
     async def stream_request(
@@ -756,53 +943,54 @@ class AsyncLLMEngine:
         import asyncio
 
         start = time.time()
-        while True:
-            try:
-                if request_timeout and time.time() - start > float(request_timeout):
-                    request.mark_timeout()
-                    yield TokenOutput(
-                        request_id=request.request_id,
-                        token_id=-1,
-                        token_text="",
-                        finished=True,
-                        finish_reason=FinishReason.TIMEOUT,
-                        generated_text=request.generated_text,
+        try:
+            while True:
+                try:
+                    if request_timeout and time.time() - start > float(request_timeout):
+                        logger.warning(
+                            f"Request {request.request_id} exceeded request timeout of {request_timeout} seconds"
+                        )
+                        self.add_aborted_req(request, FinishReason.TIMEOUT)
+
+                    token_output = await asyncio.wait_for(
+                        request.output_queue.async_q.get(), timeout=timeout
+                    )
+
+                    request.output_queue.async_q.task_done()
+
+                    yield token_output
+
+                    if token_output.finished:
+                        break
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"Timeout while waiting for token from request {request.request_id}"
+                    )
+                    if request.is_aborted():
+                        while not request.output_queue.async_q.empty():
+                            try:
+                                token_output = request.output_queue.async_q.get_nowait()
+                                request.output_queue.async_q.task_done()
+                                yield token_output
+                            except asyncio.QueueEmpty:
+                                break
+
+                        yield TokenOutput(
+                            request_id=request.request_id,
+                            token_id=-1,
+                            token_text="",
+                            finished=True,
+                            finish_reason=request.finish_reason,
+                            generated_text=request.generated_text,
+                        )
+                        break
+                    continue
+                except Exception as e:
+                    logger.error(
+                        f"Error while streaming request {request.request_id}: {e}"
                     )
                     break
-
-                token_output = await asyncio.wait_for(
-                    request.output_queue.async_q.get(), timeout=timeout
-                )
-
-                request.output_queue.async_q.task_done()
-
-                yield token_output
-
-                if token_output.finished:
-                    break
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"Timeout while waiting for token from request {request.request_id}"
-                )
-                if request.is_aborted():
-                    while not request.output_queue.async_q.empty():
-                        try:
-                            token_output = request.output_queue.async_q.get_nowait()
-                            request.output_queue.async_q.task_done()
-                            yield token_output
-                        except asyncio.QueueEmpty:
-                            break
-
-                    yield TokenOutput(
-                        request_id=request.request_id,
-                        token_id=-1,
-                        token_text="",
-                        finished=True,
-                        finish_reason=request.finish_reason,
-                        generated_text=request.generated_text,
-                    )
-                    break
-                continue
-            except Exception as e:
-                logger.error(f"Error while streaming request {request.request_id}: {e}")
-                break
+        finally:
+            # Unified cleanup point: runs whether the loop exits normally,
+            # via exception, or via aclose() (GeneratorExit from Starlette).
+            await request.close()

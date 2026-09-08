@@ -1,31 +1,54 @@
 #include "qwen3_moe_sparse_moe_block.hpp"
-#include <spdlog/spdlog.h>
+
+#include <string>
 
 namespace infinilm::models::qwen3_moe {
 
 Qwen3MoeSparseMoeBlock::Qwen3MoeSparseMoeBlock(std::shared_ptr<infinilm::config::ModelConfig> model_config,
-                                               const infinicore::Device &device) {
-    const auto &dtype{model_config->get_dtype()};
-    size_t hidden_size = model_config->get<size_t>("hidden_size");
-    size_t moe_intermediate_size = model_config->get<size_t>("moe_intermediate_size");
-    size_t shared_expert_intermediate_size = model_config->get_or<size_t>("shared_expert_intermediate_size", 0);
-    size_t num_experts = model_config->get<size_t>("num_experts");
+                                               const infinicore::Device &device)
+    : Qwen3MoeSparseMoeBlock(model_config, 0, device) {
+}
 
-    INFINICORE_NN_MODULE_INIT(gate, hidden_size, num_experts, false, dtype, device);
-    experts_.reserve(num_experts);
-    for (size_t i = 0; i < num_experts; ++i) {
-        experts_.push_back(this->register_module<Qwen3MoeMLP>("experts." + std::to_string(i), model_config, device));
-    }
-
-    if (shared_expert_intermediate_size > 0) {
-        INFINICORE_NN_MODULE_INIT(shared_expert, model_config, device);
-        INFINICORE_NN_MODULE_INIT(shared_expert_gate, hidden_size, 1, false, dtype, device);
+Qwen3MoeSparseMoeBlock::Qwen3MoeSparseMoeBlock(std::shared_ptr<infinilm::config::ModelConfig> model_config,
+                                               size_t layer_idx,
+                                               const infinicore::Device &device)
+    : use_legacy_moe_(
+        model_config->get_or<std::string>("model_type", "") == "qwen3_moe" && model_config->get_or<bool>("use_legacy_moe", false)) {
+    if (use_legacy_moe_) {
+        legacy_gate_ = this->register_module<Qwen3MoeTopKRouter>("gate", model_config, device);
+        legacy_experts_ = this->register_module<Qwen3MoeExperts>("experts", model_config, device);
+    } else {
+        gate_ = this->register_module<infinilm::layers::moe::TopKRouter>("gate", model_config, device);
+        experts_ = this->register_module<infinilm::layers::moe::FusedMoeExperts>("experts", model_config, device);
+        fused_moe_ = this->register_module<infinilm::layers::moe::FusedMoE>("fused_moe", model_config, device, layer_idx);
     }
 }
 
 infinicore::Tensor Qwen3MoeSparseMoeBlock::forward(const infinicore::Tensor &hidden_states) const {
-    spdlog::error("Qwen3MoeSparseMoeBlock: forward not implemented");
-    return hidden_states;
+    ASSERT(hidden_states->ndim() == 3);
+
+    auto shape = hidden_states->shape();
+    auto hidden_states_reshaped = hidden_states->view({shape[0] * shape[1], shape[2]});
+
+    if (use_legacy_moe_) {
+        auto [routing_weights, selected_experts] = legacy_gate_->forward(hidden_states_reshaped);
+        auto final_hidden_states = legacy_experts_->forward(hidden_states_reshaped, selected_experts, routing_weights);
+        return final_hidden_states->view({shape[0], shape[1], shape[2]});
+    }
+
+    auto [routing_weights, selected_experts] = gate_->forward(hidden_states_reshaped);
+    infinilm::layers::moe::TopKOutput topk_output{
+        routing_weights,
+        selected_experts,
+        infinicore::Tensor(),
+    };
+
+    auto final_hidden_states = fused_moe_->forward(
+        hidden_states_reshaped,
+        topk_output,
+        experts_->moe_weights());
+
+    return final_hidden_states->view({shape[0], shape[1], shape[2]});
 }
 
 } // namespace infinilm::models::qwen3_moe

@@ -1,11 +1,26 @@
+import gc
+import glob
+import json
 import os
-from typing import Dict, Union
+import re
 import time
+from typing import Dict, List, Optional, Tuple, Union
+
+import infinicore
 import torch
 from safetensors import safe_open
-import glob
 from tqdm import tqdm
-import infinicore
+
+
+def _get_scale_emb(model_path: str) -> float:
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"config.json not found at {config_path}")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    if config.get("model_type") not in ("fm9g", "minicpm"):
+        return 1.0
+    return config.get("scale_emb", 1.0)
 
 
 def parse_dtype(dtype_str: str):
@@ -41,12 +56,28 @@ str_to_torch_dtype = {
 }
 
 
+def _is_internal_moe_packed_weight(key: str) -> bool:
+    # InfiniLM registers packed MoE parameters internally. HF checkpoints
+    # provide per-expert gate/up/down weights instead, so these packed tensors
+    # are expected missing keys during non-strict checkpoint loading.
+    return (
+        key.endswith(".mlp.experts.w13_weight")
+        or key.endswith(".mlp.experts.w2_weight")
+        or key.endswith(".mlp.experts.w1")
+        or key.endswith(".mlp.experts.w2")
+    )
+
+
 def check_parameters(model_keys: list, already_loaded_keys: list):
     model_keys = set(model_keys)
     already_loaded_keys = set(already_loaded_keys)
     intersection = model_keys & already_loaded_keys
 
-    missing_keys = model_keys - intersection
+    missing_keys = {
+        key
+        for key in model_keys - intersection
+        if not _is_internal_moe_packed_weight(key)
+    }
     unexpected_keys = already_loaded_keys - intersection
     error_msgs: list[str] = []
 
@@ -70,7 +101,10 @@ def check_parameters(model_keys: list, already_loaded_keys: list):
 
 
 def load_state_dict(
-    checkpoint_file: Union[str, os.PathLike], device="cpu", dtype=torch.bfloat16
+    checkpoint_file: Union[str, os.PathLike],
+    device="cpu",
+    dtype=torch.bfloat16,
+    preserve_fp32_suffixes: Tuple[str, ...] = (".e_score_correction_bias",),
 ) -> Dict[str, torch.Tensor]:
     """
     Reads a `safetensor` checkpoint file. We load the checkpoint on "cpu" by default.
@@ -93,7 +127,13 @@ def load_state_dict(
             )
 
         for k in f.keys():
-            state_dict[k] = f.get_tensor(k).to(device=device)
+            tensor = f.get_tensor(k)
+            preserve_fp32 = k.endswith(preserve_fp32_suffixes)
+            if tensor.is_floating_point() and not preserve_fp32:
+                tensor = tensor.to(device=device, dtype=dtype)
+            else:
+                tensor = tensor.to(device=device)
+            state_dict[k] = tensor
 
     return state_dict
 
@@ -122,8 +162,20 @@ def get_model_state_dict(
             load_state_dict(file_path, device=torch_device, dtype=torch_dtype)
         )
 
+    # Apply scale_emb for fm9g models (embed_tokens uses lookup, not GEMM)
+    scale_emb = _get_scale_emb(model_path)
+    embed_tokens_unscaled = None
+    if "model.embed_tokens.weight" in model_param:
+        embed_tokens_unscaled = model_param["model.embed_tokens.weight"]
+        if scale_emb != 1.0:
+            model_param["model.embed_tokens.weight"] = embed_tokens_unscaled * float(
+                scale_emb
+            )
+
     if model_param.get("lm_head.weight", None) is None:
-        model_param["lm_head.weight"] = model_param["model.embed_tokens.weight"]
+        # Use unscaled weight for lm_head (C++ alpha handles dim_model_base scaling)
+        if embed_tokens_unscaled is not None:
+            model_param["lm_head.weight"] = embed_tokens_unscaled
 
     # --------------------------------------------------------- #
     #         model_param_infini references torch.Tensor
@@ -148,13 +200,40 @@ def load_model_state_dict_by_file(
     print(" load weights ......")
     t1 = time.time()
 
+    model_type = model.hf_config.get("model_type", "")
+    preserve_fp32_suffixes = (".e_score_correction_bias",)
+    if model_type == "kimi_k3":
+        preserve_fp32_suffixes += (".A_log", ".dt_bias")
+
     torch_device = "cpu"
     torch_dtype = infinicore.utils.to_torch_dtype(dtype)
     model_keys = model.state_dict_keyname()
+    model_key_set = set(model_keys)
+    dist_config = getattr(model, "distributed_config", None)
+    is_pipeline_parallel = dist_config is not None and dist_config.pp_size > 1
+    scale_emb = _get_scale_emb(model_path)
 
     already_loaded_keys = []
+    embed_tokens_torch_unscaled = None
+    weights_processed = False
 
-    file_list = glob.glob(os.path.join(model_path, "*.safetensors"))
+    remapper = _WEIGHT_REMAPPER.get(model_type)
+
+    index_file_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_file_path):
+        # Priority 1: If the index file exists, strictly load exactly what it maps to.
+        # This handles all standard sharded models perfectly, regardless of their actual prefix.
+        print(f"Found index file: {index_file_path}. Loading shards by index.")
+        with open(index_file_path, "r") as f:
+            index_data = json.load(f)
+        weight_map = index_data.get("weight_map", {})
+        unique_filenames = set(weight_map.values())
+        file_list = [os.path.join(model_path, fname) for fname in unique_filenames]
+    else:
+        # Priority 2: If no index file, scan all safetensors files.
+        print("No index file found. Scanning all safetensors files...")
+        file_list = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+
     if len(file_list) > 0:
         for file_path in tqdm(file_list, desc="Processing files"):
             tqdm.write(f"Processing: {os.path.basename(file_path)}")
@@ -163,8 +242,33 @@ def load_model_state_dict_by_file(
             #          Load weights from *.safetensors file
             # --------------------------------------------------------- #
             model_param = load_state_dict(
-                file_path, device=torch_device, dtype=torch_dtype
+                file_path,
+                device=torch_device,
+                dtype=torch_dtype,
+                preserve_fp32_suffixes=preserve_fp32_suffixes,
             )
+
+            # Apply model-specific weight remapping
+            if remapper is not None:
+                model_param = remapper(model_param, config=model.hf_config)
+
+            # --------------------------------------------------------- #
+            #         Scale embed_tokens on torch side before converting
+            # --------------------------------------------------------- #
+            if "model.embed_tokens.weight" in model_param:
+                embed_tokens_torch_unscaled = model_param["model.embed_tokens.weight"]
+                if scale_emb != 1.0:
+                    model_param["model.embed_tokens.weight"] = (
+                        embed_tokens_torch_unscaled * float(scale_emb)
+                    )
+
+            if is_pipeline_parallel:
+                model_param = {
+                    key: tensor
+                    for key, tensor in model_param.items()
+                    if key in model_key_set
+                }
+
             already_loaded_keys.extend(model_param.keys())
 
             # --------------------------------------------------------- #
@@ -175,24 +279,81 @@ def load_model_state_dict_by_file(
                 model_param_infini[key] = infinicore.from_torch(model_param[key])
             model.load_state_dict(model_param_infini, strict=False)
             infinicore.sync_device()
+            del model_param_infini
+            del model_param
+            gc.collect()
+        if not (
+            "lm_head.weight" in model_keys
+            and "lm_head.weight" not in already_loaded_keys
+            and embed_tokens_torch_unscaled is not None
+        ):
+            embed_tokens_torch_unscaled = None
+            gc.collect()
+
+        model.process_weights_after_loading()
+        weights_processed = True
 
     elif os.path.exists(os.path.join(model_path, "pytorch_model.bin")):
         file_path = os.path.join(model_path, "pytorch_model.bin")
         model_params = torch.load(file_path, weights_only=True, map_location="cpu")
 
+        # Apply model-specific weight remapping
+        remapper = _WEIGHT_REMAPPER.get(model_type)
+        if remapper is not None:
+            model_params = remapper(model_params, config=model.hf_config)
+
+        # Scale embed_tokens on torch side before converting
+        if "model.embed_tokens.weight" in model_params:
+            embed_tokens_torch_unscaled = model_params["model.embed_tokens.weight"].to(
+                dtype=torch_dtype
+            )
+            if scale_emb != 1.0:
+                model_params["model.embed_tokens.weight"] = (
+                    embed_tokens_torch_unscaled * float(scale_emb)
+                )
+
+        if is_pipeline_parallel:
+            model_params = {
+                key: tensor
+                for key, tensor in model_params.items()
+                if key in model_key_set
+            }
+
         model_param_infini = {}
         for key in model_params.keys():
+            target_dtype = (
+                model_params[key].dtype
+                if key.endswith(preserve_fp32_suffixes)
+                else torch_dtype
+            )
             model_param_infini[key] = infinicore.from_torch(
-                model_params[key].to(dtype=torch_dtype)
+                model_params[key].to(dtype=target_dtype)
             )
             already_loaded_keys.append(key)
 
         model.load_state_dict(model_param_infini, strict=True)
         infinicore.sync_device()
+        del model_param_infini
+        del model_params
+        gc.collect()
     else:
         raise KeyError("Weight file not found.")
 
+    # Handle tied weights: if lm_head.weight is missing, share embed_tokens.weight
+    # Use unscaled weight for lm_head (C++ alpha handles dim_model_base scaling)
+    if "lm_head.weight" in model_keys and "lm_head.weight" not in already_loaded_keys:
+        if embed_tokens_torch_unscaled is not None:
+            lm_head_tensor = infinicore.from_torch(embed_tokens_torch_unscaled)
+            model.load_state_dict({"lm_head.weight": lm_head_tensor}, strict=False)
+            already_loaded_keys.append("lm_head.weight")
+            del lm_head_tensor
+            embed_tokens_torch_unscaled = None
+            gc.collect()
+
     check_parameters(model_keys, already_loaded_keys)
+
+    if not weights_processed:
+        model.process_weights_after_loading()
 
     t2 = time.time()
     print(f" load weights over! {(t2 - t1) * 1000} ms \n")
@@ -212,7 +373,12 @@ def load_model_state_dict_by_tensor(
 
     torch_dtype = infinicore.utils.to_torch_dtype(dtype)
     model_keys = model.state_dict_keyname()
+    model_key_set = set(model_keys)
+    dist_config = getattr(model, "distributed_config", None)
+    is_pipeline_parallel = dist_config is not None and dist_config.pp_size > 1
+    scale_emb = _get_scale_emb(model_path)
     already_loaded_keys = []
+    embed_tokens_torch_unscaled = None
 
     file_list = glob.glob(os.path.join(model_path, "*.safetensors"))
     if len(file_list) > 0:
@@ -221,9 +387,17 @@ def load_model_state_dict_by_tensor(
 
             with safe_open(file_path, "pt", "cpu") as f:
                 for name in f.keys():
-                    weight_infini = infinicore.from_torch(
-                        f.get_tensor(name).to(dtype=torch_dtype)
-                    )
+                    tensor = f.get_tensor(name).to(dtype=torch_dtype)
+
+                    if name == "model.embed_tokens.weight":
+                        embed_tokens_torch_unscaled = tensor
+                        if scale_emb != 1.0:
+                            tensor = tensor * float(scale_emb)
+
+                    if is_pipeline_parallel and name not in model_key_set:
+                        continue
+
+                    weight_infini = infinicore.from_torch(tensor)
                     model.load_param(name, weight_infini)
                     already_loaded_keys.append(name)
                     infinicore.sync_stream()
@@ -233,15 +407,680 @@ def load_model_state_dict_by_tensor(
         model_params = torch.load(file_path, weights_only=True, map_location="cpu")
 
         for key in model_params.keys():
-            weight_infini = infinicore.from_torch(
-                model_params[key].to(dtype=torch_dtype)
-            )
+            tensor = model_params[key].to(dtype=torch_dtype)
+            if key == "model.embed_tokens.weight":
+                embed_tokens_torch_unscaled = tensor
+                if scale_emb != 1.0:
+                    tensor = tensor * float(scale_emb)
+            if is_pipeline_parallel and key not in model_key_set:
+                continue
+            weight_infini = infinicore.from_torch(tensor)
             model.load_param(key, weight_infini)
             already_loaded_keys.append(key)
     else:
         raise KeyError("Weight file not found.")
 
+    # Handle tied weights: if lm_head.weight is missing, share embed_tokens.weight
+    # Use unscaled weight for lm_head (C++ alpha handles dim_model_base scaling)
+    if "lm_head.weight" in model_keys and "lm_head.weight" not in already_loaded_keys:
+        if embed_tokens_torch_unscaled is not None:
+            lm_head_tensor = infinicore.from_torch(embed_tokens_torch_unscaled)
+            model.load_param("lm_head.weight", lm_head_tensor)
+            already_loaded_keys.append("lm_head.weight")
+
     check_parameters(model_keys, already_loaded_keys)
 
     t2 = time.time()
     print(f" load weights over! {(t2 - t1) * 1000} ms \n")
+
+
+# ============================================================================
+# Common weight transformation utilities
+# ============================================================================
+
+
+def drop_keys(
+    state_dict: Dict[str, torch.Tensor],
+    substrings: List[str],
+) -> Dict[str, torch.Tensor]:
+    """Drop keys containing any of the given substrings."""
+    return {
+        k: v for k, v in state_dict.items() if not any(sub in k for sub in substrings)
+    }
+
+
+def rename_keys(
+    state_dict: Dict[str, torch.Tensor],
+    mapping: Dict[str, str],
+) -> Dict[str, torch.Tensor]:
+    """Rename weight keys according to a substring mapping."""
+    result = {}
+    for key, tensor in state_dict.items():
+        new_key = key
+        for old_str, new_str in mapping.items():
+            new_key = new_key.replace(old_str, new_str)
+        result[new_key] = tensor
+    return result
+
+
+def split_fused_weight(
+    state_dict: Dict[str, torch.Tensor],
+    fused_key: str,
+    output_names: List[str],
+    split_dim: int = 0,
+    split_sizes: Optional[List[int]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Split fused weight tensors into separate weights.
+
+    Args:
+        state_dict: Original state dict.
+        fused_key: Substring to match in key names (e.g. "query_key_value").
+        output_names: Names of the split outputs (e.g. ["q_proj", "k_proj", "v_proj"]).
+        split_dim: Dimension along which to split. Default 0.
+        split_sizes: Optional explicit sizes for each split. Supports -1 to mean
+            "the remaining size". If None, split equally.
+
+    Returns:
+        New state dict with fused keys replaced by split keys.
+
+    Examples:
+        # Equal 2-way split (e.g. gate_up_proj.weight)
+        split_fused_weight(sd, "gate_up_proj", ["gate_proj", "up_proj"])
+
+        # Dynamic 3-way split with bias (e.g. query_key_value.weight + bias)
+        split_fused_weight(sd, "query_key_value", ["q_proj", "k_proj", "v_proj"],
+                           split_sizes=[q_dim, k_dim, -1])
+    """
+    result = {}
+    marker = f".{fused_key}."
+
+    for key, tensor in state_dict.items():
+        if marker not in key:
+            result[key] = tensor
+            continue
+
+        # Extract base_key and suffix (handles both .weight and .bias)
+        base_key, suffix = key.split(marker, 1)
+        dim_size = tensor.shape[split_dim]
+
+        # Calculate split sizes
+        if split_sizes is not None:
+            sizes = []
+            remainder = dim_size
+            for s in split_sizes:
+                if s == -1:
+                    sizes.append(0)  # placeholder
+                else:
+                    sizes.append(s)
+                    remainder -= s
+            # Fill -1 placeholders with remainder
+            sizes = [remainder if s == 0 else s for s in sizes]
+        else:
+            num_splits = len(output_names)
+            chunk = dim_size // num_splits
+            sizes = [chunk] * (num_splits - 1)
+            sizes.append(dim_size - chunk * (num_splits - 1))
+
+        splits = torch.split(tensor, sizes, dim=split_dim)
+        for name, split_tensor in zip(output_names, splits):
+            result[f"{base_key}.{name}.{suffix}"] = split_tensor
+
+    return result
+
+
+def split_fused_weight_with_sizes(
+    state_dict: Dict[str, torch.Tensor],
+    fused_key: str,
+    output_names: List[str],
+    split_sizes: List[int],
+    split_dim: int = 0,
+) -> Dict[str, torch.Tensor]:
+    """Split fused weight tensors into separate weights with explicit sizes.
+    Supports -1 in split_sizes to mean "the remaining size".
+    Handles both .weight and .bias suffixes (unlike split_fused_weight
+    which only handles .weight).
+    """
+    result = {}
+    marker = f".{fused_key}."
+
+    for key, tensor in state_dict.items():
+        if marker not in key:
+            result[key] = tensor
+            continue
+
+        base_key, suffix = key.split(marker, 1)
+        dim_size = tensor.shape[split_dim]
+
+        # Resolve -1 (remainder)
+        sizes = []
+        remainder = dim_size
+        for s in split_sizes:
+            if s == -1:
+                sizes.append(0)  # placeholder
+            else:
+                sizes.append(s)
+                remainder -= s
+        sizes = [remainder if s == 0 else s for s in sizes]
+
+        splits = torch.split(tensor, sizes, dim=split_dim)
+        for name, split_tensor in zip(output_names, splits):
+            result[f"{base_key}.{name}.{suffix}"] = split_tensor
+
+    return result
+
+
+# ============================================================================
+# Model-specific remap functions
+# ============================================================================
+def _remap_glm4(state_dict, config=None):
+    """Split GLM-4 fused gate_up_proj into gate_proj + up_proj."""
+    return split_fused_weight(
+        state_dict,
+        fused_key="gate_up_proj",
+        output_names=["gate_proj", "up_proj"],
+    )
+
+
+def _remap_chatglm(state_dict, config=None):
+    """Remap ChatGLM weights to InfiniLM format.
+
+    Faithfully ported from the original working _remap_chatglm_weights.
+    """
+    hf_config = config or {}
+    num_heads = hf_config.get("num_attention_heads", 32)
+    num_kv = hf_config.get("multi_query_group_num", 2)
+    head_dim = hf_config.get("kv_channels", 128)
+    ffn_hidden = hf_config.get("ffn_hidden_size", 13696)
+
+    q_dim = num_heads * head_dim
+    k_dim = num_kv * head_dim
+
+    # 1. Drop unused keys
+    state_dict = drop_keys(state_dict, ["rotary_pos_emb"])
+
+    # 2. Split QKV
+    state_dict = split_fused_weight_with_sizes(
+        state_dict,
+        fused_key="query_key_value",
+        output_names=["q_proj", "k_proj", "v_proj"],
+        split_sizes=[q_dim, k_dim, -1],
+    )
+
+    # 3. Split gate_up
+    state_dict = split_fused_weight_with_sizes(
+        state_dict,
+        fused_key="dense_h_to_4h",
+        output_names=["gate_proj", "up_proj"],
+        split_sizes=[ffn_hidden, -1],
+    )
+
+    # 4. Rename keys
+    state_dict = rename_keys(
+        state_dict,
+        {
+            "transformer.encoder.layers.": "model.layers.",
+            "transformer.embedding.word_embeddings": "model.embed_tokens",
+            "transformer.encoder.final_layernorm": "model.norm",
+            "transformer.output_layer": "lm_head",
+            "self_attention.": "self_attn.",
+            "self_attn.dense": "self_attn.o_proj",
+            "mlp.dense_4h_to_h": "mlp.down_proj",
+        },
+    )
+
+    return state_dict
+
+
+def _is_baichuan2(config):
+    """
+    Baichuan1 and Baichuan2 share the same model_type "baichuan" in official HuggingFace configs,
+    making them indistinguishable by model_type alone. However, their inference logic differs
+    critically: Baichuan2 requires normalized lm_head while Baichuan1 does not.
+
+    The most reliable automatic way to distinguish them is by vocab_size:
+      - Baichuan1: vocab_size = 64000
+      - Baichuan2: vocab_size = 125696
+    """
+    return config.get("vocab_size") == 125696
+
+
+def _remap_baichuan(state_dict, config=None):
+    """Split Baichuan fused W_pack into q_proj, k_proj, v_proj
+    and apply Baichuan2-specific fixes."""
+    import torch.nn.functional as F
+
+    hf_config = config or {}
+    hidden_size = hf_config.get("hidden_size", 4096)
+    num_heads = hf_config.get("num_attention_heads", 32)
+    per_head_dim = num_heads * (hidden_size // num_heads)
+
+    # 1. Split W_pack → q_proj, k_proj, v_proj
+    state_dict = split_fused_weight(
+        state_dict,
+        fused_key="W_pack",
+        output_names=["q_proj", "k_proj", "v_proj"],
+        split_sizes=[per_head_dim, per_head_dim, -1],
+    )
+
+    # 2. Baichuan2: normalize lm_head.weight
+    #    Baichuan2 trains with normalized lm_head. Inference must match this,
+    #    otherwise the logits distribution will be distorted, causing severe
+    #    repetitive output especially under greedy decoding.
+    #    (See _is_baichuan2 for how we distinguish Baichuan1 vs Baichuan2)
+    if _is_baichuan2(hf_config) and "lm_head.weight" in state_dict:
+        state_dict["lm_head.weight"] = F.normalize(
+            state_dict["lm_head.weight"], p=2, dim=-1
+        )
+
+    return state_dict
+
+
+def _remap_gpt2(state_dict, config=None):
+    """Remap HuggingFace GPT-2 weights to InfiniLM GPT-2 module names.
+
+    HuggingFace GPT-2 uses Conv1D modules whose weights are stored as
+    [in_features, out_features]. InfiniLM Linear expects [out_features,
+    in_features], so projection weights must be transposed.
+    """
+    remapped = {}
+    for key, tensor in state_dict.items():
+        if key.endswith((".attn.bias", ".attn.masked_bias")):
+            continue
+
+        new_key = key
+
+        if new_key.startswith("wte."):
+            new_key = new_key.replace("wte.", "model.embed_tokens.", 1)
+        elif new_key.startswith("wpe."):
+            new_key = new_key.replace("wpe.", "model.embed_positions.", 1)
+        elif new_key.startswith("h."):
+            new_key = new_key.replace("h.", "model.layers.", 1)
+        elif new_key.startswith("ln_f."):
+            new_key = new_key.replace("ln_f.", "model.norm.", 1)
+
+        if key.endswith(("attn.c_proj.weight", "mlp.c_fc.weight", "mlp.c_proj.weight")):
+            tensor = tensor.t().contiguous()
+
+        new_key = new_key.replace(".attn.c_proj.", ".attn.o_proj.")
+        if new_key.endswith(".attn.o_proj.bias"):
+            new_key = new_key.removesuffix(".attn.o_proj.bias") + ".attn.o_proj_bias"
+        elif new_key.endswith(".mlp.c_proj.bias"):
+            new_key = new_key.removesuffix(".mlp.c_proj.bias") + ".mlp.c_proj_bias"
+
+        if new_key.endswith(".attn.c_attn.weight"):
+            q, k, v = tensor.t().contiguous().chunk(3, dim=0)
+            prefix = new_key.removesuffix(".attn.c_attn.weight")
+            remapped[f"{prefix}.attn.q_proj.weight"] = q
+            remapped[f"{prefix}.attn.k_proj.weight"] = k
+            remapped[f"{prefix}.attn.v_proj.weight"] = v
+        elif new_key.endswith(".attn.c_attn.bias"):
+            q, k, v = tensor.chunk(3, dim=0)
+            prefix = new_key.removesuffix(".attn.c_attn.bias")
+            remapped[f"{prefix}.attn.q_proj.bias"] = q
+            remapped[f"{prefix}.attn.k_proj.bias"] = k
+            remapped[f"{prefix}.attn.v_proj.bias"] = v
+        else:
+            remapped[new_key] = tensor
+
+    if "lm_head.weight" not in remapped and "model.embed_tokens.weight" in remapped:
+        remapped["lm_head.weight"] = remapped["model.embed_tokens.weight"]
+
+    return remapped
+
+
+def _remap_mamba(state_dict, config=None):
+    """Remap HuggingFace Mamba weights to InfiniLM native names."""
+    remapped = {}
+    for key, tensor in state_dict.items():
+        new_key = key
+        new_key = new_key.replace(".mixer.conv1d.weight", ".mixer.conv1d_weight")
+        new_key = new_key.replace(".mixer.conv1d.bias", ".mixer.conv1d_bias")
+        remapped[new_key] = tensor
+    if "lm_head.weight" not in remapped and "backbone.embeddings.weight" in remapped:
+        remapped["lm_head.weight"] = remapped["backbone.embeddings.weight"]
+    return remapped
+
+
+def _remap_videonsa(state_dict, config=None):
+    """Adapt VideoNSA/Qwen2.5-VL weights to the InfiniLM C++ module layout."""
+    key = "visual.patch_embed.proj.weight"
+    if key in state_dict:
+        state_dict = dict(state_dict)
+        if state_dict[key].ndim == 5:
+            state_dict[key] = (
+                state_dict[key].reshape(state_dict[key].shape[0], -1).contiguous()
+            )
+        state_dict["visual.patch_embed.proj_weight"] = state_dict[key]
+    return state_dict
+
+
+# Model type → remap function mapping
+def _remap_qwen3_5(state_dict, config):
+    """Apply Qwen3.5-specific load-time weight fixes."""
+    state_dict = drop_keys(state_dict, ["mtp."])
+    llm_config = config["text_config"]
+    key_dim = llm_config["linear_key_head_dim"] * llm_config["linear_num_key_heads"]
+
+    norm_weight_suffixes = (
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+    )
+
+    to_drop = []
+    to_add = {}
+    for key, tensor in state_dict.items():
+        if key == "model.norm.weight" or key.endswith(norm_weight_suffixes):
+            state_dict[key] = tensor + torch.ones_like(tensor)
+        elif key.endswith("linear_attn.in_proj_qkv.weight"):
+            prefix = key[: -len("in_proj_qkv.weight")]
+            to_add[prefix + "in_proj_q.weight"] = state_dict[key][
+                :key_dim, :
+            ].contiguous()
+            to_add[prefix + "in_proj_k.weight"] = state_dict[key][
+                key_dim : key_dim * 2, :
+            ].contiguous()
+            to_add[prefix + "in_proj_v.weight"] = state_dict[key][
+                key_dim * 2 :, :
+            ].contiguous()
+            to_drop.append(key)
+
+    state_dict = drop_keys(state_dict, to_drop)
+    state_dict.update(to_add)
+
+    embed_tokens_key = "model.language_model.embed_tokens.weight"
+    if (
+        config.get("tie_word_embeddings", False)
+        and embed_tokens_key in state_dict
+        and "lm_head.weight" not in state_dict
+    ):
+        state_dict["lm_head.weight"] = state_dict[embed_tokens_key]
+
+    return state_dict
+
+
+def _remap_ernie4_5_moe_vl(state_dict, config=None):
+    """Apply ERNIE 4.5 VL load-time weight fixes.
+
+    ERNIE checkpoints store router gate weights in fp32. They also store each
+    expert as separate gate/up/down projections; InfiniLM uses InfiniCore's
+    fused MoE op, so fuse the text expert weights before loading.
+    """
+    target_dtype = torch.bfloat16
+    hf_config = config or {}
+    for key in ("torch_dtype", "dtype"):
+        dtype_name = hf_config.get(key)
+        if dtype_name in ("float16", "float32", "bfloat16"):
+            target_dtype = {
+                "float16": torch.float16,
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+            }[dtype_name]
+            break
+
+    text_expert_count = hf_config.get("num_experts")
+    moe_num_experts = hf_config.get("moe_num_experts")
+    if isinstance(moe_num_experts, list) and len(moe_num_experts) > 0:
+        text_expert_count = int(moe_num_experts[0])
+    elif text_expert_count is not None:
+        text_expert_count = int(text_expert_count)
+
+    expert_re = re.compile(
+        r"^(?P<prefix>model\.layers\.\d+\.mlp\.experts)\."
+        r"(?P<expert>\d+)\."
+        r"(?P<proj>gate_proj|up_proj|down_proj)\."
+        r"(?P<kind>weight|bias)$"
+    )
+    expert_parts = {}
+    remapped = {}
+
+    for key, tensor in state_dict.items():
+        match = expert_re.match(key)
+        if match is not None:
+            prefix = match.group("prefix")
+            expert = int(match.group("expert"))
+            proj = match.group("proj")
+            kind = match.group("kind")
+            expert_parts.setdefault(prefix, {}).setdefault(expert, {})[(proj, kind)] = (
+                tensor
+            )
+            continue
+
+        if (
+            key.endswith((".mlp.gate.weight", ".mlp.gate.weight_1"))
+            and tensor.is_floating_point()
+        ):
+            remapped[key] = tensor.to(dtype=target_dtype).contiguous()
+        else:
+            remapped[key] = tensor
+
+    for prefix, experts in expert_parts.items():
+        text_ids = sorted(
+            expert_id
+            for expert_id in experts
+            if text_expert_count is None or expert_id < text_expert_count
+        )
+        vision_ids = []
+        if text_expert_count is not None:
+            vision_ids = sorted(
+                expert_id for expert_id in experts if expert_id >= text_expert_count
+            )
+        if not text_ids:
+            continue
+
+        def fuse_expert_group(expert_ids):
+            w1_tensors = []
+            w2_tensors = []
+            b1_tensors = []
+            b2_tensors = []
+            has_all_bias = True
+            for expert_id in expert_ids:
+                parts = experts[expert_id]
+                gate = parts.get(("gate_proj", "weight"))
+                up = parts.get(("up_proj", "weight"))
+                down = parts.get(("down_proj", "weight"))
+                if gate is None or up is None or down is None:
+                    raise KeyError(
+                        f"Incomplete ERNIE MoE expert weights for {prefix}.{expert_id}"
+                    )
+                w1_tensors.append(torch.cat([gate, up], dim=0))
+                w2_tensors.append(down)
+
+                gate_bias = parts.get(("gate_proj", "bias"))
+                up_bias = parts.get(("up_proj", "bias"))
+                down_bias = parts.get(("down_proj", "bias"))
+                if gate_bias is None or up_bias is None or down_bias is None:
+                    has_all_bias = False
+                else:
+                    b1_tensors.append(torch.cat([gate_bias, up_bias], dim=0))
+                    b2_tensors.append(down_bias)
+
+            fused = {
+                "w1": torch.stack(w1_tensors, dim=0)
+                .to(dtype=target_dtype)
+                .contiguous(),
+                "w2": torch.stack(w2_tensors, dim=0)
+                .to(dtype=target_dtype)
+                .contiguous(),
+            }
+            if has_all_bias:
+                fused["b1"] = (
+                    torch.stack(b1_tensors, dim=0).to(dtype=target_dtype).contiguous()
+                )
+                fused["b2"] = (
+                    torch.stack(b2_tensors, dim=0).to(dtype=target_dtype).contiguous()
+                )
+            return fused
+
+        text_fused = fuse_expert_group(text_ids)
+        remapped[f"{prefix}.w1"] = text_fused["w1"]
+        remapped[f"{prefix}.w2"] = text_fused["w2"]
+        if "b1" in text_fused:
+            remapped[f"{prefix}.b1"] = text_fused["b1"]
+            remapped[f"{prefix}.b2"] = text_fused["b2"]
+
+        if vision_ids:
+            vision_fused = fuse_expert_group(vision_ids)
+            remapped[f"{prefix}.w1_1"] = vision_fused["w1"]
+            remapped[f"{prefix}.w2_1"] = vision_fused["w2"]
+            if "b1" in vision_fused:
+                remapped[f"{prefix}.b1_1"] = vision_fused["b1"]
+                remapped[f"{prefix}.b2_1"] = vision_fused["b2"]
+
+    return remapped
+
+
+def _remap_qwen3_next(state_dict, config):
+    """Adapt Qwen3Next fused linear-attention weights to InfiniLM module names."""
+    state_dict = drop_keys(state_dict, ["mtp."])
+    num_key_heads = config["linear_num_key_heads"]
+    num_value_heads = config["linear_num_value_heads"]
+    key_head_dim = config["linear_key_head_dim"]
+    value_head_dim = config["linear_value_head_dim"]
+    values_per_key = num_value_heads // num_key_heads
+    value_group_dim = values_per_key * value_head_dim
+    norm_weight_suffixes = (
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+    )
+
+    to_drop = []
+    to_add = {}
+    for key, tensor in state_dict.items():
+        if key == "model.norm.weight" or key.endswith(norm_weight_suffixes):
+            state_dict[key] = tensor + torch.ones_like(tensor)
+        elif key.endswith("linear_attn.in_proj_qkvz.weight"):
+            prefix = key[: -len("in_proj_qkvz.weight")]
+            grouped = tensor.view(
+                num_key_heads,
+                2 * key_head_dim + 2 * value_group_dim,
+                tensor.shape[1],
+            )
+            q, k, v, z = torch.split(
+                grouped,
+                [key_head_dim, key_head_dim, value_group_dim, value_group_dim],
+                dim=1,
+            )
+            to_add[prefix + "in_proj_q.weight"] = q.reshape(
+                -1, tensor.shape[1]
+            ).contiguous()
+            to_add[prefix + "in_proj_k.weight"] = k.reshape(
+                -1, tensor.shape[1]
+            ).contiguous()
+            to_add[prefix + "in_proj_v.weight"] = v.reshape(
+                -1, tensor.shape[1]
+            ).contiguous()
+            to_add[prefix + "in_proj_z.weight"] = z.reshape(
+                -1, tensor.shape[1]
+            ).contiguous()
+            to_drop.append(key)
+        elif key.endswith("linear_attn.in_proj_ba.weight"):
+            prefix = key[: -len("in_proj_ba.weight")]
+            grouped = tensor.view(
+                num_key_heads,
+                2 * values_per_key,
+                tensor.shape[1],
+            )
+            b, a = torch.split(grouped, [values_per_key, values_per_key], dim=1)
+            to_add[prefix + "in_proj_b.weight"] = b.reshape(
+                -1, tensor.shape[1]
+            ).contiguous()
+            to_add[prefix + "in_proj_a.weight"] = a.reshape(
+                -1, tensor.shape[1]
+            ).contiguous()
+            to_drop.append(key)
+
+    state_dict = drop_keys(state_dict, to_drop)
+    state_dict.update(to_add)
+    return state_dict
+
+
+def _remap_qwen3_5_moe(state_dict, config):
+    """Adapt packed Qwen3.5-MoE experts to InfiniLM expert parameter names."""
+    state_dict = _remap_qwen3_5(state_dict, config)
+    text_config = config.get("text_config", config)
+    expected_num_experts = text_config["num_experts"]
+    expected_intermediate_size = text_config["moe_intermediate_size"]
+
+    remapped = {}
+    for key, tensor in state_dict.items():
+        if key.endswith(".mlp.experts.gate_up_proj"):
+            if tensor.ndim != 3:
+                raise ValueError(
+                    f"Expected packed gate_up_proj to be 3D, got {tensor.shape} for {key}"
+                )
+            if tensor.shape[0] != expected_num_experts:
+                raise ValueError(
+                    f"Expected {expected_num_experts} experts, got {tensor.shape[0]} for {key}"
+                )
+            if tensor.shape[1] != expected_intermediate_size * 2:
+                raise ValueError(
+                    f"Expected packed gate/up size {expected_intermediate_size * 2}, "
+                    f"got {tensor.shape[1]} for {key}"
+                )
+
+            prefix = key[: -len("gate_up_proj")]
+            for expert_idx, expert_gate_up in enumerate(tensor.unbind(0)):
+                gate, up = expert_gate_up.chunk(2, dim=0)
+                expert_prefix = f"{prefix}{expert_idx}."
+                remapped[f"{expert_prefix}gate_proj.weight"] = gate
+                remapped[f"{expert_prefix}up_proj.weight"] = up
+        elif key.endswith(".mlp.experts.down_proj"):
+            if tensor.ndim != 3:
+                raise ValueError(
+                    f"Expected packed down_proj to be 3D, got {tensor.shape} for {key}"
+                )
+            if tensor.shape[0] != expected_num_experts:
+                raise ValueError(
+                    f"Expected {expected_num_experts} experts, got {tensor.shape[0]} for {key}"
+                )
+            if tensor.shape[2] != expected_intermediate_size:
+                raise ValueError(
+                    f"Expected down projection input size {expected_intermediate_size}, "
+                    f"got {tensor.shape[2]} for {key}"
+                )
+
+            prefix = key[: -len("down_proj")]
+            for expert_idx, expert_down in enumerate(tensor.unbind(0)):
+                remapped[f"{prefix}{expert_idx}.down_proj.weight"] = expert_down
+        else:
+            remapped[key] = tensor
+
+    return remapped
+
+
+def _remap_kimi_k3(state_dict, config):
+    """Adapt released Kimi-K3 KDA weights to the reference module layout."""
+    text_config = config.get("text_config", config)
+    num_heads = text_config["linear_attn_config"]["num_heads"]
+
+    for key, tensor in state_dict.items():
+        if key.endswith(".self_attn.A_log") and tensor.shape != (num_heads,):
+            if tensor.ndim != 1 or tensor.shape[0] < num_heads:
+                raise ValueError(
+                    f"Kimi-K3 A_log must contain at least {num_heads} values, "
+                    f"but {key} has shape {tuple(tensor.shape)}"
+                )
+            # Released Kimi-K3 checkpoints contain head_dim entries although
+            # the bundled reference module and KDA ABI consume one per head.
+            state_dict[key] = tensor[:num_heads].contiguous()
+
+    return state_dict
+
+
+_WEIGHT_REMAPPER = {
+    "glm4": _remap_glm4,
+    "chatglm": _remap_chatglm,
+    "baichuan": _remap_baichuan,
+    "gpt2": _remap_gpt2,
+    "mamba": _remap_mamba,
+    "videonsa": _remap_videonsa,
+    "qwen3_5": _remap_qwen3_5,
+    "ernie4_5_moe_vl": _remap_ernie4_5_moe_vl,
+    "qwen3_5_moe": _remap_qwen3_5_moe,
+    "qwen3_next": _remap_qwen3_next,
+    "kimi_k3": _remap_kimi_k3,
+}

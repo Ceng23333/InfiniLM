@@ -35,7 +35,7 @@ std::tuple<infinicore::Tensor, infinicore::Tensor> Qwen3NextDecoderLayer::forwar
                                                                                   infinicore::Tensor &residual) {
     input_layernorm_->forward_inplace(hidden_states, residual);
     if ("linear_attention" == layer_type_) {
-        hidden_states = linear_attn_->forward(positions, hidden_states);
+        hidden_states = linear_attn_->forward(hidden_states);
     } else if ("full_attention" == layer_type_) {
         hidden_states = self_attn_->forward(positions, hidden_states);
     }
@@ -50,7 +50,7 @@ infinicore::Tensor Qwen3NextDecoderLayer::forward(const infinicore::Tensor &posi
     auto residual = hidden_states;
     hidden_states = input_layernorm_->forward(hidden_states);
     if ("linear_attention" == layer_type_) {
-        hidden_states = linear_attn_->forward(positions, hidden_states);
+        hidden_states = linear_attn_->forward(hidden_states);
     } else if ("full_attention" == layer_type_) {
         hidden_states = self_attn_->forward(positions, hidden_states);
     }

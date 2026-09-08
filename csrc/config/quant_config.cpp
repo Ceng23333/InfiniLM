@@ -5,23 +5,28 @@ QuantConfig::QuantConfig(const nlohmann::json &json) : quantization_config(json)
     this->quantization_method = get_quantization_method();
 }
 
-std::shared_ptr<infinicore::quantization::BaseQuantization>
+std::shared_ptr<infinilm::quantization::BaseQuantization>
 QuantConfig::get_quantization_method() const {
     if (quantization_config.is_null()) {
-        // return nullptr;
-        return std::make_shared<infinicore::quantization::NoneQuantization>(quantization_config); // Default case if no matching scheme
+        return std::make_shared<infinilm::quantization::NoneQuantization>(quantization_config); // Default case if no matching scheme
     }
 
+    const std::string quant_method = quantization_config.value("quant_method", "");
+
     // Determine the quantization scheme from the JSON config
-    if (quantization_config["quant_method"] == "compressed-tensors") {
-        return std::make_shared<infinicore::quantization::CompressedTensors>(quantization_config);
-    } else if (quantization_config["quant_method"] == "awq") {
-        return std::make_shared<infinicore::quantization::AWQ>(quantization_config);
+    if (quant_method == "compressed-tensors") {
+        return std::make_shared<infinilm::quantization::CompressedTensors>(quantization_config);
+    } else if (quant_method == "awq") {
+        return std::make_shared<infinilm::quantization::AWQ>(quantization_config);
+    } else if (quant_method == "gptq") {
+        return std::make_shared<infinilm::quantization::GPTQ>(quantization_config);
+    } else if (quant_method == "quark") {
+        return std::make_shared<infinilm::quantization::MXFP4>(quantization_config);
     } else {
-        return std::make_shared<infinicore::quantization::NoneQuantization>(quantization_config);
+        return std::make_shared<infinilm::quantization::NoneQuantization>(quantization_config);
     }
     // Add other schemes as needed
 
-    return std::make_shared<infinicore::quantization::NoneQuantization>(quantization_config); // Default case if no matching scheme
+    return std::make_shared<infinilm::quantization::NoneQuantization>(quantization_config); // Default case if no matching scheme
 }
 } // namespace infinilm::config

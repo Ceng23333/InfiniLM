@@ -17,6 +17,10 @@ struct AttentionMetadata {
     std::optional<infinicore::Tensor> block_tables;
     /// Slot ids for each token `[seq]`. Used for paged cache.
     std::optional<infinicore::Tensor> slot_mapping;
+    /// Maximum query length in the current batch.
+    size_t max_query_length{0};
+    /// Maximum total sequence length in the current batch.
+    size_t max_sequence_length{0};
 
     AttentionMetadata() = default;
 
@@ -25,12 +29,16 @@ struct AttentionMetadata {
                       std::optional<infinicore::Tensor> input_offsets,
                       std::optional<infinicore::Tensor> cu_seqlens,
                       std::optional<infinicore::Tensor> block_tables,
-                      std::optional<infinicore::Tensor> slot_mapping) : past_sequence_lengths(past_sequence_lengths),
-                                                                        total_sequence_lengths(total_sequence_lengths),
-                                                                        input_offsets(input_offsets),
-                                                                        cu_seqlens(cu_seqlens),
-                                                                        block_tables(block_tables),
-                                                                        slot_mapping(slot_mapping) {}
+                      std::optional<infinicore::Tensor> slot_mapping,
+                      size_t max_query_length = 0,
+                      size_t max_sequence_length = 0) : past_sequence_lengths(past_sequence_lengths),
+                                                        total_sequence_lengths(total_sequence_lengths),
+                                                        input_offsets(input_offsets),
+                                                        cu_seqlens(cu_seqlens),
+                                                        block_tables(block_tables),
+                                                        slot_mapping(slot_mapping),
+                                                        max_query_length(max_query_length),
+                                                        max_sequence_length(max_sequence_length) {}
 
     AttentionMetadata(const infinilm::InfinilmModel::Input &input) : AttentionMetadata(input.past_sequence_lengths,
                                                                                        input.total_sequence_lengths,
@@ -40,9 +48,28 @@ struct AttentionMetadata {
                                                                                        input.slot_mapping) {}
 };
 
+struct MultiModalMetadata {
+    std::optional<std::vector<size_t>> image_req_ids;
+    // Flattened [start, end) token ranges in the current packed language sequence.
+    std::optional<std::vector<size_t>> visual_token_ranges;
+};
+
+struct MambaMetadata {
+    /// Offsets of each request in a continous-batched sequence, of shape `[num_requests + 1]`.
+    std::optional<infinicore::Tensor> input_offsets;
+    /// State cache indices read at the start of each request forward.
+    std::optional<infinicore::Tensor> init_state_indices;
+    /// State cache indices written with the final state of each request forward.
+    std::optional<infinicore::Tensor> final_state_indices;
+};
+
 struct ForwardContext {
     AttentionMetadata attn_metadata;
+    MambaMetadata mamba_metadata;
+    MultiModalMetadata mm_metadata;
     std::vector<infinicore::Tensor> kv_cache_vec;
+    std::vector<infinicore::Tensor> conv_state_vec;
+    std::vector<infinicore::Tensor> ssm_state_vec;
 };
 
 void initialize_forward_context(ForwardContext &forward_context);

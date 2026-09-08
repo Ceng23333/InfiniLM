@@ -5,8 +5,10 @@
 #include "infinicore/ops.hpp"
 #include "quant_config.hpp"
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace infinilm::config {
@@ -38,16 +40,33 @@ public:
 
     template <typename T>
     T get_or(const std::string &key, const T &default_value) const {
-        if (!config_json.contains(key) || config_json.at(key).is_null()) {
-            return default_value;
-        }
-        try {
-            return config_json.at(key).get<T>();
-        } catch (const nlohmann::json::type_error &) {
-            // If type conversion fails, return default value
-            return default_value;
-        }
+        return get_or<T>({std::string_view(key)}, default_value);
     }
+
+    template <typename T>
+    T get_or(std::initializer_list<std::string_view> keys, const T &default_value) const {
+        for (std::string_view key : keys) {
+            if (key.empty()) {
+                continue;
+            }
+            auto it = config_json.find(std::string(key));
+            if (it == config_json.end() || it->is_null()) {
+                continue;
+            }
+            try {
+                return it->get<T>();
+            } catch (const nlohmann::json::type_error &) {
+                return default_value;
+            }
+        }
+        return default_value;
+    }
+
+    template <typename T>
+    T get_or_alias(const std::string &key, const std::string &alias, const T &default_value) const {
+        return get_or<T>({key, alias}, default_value);
+    }
+
     size_t get_kv_dim() const {
         return get<size_t>("hidden_size") * get<size_t>("num_key_value_heads") / get<size_t>("num_attention_heads");
     }
@@ -58,21 +77,24 @@ public:
         return get<size_t>("hidden_size") / get<size_t>("num_attention_heads");
     }
 
+    // Compute the actual rotary dimension based on partial rotation factor
+    size_t get_rotary_dim() const;
+
     QuantConfig get_quant_config() const {
         return quant_config;
     }
 
-    std::shared_ptr<infinicore::quantization::BaseQuantization> get_quantization_method() const {
+    std::shared_ptr<infinilm::quantization::BaseQuantization> get_quantization_method() const {
         return quant_config.get_quantization_method();
     }
 
     infinicore::DataType get_dtype() const;
-    infinicore::quantization::QuantScheme get_quant_scheme() const;
-    std::shared_ptr<infinicore::nn::RoPE::ScalingConfig> get_rope_scaling() const;
+    infinilm::quantization::QuantScheme get_quant_scheme() const;
+
     void set_kv_quant_scheme(infinicore::DataType kv_cache_dtype) {
         this->quant_config.set_kv_quant_scheme(kv_cache_dtype);
     }
-    infinicore::quantization::KVQuantAlgo get_kv_quant_scheme() const {
+    infinilm::quantization::KVQuantAlgo get_kv_quant_scheme() const {
         return quant_config.get_kv_quant_scheme();
     }
     infinicore::DataType get_kv_cache_dtype() const {
@@ -102,8 +124,18 @@ public:
     // Stream output operator
     friend std::ostream &operator<<(std::ostream &os, const ModelConfig &config);
 
+    infinicore::nn::RoPE::Algo get_rope_algo() const {
+        return rope_algo_;
+    }
+
+    void set_rope_algo(infinicore::nn::RoPE::Algo algo) {
+        rope_algo_ = algo;
+    }
+
 private:
     nlohmann::json config_json;
     QuantConfig quant_config;
+
+    infinicore::nn::RoPE::Algo rope_algo_ = infinicore::nn::RoPE::Algo::GPT_NEOX;
 };
 } // namespace infinilm::config

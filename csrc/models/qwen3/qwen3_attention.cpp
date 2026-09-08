@@ -1,5 +1,6 @@
 #include "qwen3_attention.hpp"
 #include "../../global_state/global_state.hpp"
+#include "../../layers/attention/attention.hpp"
 #include "../../utils.hpp"
 
 namespace infinilm::models::qwen3 {
@@ -22,42 +23,20 @@ Qwen3Attention::Qwen3Attention(std::shared_ptr<infinilm::config::ModelConfig> mo
     const engine::distributed::RankInfo &rank_info = infinilm::global_state::get_tensor_model_parallel_rank_info();
     int tp_rank = infinilm::global_state::get_tensor_model_parallel_rank();
     int tp_size = infinilm::global_state::get_tensor_model_parallel_world_size();
-    if ((total_num_kv_heads < tp_size) || (0 != (total_num_kv_heads % tp_size))) {
-        throw std::runtime_error("infinilm::models::qwen3::Qwen3Attention: num_key_value_heads must be divisible by tp_size");
-    }
-
     num_attention_heads_ = total_num_heads / tp_size;
-    num_key_value_heads_ = total_num_kv_heads / tp_size;
+    num_key_value_heads_ = total_num_kv_heads < static_cast<size_t>(tp_size)
+                             ? 1
+                             : total_num_kv_heads / tp_size;
 
-    auto quant_scheme = model_config->get_quant_scheme();
     auto quantization_method = model_config->get_quantization_method();
-    switch (quant_scheme) {
-    case infinicore::quantization::QuantScheme::NONE: {
-        INFINILM_QKV_LINEAR_INIT(qkv_proj, "q_proj", "k_proj", "v_proj", hidden_size_, head_dim_, total_num_heads, total_num_kv_heads,
-                                 quantization_method, use_bias, dtype, device, rank_info);
-        INFINICORE_NN_MODULE_INIT(o_proj, total_num_heads * head_dim_, hidden_size_, quantization_method,
-                                  use_output_bias, dtype, device, tp_rank, tp_size, rank_info.comm);
-        break;
-    }
-    case infinicore::quantization::QuantScheme::COMPRESSED_TENSOR_W8A8I8: {
-        INFINILM_QKV_LINEAR_W8A8_INIT(qkv_proj, "q_proj", "k_proj", "v_proj", hidden_size_, head_dim_, total_num_heads, total_num_kv_heads,
-                                      quantization_method, use_bias, dtype, device, rank_info);
-        INFINICORE_NN_MODULE_INIT(o_proj, total_num_heads * head_dim_, hidden_size_, quantization_method,
-                                  use_output_bias, dtype, device, tp_rank, tp_size, rank_info.comm);
-        break;
-    }
-    case infinicore::quantization::QuantScheme::AWQ_W4A16: {
-        INFINILM_QKV_LINEAR_W4A16AWQ_INIT(qkv_proj, "q_proj", "k_proj", "v_proj", hidden_size_, head_dim_, total_num_heads, total_num_kv_heads,
-                                          quantization_method, use_bias, dtype, device, rank_info);
-        INFINICORE_NN_MODULE_INIT(o_proj, total_num_heads * head_dim_, hidden_size_, quantization_method,
-                                  use_output_bias, dtype, device, tp_rank, tp_size, rank_info.comm);
-        break;
-    }
-    default: {
-        throw std::runtime_error("infinilm::models::qwen3::Qwen3Attention: unsupported quantization scheme");
-        break;
-    }
-    }
+    auto register_fn = [this](const std::string &n, infinicore::nn::Parameter p) { this->register_parameter(n, std::move(p)); };
+    qkv_proj_ = std::make_shared<layers::linear::QKVParallelLinear>(
+        hidden_size_, head_dim_, total_num_heads, total_num_kv_heads,
+        "q_proj", "k_proj", "v_proj", register_fn,
+        quantization_method, use_bias, dtype, device, rank_info);
+    o_proj_ = this->register_module<layers::linear::RowParallelLinear>(
+        "o_proj", total_num_heads * head_dim_, hidden_size_, quantization_method,
+        use_output_bias, dtype, device, tp_rank, tp_size, rank_info.comm);
 
     rotary_emb_ = infinilm::layers::rotary_embedding::get_rope(model_config, device);
 
@@ -68,21 +47,7 @@ Qwen3Attention::Qwen3Attention(std::shared_ptr<infinilm::config::ModelConfig> mo
     INFINICORE_NN_MODULE_INIT(q_norm, head_dim_, rms_norm_eps, dtype, device);
     INFINICORE_NN_MODULE_INIT(k_norm, head_dim_, rms_norm_eps, dtype, device);
 
-    auto kv_quant_scheme = infinilm::global_state::get_infinilm_config().model_config->get_kv_quant_scheme();
-    switch (kv_quant_scheme) {
-    case (infinicore::quantization::KVQuantAlgo::NONE): {
-        break;
-    }
-    case (infinicore::quantization::KVQuantAlgo::INT8): {
-        INFINICORE_NN_PARAMETER_INIT(kv_cache_k_scale, ({1}, infinicore::DataType::F32, device, 0, 0, 1));
-        INFINICORE_NN_PARAMETER_INIT(kv_cache_v_scale, ({1}, infinicore::DataType::F32, device, 0, 0, 1));
-        break;
-    }
-    default: {
-        throw std::runtime_error("infinilm::layers::attention: unsupported kv_quant_scheme");
-        break;
-    }
-    }
+    infinilm::layers::attention::init_kv_cache_quant_params(register_fn, device, kv_cache_k_scale_, kv_cache_v_scale_);
 }
 
 infinicore::Tensor Qwen3Attention::forward(const infinicore::Tensor &positions,
@@ -126,12 +91,11 @@ infinicore::Tensor Qwen3Attention::forward_static_(const infinicore::Tensor &pos
     }
 
     // 4. Apply RoPE to QK
-    auto q_rope = infinicore::Tensor::empty({batch_size, num_attention_heads_, seq_len, head_dim_}, q_reshaped->dtype(), q_reshaped->device())->permute({0, 2, 1, 3});
-    rotary_emb_->forward(q_rope, q_reshaped, pos_ids_for_rope);
+    rotary_emb_->forward(q_reshaped, pos_ids_for_rope, true);
     rotary_emb_->forward(k_reshaped, pos_ids_for_rope, true);
 
     // 6. Attn Backend calculate
-    auto attn_output = attn_->forward(q_rope, k_reshaped, v_reshaped);
+    auto attn_output = attn_->forward(q_reshaped, k_reshaped, v_reshaped);
 
     // 7. Project output
     auto output = o_proj_->forward(attn_output);

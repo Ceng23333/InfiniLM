@@ -2,21 +2,23 @@
 Inference Server - HTTP API server for LLM inference.
 """
 
-from contextlib import asynccontextmanager
-import sys
-import time
+import asyncio
 import json
-import uuid
-import argparse
-import uvicorn
 import logging
 import os
-import asyncio
-from infinilm.base_config import BaseConfig
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-
-from infinilm.llm import AsyncLLMEngine, SamplingParams, FinishReason
+from infinilm.base_config import BaseConfig
+from infinilm.config import KVTransferConfig
+from infinilm.llm import AsyncLLMEngine, FinishReason, SamplingParams
+from infinilm.moe_config import configure_moe_ep_backend
 from infinilm.server.openai_protocol import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger(__name__)
@@ -29,19 +31,20 @@ def chunk_json(
     id_,
     content=None,
     role=None,
+    tool_calls=None,
     finish_reason=None,
     model: str = "unknown",
-    tool_calls=None,
+    usage=None,
 ):
     """Generate JSON chunk for streaming response."""
     delta = {}
-    if content:
+    if content is not None:
         delta["content"] = content
     if role:
         delta["role"] = role
     if tool_calls:
         delta["tool_calls"] = tool_calls
-    return {
+    payload = {
         "id": id_,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
@@ -57,6 +60,9 @@ def chunk_json(
             }
         ],
     }
+    if usage is not None:
+        payload["usage"] = usage
+    return payload
 
 
 def completion_json(
@@ -71,12 +77,10 @@ def completion_json(
     tool_calls=None,
 ):
     """Generate JSON response for non-streaming completion."""
-    message = {
-        "role": role,
-        "content": content,
-    }
+    message = {"role": role, "content": content}
     if tool_calls:
         message["tool_calls"] = tool_calls
+
     return {
         "id": id_,
         "object": "chat.completion",
@@ -108,6 +112,13 @@ class InferenceServer:
         device: str = "cuda",
         dtype: str = "float16",
         tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        pipeline_parallel_stage: int = 0,
+        master_addr: str = "127.0.0.1",
+        master_port: int = 29500,
+        moe_ep_backend: str = "disabled",
+        moe_ep_size: int = 1,
+        use_legacy_moe: bool = False,
         cache_type: str = "paged",
         max_tokens: int = 4096,
         max_batch_size: int = 16,
@@ -121,7 +132,13 @@ class InferenceServer:
         port: int = 8000,
         enable_graph: bool = False,
         attn_backend: str = "default",
+        use_mla: bool = False,
+        skip_load: bool = False,
+        weight_load_mode: str = "async",
         ignore_eos: bool = False,
+        kv_transfer_config: Optional[KVTransferConfig] = None,
+        enable_prefix_caching: bool = True,
+        pre_transpose: bool = False,
     ):
         """Initialize inference server.
 
@@ -130,6 +147,9 @@ class InferenceServer:
             device: Device type ('cpu', 'cuda', 'mlu', 'moore').
             dtype: Data type ('float16', 'bfloat16', 'float32').
             tensor_parallel_size: Number of devices for tensor parallelism.
+            moe_ep_backend: MoE expert-parallel backend.
+            moe_ep_size: MoE expert-parallel size.
+            use_legacy_moe: Whether to use the legacy Qwen3 MoE implementation.
             cache_type: Cache type ('paged' or 'static').
             max_tokens: Default maximum tokens to generate.
             max_batch_size: Maximum batch size for inference (only for paged cache).
@@ -143,6 +163,11 @@ class InferenceServer:
             port: Server port number.
             enable_graph: Whether to enable graph compiling.
             attn_backend: Attention backend to use ('default', 'flash-attn').
+            use_mla: Whether to use DeepSeek V2 MLA attention when supported.
+            skip_load: Whether to skip loading model weights.
+            weight_load_mode: Weight loading mode across tensor-parallel workers.
+            ignore_eos: Whether to ignore EOS tokens during generation.
+            kv_transfer_config: Optional configuration for the KV transfer mechanism.
         """
         self.model_path = model_path
         # vLLM-like served model id: directory name of model_path
@@ -150,6 +175,13 @@ class InferenceServer:
         self.device = device
         self.dtype = dtype
         self.tensor_parallel_size = tensor_parallel_size
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.pipeline_parallel_stage = pipeline_parallel_stage
+        self.master_addr = master_addr
+        self.master_port = master_port
+        self.moe_ep_backend = moe_ep_backend
+        self.moe_ep_size = moe_ep_size
+        self.use_legacy_moe = use_legacy_moe
         self.cache_type = cache_type
         self.max_tokens = max_tokens
         self.max_batch_size = max_batch_size
@@ -163,7 +195,13 @@ class InferenceServer:
         self.port = port
         self.enable_graph = enable_graph
         self.attn_backend = attn_backend
+        self.use_mla = use_mla
+        self.skip_load = skip_load
+        self.weight_load_mode = weight_load_mode
         self.ignore_eos = ignore_eos
+        self.kv_transfer_config = kv_transfer_config
+        self.enable_prefix_caching = enable_prefix_caching
+        self.pre_transpose = pre_transpose
 
         self.engine: AsyncLLMEngine = None
 
@@ -184,6 +222,13 @@ class InferenceServer:
                 device=self.device,
                 dtype=self.dtype,
                 tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                pipeline_parallel_stage=self.pipeline_parallel_stage,
+                master_addr=self.master_addr,
+                master_port=self.master_port,
+                moe_ep_backend=self.moe_ep_backend,
+                moe_ep_size=self.moe_ep_size,
+                use_legacy_moe=self.use_legacy_moe,
                 cache_type=self.cache_type,
                 max_batch_size=self.max_batch_size,
                 max_tokens=self.max_tokens,
@@ -195,6 +240,12 @@ class InferenceServer:
                 top_k=self.top_k,
                 enable_graph=self.enable_graph,
                 attn_backend=self.attn_backend,
+                use_mla=self.use_mla,
+                skip_load=self.skip_load,
+                weight_load_mode=self.weight_load_mode,
+                kv_transfer_config=self.kv_transfer_config,
+                enable_prefix_caching=self.enable_prefix_caching,
+                pre_transpose=self.pre_transpose,
             )
             self.engine.start()
             logger.info(f"Engine initialized with model at {self.model_path}")
@@ -216,29 +267,24 @@ class InferenceServer:
         async def chat_completions(request: Request):
             try:
                 data = await request.json()
-                logger.debug(f"Received request data: {data}")
+                # logger.debug(f"Received request data: {data}")
             except Exception as e:
                 logger.error(f"Failed to parse request JSON: {e}")
-                return JSONResponse(content={"error": "Invalid JSON"}, status_code=400)
+                return self._error_response("Invalid JSON", status_code=400)
+
+            try:
+                self._validate_request(data)
+            except ValueError as exc:
+                return self._error_response(str(exc), status_code=400)
 
             if not data.get("messages"):
                 if not data.get("prompt"):
-                    return JSONResponse(
-                        content={"error": "No message provided"}, status_code=400
-                    )
+                    return self._error_response("No message provided", status_code=400)
                 else:
                     data["messages"] = [{"role": "user", "content": data.get("prompt")}]
 
             # Normalize messages to handle multimodal content (list format)
-            data["messages"] = self._normalize_messages(data.get("messages", []))
-
-            # Forward OpenAI tools into chat_template_kwargs for tokenizer templates.
-            chat_template_kwargs = dict(data.get("chat_template_kwargs") or {})
-            tools = data.get("tools")
-            tool_choice = data.get("tool_choice", "auto")
-            if tools and tool_choice != "none":
-                chat_template_kwargs["tools"] = tools
-            data["chat_template_kwargs"] = chat_template_kwargs
+            data["messages"] = data.get("messages", [])
 
             stream = data.get("stream", False)
             request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -320,6 +366,85 @@ class InferenceServer:
 
         return normalized
 
+    @staticmethod
+    def _error_response(message: str, status_code: int = 500) -> JSONResponse:
+        error_type = "invalid_request_error" if status_code < 500 else "server_error"
+        return JSONResponse(
+            content={
+                "error": {
+                    "message": message,
+                    "type": error_type,
+                    "param": None,
+                    "code": None,
+                }
+            },
+            status_code=status_code,
+        )
+
+    @staticmethod
+    def _validate_request(data: dict) -> None:
+        if not isinstance(data, dict):
+            raise ValueError("Request body must be a JSON object")
+        if "messages" in data and not isinstance(data["messages"], list):
+            raise ValueError("messages must be an array")
+
+        tools = data.get("tools")
+        if tools is not None:
+            if not isinstance(tools, list):
+                raise ValueError("tools must be an array")
+            for tool in tools:
+                if (
+                    not isinstance(tool, dict)
+                    or tool.get("type") != "function"
+                    or not isinstance(tool.get("function"), dict)
+                    or not tool["function"].get("name")
+                ):
+                    raise ValueError(
+                        "each tool must be a function with a non-empty name"
+                    )
+
+        tool_choice = data.get("tool_choice")
+        if isinstance(tool_choice, str):
+            if tool_choice not in ("auto", "none", "required"):
+                raise ValueError("tool_choice must be auto, none, or required")
+        elif tool_choice is not None and not isinstance(tool_choice, dict):
+            raise ValueError("tool_choice must be a string or object")
+
+    @staticmethod
+    def _build_chat_template_kwargs(data: dict) -> dict:
+        raw_kwargs = data.get("chat_template_kwargs") or {}
+        if not isinstance(raw_kwargs, dict):
+            raise ValueError("chat_template_kwargs must be an object")
+        kwargs = raw_kwargs.copy()
+
+        tools = data.get("tools")
+        tool_choice = data.get("tool_choice")
+        if tools and tool_choice != "none":
+            if isinstance(tool_choice, dict):
+                function = tool_choice.get("function") or {}
+                function_name = function.get("name")
+                if function_name:
+                    tools = [
+                        tool
+                        for tool in tools
+                        if tool.get("function", {}).get("name") == function_name
+                    ]
+                    if not tools:
+                        raise ValueError(
+                            f"tool_choice references unknown function {function_name!r}"
+                        )
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+
+        for key in ("enable_thinking", "reasoning_effort", "preserve_thinking"):
+            if key in data:
+                kwargs[key] = data[key]
+
+        thinking = data.get("thinking")
+        if isinstance(thinking, dict) and "type" in thinking:
+            kwargs["enable_thinking"] = thinking["type"] != "disabled"
+        return kwargs
+
     def _build_sampling_params(self, data: dict) -> SamplingParams:
         """Build SamplingParams from request data."""
         # Support both:
@@ -337,11 +462,16 @@ class InferenceServer:
                 return sp.get(key)
             return default
 
-        # Accept common alias
-        max_tokens = pick("max_tokens", self.max_tokens)
+        max_tokens = None
+        for key in ("max_tokens", "max_completion_tokens", "max_new_tokens"):
+            if key in data and data[key] is not None:
+                max_tokens = data[key]
+                break
+            if key in sp and sp[key] is not None:
+                max_tokens = sp[key]
+                break
         if max_tokens is None:
-            # Some clients use max_new_tokens
-            max_tokens = pick("max_new_tokens", self.max_tokens)
+            max_tokens = self.max_tokens
 
         stop = pick("stop", None)
         if isinstance(stop, str):
@@ -359,25 +489,26 @@ class InferenceServer:
     async def _stream_chat(self, request_id: str, data: dict, http_request: Request):
         """Handle streaming chat request."""
         req = None
+        _abort_reason = FinishReason.CANCELED
 
         try:
             messages = data.get("messages", [])
             sampling_params = self._build_sampling_params(data)
+            chat_template_kwargs = self._build_chat_template_kwargs(data)
 
             req = self.engine.add_chat_request(
                 messages=messages,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 request_data=data,
-                http_request=http_request,
                 add_generation_prompt=bool(data.get("add_generation_prompt", True)),
-                chat_template_kwargs=data.get("chat_template_kwargs") or {},
+                chat_template_kwargs=chat_template_kwargs,
             )
+            role_chunk = chunk_json(request_id, role="assistant", model=self.model_id)
+            yield f"data: {json.dumps(role_chunk)}\n\n"
 
             tool_parser = (
-                ToolCallStreamParser()
-                if (data.get("chat_template_kwargs") or {}).get("tools")
-                else None
+                ToolCallStreamParser() if chat_template_kwargs.get("tools") else None
             )
             tool_call_index = 0
 
@@ -389,10 +520,8 @@ class InferenceServer:
                 # Check client disconnect
                 if await http_request.is_disconnected():
                     logger.info(f"Client disconnected for request {request_id}")
-                    req.mark_canceled()
                     break
 
-                # If stream_request enforces timeout, we can just surface the state to the client.
                 if token_output.finish_reason == FinishReason.TIMEOUT:
                     logger.warning(
                         f"Request {request_id} timed out after {DEFAULT_REQUEST_TIMEOUT}s"
@@ -425,66 +554,59 @@ class InferenceServer:
                         content_parts, tool_calls = tool_parser.feed(
                             token_output.token_text
                         )
-                    for part in content_parts:
-                        if not part:
-                            continue
-                        chunk = json.dumps(
-                            chunk_json(
-                                request_id,
-                                content=part,
-                                model=self.model_id,
-                            ),
-                            ensure_ascii=False,
+                    for content_part in content_parts:
+                        chunk = chunk_json(
+                            request_id, content=content_part, model=self.model_id
                         )
-                        yield f"data: {chunk}\n\n"
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     for tool_call in tool_calls:
                         delta_call = {"index": tool_call_index, **tool_call}
                         tool_call_index += 1
-                        chunk = json.dumps(
-                            chunk_json(
-                                request_id,
-                                tool_calls=[delta_call],
-                                model=self.model_id,
-                            ),
-                            ensure_ascii=False,
+                        chunk = chunk_json(
+                            request_id,
+                            tool_calls=[delta_call],
+                            model=self.model_id,
                         )
-                        yield f"data: {chunk}\n\n"
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
                 if token_output.finished:
                     if tool_parser is not None:
                         content_parts, tool_calls = tool_parser.finalize()
-                        for part in content_parts:
-                            if not part:
-                                continue
-                            chunk = json.dumps(
-                                chunk_json(
-                                    request_id,
-                                    content=part,
-                                    model=self.model_id,
-                                ),
-                                ensure_ascii=False,
+                        for content_part in content_parts:
+                            chunk = chunk_json(
+                                request_id, content=content_part, model=self.model_id
                             )
-                            yield f"data: {chunk}\n\n"
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                         for tool_call in tool_calls:
                             delta_call = {"index": tool_call_index, **tool_call}
                             tool_call_index += 1
-                            chunk = json.dumps(
-                                chunk_json(
-                                    request_id,
-                                    tool_calls=[delta_call],
-                                    model=self.model_id,
-                                ),
-                                ensure_ascii=False,
+                            chunk = chunk_json(
+                                request_id,
+                                tool_calls=[delta_call],
+                                model=self.model_id,
                             )
-                            yield f"data: {chunk}\n\n"
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     finish_reason = self._convert_finish_reason(
                         token_output.finish_reason
                     )
                     if tool_parser is not None and tool_parser.has_tool_calls:
                         finish_reason = "tool_calls"
+                    usage = None
+                    stream_options = data.get("stream_options")
+                    if isinstance(stream_options, dict) and stream_options.get(
+                        "include_usage"
+                    ):
+                        usage = {
+                            "prompt_tokens": req.get_prompt_length(),
+                            "completion_tokens": req.get_num_generated_tokens(),
+                            "total_tokens": req.get_total_length(),
+                        }
                     chunk = json.dumps(
                         chunk_json(
-                            request_id, finish_reason=finish_reason, model=self.model_id
+                            request_id,
+                            finish_reason=finish_reason,
+                            model=self.model_id,
+                            usage=usage,
                         ),
                         ensure_ascii=False,
                     )
@@ -492,15 +614,14 @@ class InferenceServer:
                     break
 
         except asyncio.CancelledError:
+            # Starlette cancelled us (client disconnected); stream_request will be
+            # aclose()'d automatically via the async-for destructor.
             logger.info(f"Request {request_id} was cancelled")
-            if req:
-                req.mark_canceled()
             raise
 
         except Exception as e:
             logger.error(f"Stream error for {request_id}: {e}", exc_info=True)
-            if req:
-                req.mark_failed()
+            _abort_reason = FinishReason.ERROR
             error_chunk = json.dumps(
                 chunk_json(
                     request_id,
@@ -513,28 +634,29 @@ class InferenceServer:
             yield f"data: {error_chunk}\n\n"
 
         finally:
+            # Unified abort: reason is ERROR if we got here via Exception, else CANCELED.
+            # req.close() is handled by stream_request.finally.
             if req and not req.is_finished():
-                req.mark_canceled()
-            if req:
-                await req.close()
-            yield "data: [DONE]\n\n"
+                self.engine.add_aborted_req(req, _abort_reason)
+        yield "data: [DONE]\n\n"
 
     async def _chat(self, request_id: str, data: dict, http_request: Request):
         """Handle non-streaming chat request."""
         req = None
+        _abort_reason = FinishReason.CANCELED
 
         try:
             messages = data.get("messages", [])
             sampling_params = self._build_sampling_params(data)
+            chat_template_kwargs = self._build_chat_template_kwargs(data)
 
             req = self.engine.add_chat_request(
                 messages=messages,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 request_data=data,
-                http_request=http_request,
                 add_generation_prompt=bool(data.get("add_generation_prompt", True)),
-                chat_template_kwargs=data.get("chat_template_kwargs") or {},
+                chat_template_kwargs=chat_template_kwargs,
             )
 
             # Collect all generated tokens
@@ -547,7 +669,6 @@ class InferenceServer:
                 # Check client disconnect
                 if await http_request.is_disconnected():
                     logger.info(f"Client disconnected for request {request_id}")
-                    req.mark_canceled()
                     break
 
                 # Request-level timeout is handled inside stream_request.
@@ -569,7 +690,7 @@ class InferenceServer:
             output_text = output_text.strip()
             finish_reason = self._convert_finish_reason(req.finish_reason)
             tool_calls = None
-            if (data.get("chat_template_kwargs") or {}).get("tools"):
+            if chat_template_kwargs.get("tools"):
                 output_text, tool_calls = parse_tool_calls(output_text)
                 if tool_calls:
                     finish_reason = "tool_calls"
@@ -589,21 +710,18 @@ class InferenceServer:
 
         except asyncio.CancelledError:
             logger.info(f"Request {request_id} was cancelled")
-            if req:
-                req.mark_canceled()
             raise
 
         except Exception as e:
             logger.error(f"Chat error for {request_id}: {e}", exc_info=True)
-            if req:
-                req.mark_failed()
-            return JSONResponse(content={"error": str(e)}, status_code=500)
+            _abort_reason = FinishReason.ERROR
+            return self._error_response(str(e), status_code=500)
 
         finally:
+            # Unified abort: reason is ERROR if we got here via Exception, else CANCELED.
+            # req.close() is handled by stream_request.finally.
             if req and not req.is_finished():
-                req.mark_canceled()
-            if req:
-                await req.close()
+                self.engine.add_aborted_req(req, _abort_reason)
 
     def _convert_finish_reason(self, reason: FinishReason) -> str:
         """Convert FinishReason enum to string."""
@@ -631,16 +749,61 @@ def setup_logging(log_level: str = "INFO"):
     )
 
 
+def parse_kv_transfer_config(kv_transfer_config_str: str) -> KVTransferConfig:
+    """Parse JSON string into KVTransferConfig."""
+    kv_dict = json.loads(kv_transfer_config_str)
+    if not isinstance(kv_dict, dict):
+        raise ValueError("--kv-transfer-config must be a JSON object")
+
+    return KVTransferConfig(
+        kv_connector=kv_dict.get("kv_connector", None),
+        engine_id=kv_dict.get("engine_id", None),
+        kv_role=kv_dict.get("kv_role", None),
+        kv_connector_extra_config=kv_dict.get("kv_connector_extra_config", None),
+    )
+
+
 def main():
     cfg = BaseConfig()
     setup_logging(cfg.log_level)
+    if cfg.pp > 1 and cfg.node_rank > 0:
+        from infinilm.server.pipeline_worker import run_worker
+
+        run_worker(cfg)
+        return
+
     device = cfg.get_device_str(cfg.device)
+
+    kv_transfer_config = None
+    if cfg.kv_transfer_config:
+        kv_transfer_config = parse_kv_transfer_config(cfg.kv_transfer_config)
+
+    if cfg.use_legacy_moe:
+        moe_ep_backend, ep = "disabled", 1
+    else:
+        moe_ep_backend, ep = configure_moe_ep_backend(
+            cfg.tp, cfg.dp, cfg.ep, cfg.moe_ep_backend, cfg.model
+        )
+    logger.info(
+        "MoE EP backend: %s  TP=%s  DP=%s  EP=%s",
+        moe_ep_backend,
+        cfg.tp,
+        cfg.dp,
+        ep,
+    )
 
     server = InferenceServer(
         model_path=cfg.model,
         device=device,
         dtype=cfg.dtype,
         tensor_parallel_size=cfg.tp,
+        pipeline_parallel_size=cfg.pp,
+        pipeline_parallel_stage=cfg.node_rank,
+        master_addr=cfg.master_addr,
+        master_port=cfg.master_port,
+        moe_ep_backend=moe_ep_backend,
+        moe_ep_size=ep,
+        use_legacy_moe=cfg.use_legacy_moe,
         cache_type="paged" if cfg.enable_paged_attn else "static",
         max_tokens=cfg.max_new_tokens,
         max_batch_size=cfg.max_batch_size,
@@ -654,7 +817,13 @@ def main():
         port=cfg.port,
         enable_graph=cfg.enable_graph,
         attn_backend=cfg.attn,
+        use_mla=cfg.use_mla,
+        skip_load=cfg.skip_load,
+        weight_load_mode=cfg.weight_load_mode,
         ignore_eos=cfg.ignore_eos,
+        kv_transfer_config=kv_transfer_config,
+        enable_prefix_caching=cfg.enable_prefix_caching,
+        pre_transpose=cfg.pre_transpose,
     )
     server.start()
 

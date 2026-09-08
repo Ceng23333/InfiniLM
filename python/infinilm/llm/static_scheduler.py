@@ -4,14 +4,15 @@ Static Scheduler - Single-batch request scheduling for Static KV Cache.
 
 import logging
 import queue
-import janus
 from typing import List, Optional
 
-from infinilm.llm.cache_manager import BlockManager
+import janus
+
+from infinilm.llm.prefix_cache import BlockHash
 from infinilm.llm.request import (
-    RequestStatus,
-    InferenceRequest,
     FinishReason,
+    InferenceRequest,
+    RequestStatus,
     TokenOutput,
 )
 
@@ -33,61 +34,7 @@ class StaticSchedulerOutput:
         self.num_requests = len(scheduled_requests)
         self.is_prefill = is_prefill
         self.prefix_hit_len = prefix_hit_len
-
-    def build_model_inputs(
-        self, temperature: float = 1.0, top_p: float = 0.8, top_k: int = 1
-    ):
-        """Construct model inputs for prefill or decode phase.
-
-        Static cache model inputs:
-
-        Prefill phase (with prefix cache reuse):
-            - input_ids: Tokens after the cached prefix [1, prompt_length - prefix_hit_len]
-            - position_ids: [prefix_hit_len, ..., prompt_length-1]
-            - past_kv_lengths: [prefix_hit_len]  (reuse cached prefix)
-            - total_kv_lengths: [prompt_length]
-
-        Decode phase:
-            - input_ids: Only the last generated token [1, 1]
-            - position_ids: [current_position] (position in full sequence)
-            - past_kv_lengths: [num_cached_tokens]
-            - total_kv_lengths: [total_tokens]
-        """
-        req = self.scheduled_requests[0]
-
-        if self.is_prefill:
-            # Prefill: only send tokens not already in cache
-            tokens = req.get_input_tokens()
-            prefix_hit_len = self.prefix_hit_len
-            input_tokens = tokens[prefix_hit_len:]
-            input_ids = [input_tokens]
-            position_ids = [list(range(prefix_hit_len, len(tokens)))]
-            past_kv_len = prefix_hit_len
-            total_kv_len = len(tokens)
-            input_offsets = [0, len(input_tokens)]
-        else:
-            # Decode: send only the last generated token
-            last_token = req.generated_token_ids[-1]
-            current_position = req.get_total_length() - 1
-            input_ids = [[last_token]]
-            position_ids = [[current_position]]
-            past_kv_len = current_position
-            total_kv_len = req.get_total_length()
-            input_offsets = [0, 1]
-
-        return {
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "past_kv_lengths": [past_kv_len],
-            "total_kv_lengths": [total_kv_len],
-            "input_offsets": input_offsets,
-            "cu_seqlens": [0, total_kv_len],
-            "block_tables": None,
-            "slot_mapping": None,
-            "temperature": temperature,
-            "top_k": top_k,
-            "top_p": top_p,
-        }
+        self.kv_connector_metadata = None
 
 
 class StaticScheduler:
@@ -100,15 +47,25 @@ class StaticScheduler:
     - Prefix cache reuse via chained block hashing (block size = _BLOCK_SIZE)
     """
 
-    def __init__(self, max_cache_len: int = 4096):
+    def __init__(
+        self,
+        max_cache_len: int = 4096,
+        enable_prefix_caching: bool = True,
+    ):
         self.waiting_queue = janus.Queue()
         self.running_request: Optional[InferenceRequest] = None
         self.max_cache_len = max_cache_len
-        self.cached_block_hashes: List[int] = []
-        self.pending_block_hashes: List[int] = []
+        self.enable_prefix_caching = enable_prefix_caching
+        self.cached_block_hashes: List[BlockHash] = []
 
     def add_request(self, request: InferenceRequest):
         if request is not None:
+            # TODO: Remove the multimodal exclusion once media-aware prefix
+            # hashing and model-side cache-boundary handling are supported.
+            request.initialize_block_hashes(
+                _BLOCK_SIZE,
+                self.enable_prefix_caching and not request.has_multimodal_inputs,
+            )
             request.status = RequestStatus.WAITING
             self.waiting_queue.sync_q.put(request)
 
@@ -147,23 +104,6 @@ class StaticScheduler:
                         )
                     continue
 
-                total_length = req.get_total_length()
-                if total_length % _BLOCK_SIZE == 1 and total_length > _BLOCK_SIZE:
-                    block_index = total_length // _BLOCK_SIZE - 1
-                    if len(self.cached_block_hashes) <= block_index:
-                        all_tokens = req.get_all_token_ids()
-                        block_tokens = all_tokens[-(_BLOCK_SIZE + 1) : -1]
-                        prev_h = (
-                            self.cached_block_hashes[-1]
-                            if self.cached_block_hashes
-                            else -1
-                        )
-                        new_h = BlockManager.compute_hash(block_tokens, prev_h)
-                        self.cached_block_hashes.append(new_h)
-                        logger.debug(
-                            f"Decode: appended block hash at index {block_index}"
-                        )
-
                 return StaticSchedulerOutput(scheduled_requests=[req], is_prefill=False)
 
             # Case 2: Get new request from waiting queue (prefill phase)
@@ -201,40 +141,27 @@ class StaticScheduler:
                     )
                 continue
 
-            tokens = req.prompt_token_ids
-            num_full_blocks = prompt_len // _BLOCK_SIZE
             matched = 0
 
-            self.pending_block_hashes.clear()
-
-            for i in range(num_full_blocks):
-                prev_h = self.cached_block_hashes[i - 1] if i > 0 else -1
-                h = BlockManager.compute_hash(
-                    tokens[i * _BLOCK_SIZE : (i + 1) * _BLOCK_SIZE], prev_h
-                )
-                if (
-                    i < len(self.cached_block_hashes)
-                    and h == self.cached_block_hashes[i]
-                ):
-                    matched = i + 1
-                else:
-                    del self.cached_block_hashes[i:]
-                    cur_h = h
-                    self.pending_block_hashes.append(cur_h)
-                    for j in range(i + 1, num_full_blocks):
-                        cur_h = BlockManager.compute_hash(
-                            tokens[j * _BLOCK_SIZE : (j + 1) * _BLOCK_SIZE],
-                            cur_h,
-                        )
-                        self.pending_block_hashes.append(cur_h)
-                    break
+            if self.enable_prefix_caching:
+                for block_idx in range(len(req.block_hashes)):
+                    if (
+                        block_idx >= len(self.cached_block_hashes)
+                        or req.block_hashes[block_idx]
+                        != self.cached_block_hashes[block_idx]
+                    ):
+                        break
+                    matched += 1
+                self.cached_block_hashes = self.cached_block_hashes[:matched]
             else:
-                del self.cached_block_hashes[matched:]
+                self.cached_block_hashes.clear()
 
-            prefix_hit_len = matched * _BLOCK_SIZE
+            # Leave the last prompt token for a non-empty model input.
+            prefix_hit_len = min(matched * _BLOCK_SIZE, max(prompt_len - 1, 0))
+
             logger.info(
-                f"Prefill cache match: {matched}/{num_full_blocks} blocks "
-                f"({prefix_hit_len} tokens reused, {len(self.pending_block_hashes)} pending)"
+                f"Prefill cache match: {matched}/{len(req.block_hashes)} blocks "
+                f"({prefix_hit_len} tokens reused)"
             )
 
             req.status = RequestStatus.RUNNING
@@ -243,13 +170,30 @@ class StaticScheduler:
                 scheduled_requests=[req], is_prefill=True, prefix_hit_len=prefix_hit_len
             )
 
-    def update_cache(self):
-        """Commit hashes computed during prefill into the confirmed cache hash list."""
-        self.cached_block_hashes.extend(self.pending_block_hashes)
-        self.pending_block_hashes.clear()
-        logger.debug(
-            f"update_cache: cached_block_hashes now has {len(self.cached_block_hashes)} blocks"
+    def commit_computed_tokens(
+        self, request: InferenceRequest, num_computed_tokens: int
+    ) -> None:
+        """Publish the current request's computed static-cache prefix."""
+        if not self.enable_prefix_caching:
+            self.cached_block_hashes.clear()
+            return
+        num_computed_blocks = min(
+            num_computed_tokens // _BLOCK_SIZE,
+            len(request.block_hashes),
         )
+        if len(self.cached_block_hashes) > num_computed_blocks:
+            del self.cached_block_hashes[num_computed_blocks:]
+        start_block = len(self.cached_block_hashes)
+        if start_block == num_computed_blocks:
+            return
+
+        self.cached_block_hashes.extend(
+            request.block_hashes[start_block:num_computed_blocks]
+        )
+
+    def update_from_output(self, model_output):
+        """Static cache has no scheduler-side connector state to update."""
+        return None
 
     def complete_requests(self, requests: List[InferenceRequest]):
         """Handle completed requests."""

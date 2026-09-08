@@ -1,8 +1,11 @@
 #pragma once
 
+#include "../../global_state/global_state.hpp"
 #include "../../models/infinilm_model.hpp"
 #include "../linear/linear.hpp"
 #include "infinicore/device.hpp"
+#include "infinicore/ops/select_last_token_hidden.hpp"
+#include <stdexcept>
 
 namespace infinilm::layers::causal_lm_templates {
 
@@ -34,9 +37,14 @@ public:
         size_t hidden_size = model_config->get<size_t>("hidden_size");
         size_t vocab_size = model_config->get<size_t>("vocab_size");
         const auto &dtype{model_config->get_dtype()};
+        const auto &rank_info = infinilm::global_state::get_tensor_model_parallel_rank_info();
+        pp_size_ = static_cast<size_t>(rank_info.pp_size);
+        pp_stage_ = static_cast<size_t>(rank_info.pp_stage);
 
         model_ = this->register_module<Model>("model", model_config, device);
-        lm_head_ = this->register_module<infinilm::layers::linear::ReplicatedLinear>("lm_head", hidden_size, vocab_size, false, dtype, device);
+        if (is_last_pp_stage()) {
+            lm_head_ = this->register_module<infinilm::layers::linear::ReplicatedLinear>("lm_head", hidden_size, vocab_size, false, dtype, device);
+        }
     }
 
     /**
@@ -44,11 +52,34 @@ public:
      */
     Output forward(const Input &input) const override {
         auto hidden_states = model_->forward(input);
-        auto logits = lm_head_->forward(hidden_states);
-        return {logits};
+        if (!is_last_pp_stage()) {
+            return {infinicore::Tensor(), hidden_states};
+        }
+
+        auto lm_head_input = hidden_states;
+        if (!input.sample_all_positions && input.input_offsets.has_value()) {
+            const size_t num_requests = input.input_offsets.value()->numel() - 1;
+            const bool is_packed_prefill = hidden_states->ndim() == 3
+                                        && hidden_states->size(0) == 1
+                                        && hidden_states->size(1) > num_requests;
+            if (is_packed_prefill) {
+                lm_head_input = infinicore::Tensor::empty(
+                    {1, num_requests, hidden_states->size(2)},
+                    hidden_states->dtype(),
+                    hidden_states->device());
+                infinicore::op::select_last_token_hidden_(
+                    lm_head_input, hidden_states, input.input_offsets.value());
+            }
+        }
+
+        auto logits = lm_head_->forward(lm_head_input);
+        return {logits, hidden_states};
     }
 
     infinicore::Tensor logits_from_hidden(const infinicore::Tensor &hidden_states) const {
+        if (!lm_head_) {
+            throw std::runtime_error("TextCausalLM::logits_from_hidden called on a non-last pipeline stage");
+        }
         return lm_head_->forward(const_cast<infinicore::Tensor &>(hidden_states));
     }
 
@@ -57,6 +88,12 @@ public:
 protected:
     INFINICORE_NN_MODULE(Model, model);
     INFINICORE_NN_MODULE(infinilm::layers::linear::ReplicatedLinear, lm_head);
+
+private:
+    bool is_last_pp_stage() const { return pp_stage_ + 1 == pp_size_; }
+
+    size_t pp_size_{1};
+    size_t pp_stage_{0};
 };
 
 } // namespace infinilm::layers::causal_lm_templates

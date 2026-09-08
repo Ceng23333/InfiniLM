@@ -30,37 +30,52 @@
     git submodule update --init --recursive
     ```
 
-
-  - 选择是否使用kv caching，默认为false；在支持了此算子的平台(英伟达、阿里、天数、沐曦、海光、QY)可以使用
-    ```bash
-      xmake f --use-kv-caching= [true | false] -cv
-    ```
-
-
   - 安装 InfiniLM Python 包
     ```bash
       pip install -e .
     ```
 
+    使用 CoreX PyTorch 时，需要让 InfiniLM 与 PyTorch/InfiniCore
+    使用相同的 libstdc++ ABI：
+
+    ```bash
+    export INFINILM_CXX11_ABI=0
+    pip install -e .
+    ```
+
   - 单次推理测试
     - llama示例
     ```bash
-    python examples/jiuge.py --device [cpu | nvidia | qy | metax | moore | iluvatar | ali | cambricon | hygon] --model=<path/to/model_dir>
+    python examples/test_infer.py --device [cpu | nvidia | qy | metax | moore | iluvatar | ali | cambricon | hygon] --model=<path/to/model_dir>
     ```
     - 例如：
     ```bash
-    python examples/jigue.py --device=nvidia --model=/models/TinyLlama-1.1B-Chat-v1.0
+    python examples/test_infer.py --device=nvidia --model=/models/TinyLlama-1.1B-Chat-v1.0
     ```
   - 分布式推理测试
       - 9g示例
       ```bash
-    python examples/jiuge.py [-- device nvidia] --model=<path/to/model> --backend=cpp --tp=NDEV --batch-size=MAX_BATCH
+    python examples/test_infer.py [-- device nvidia] --model=<path/to/model> --backend=cpp --tp=NDEV --batch-size=MAX_BATCH
     ```
 
     - 例如： 9G7B模型，cpp后端，batch_size为16，4卡分布式
     ```bash
-    python examples/jiuge.py --device nvidia --model=/models/9G7B_MHA/ --backend=cpp --tp=4 --batch-size=16
+    python examples/test_infer.py --device nvidia --model=/models/9G7B_MHA/ --backend=cpp --tp=4 --batch-size=16
     ```
+
+    - PP=2 示例：
+
+      在两个终端中分别启动 stage 0 和 stage 1。两个进程的模型、并行和缓存参数必须保持一致。
+
+      ```bash
+      # Terminal 1: stage 0 / coordinator (--node-rank=0)
+      CUDA_VISIBLE_DEVICES=0 python examples/test_infer.py --device=nvidia --model=<path/to/model> --tp=1 --pp=2 --node-rank=0 --master-addr=127.0.0.1 --master-port=29500 --enable-paged-attn --attn=flash-attn --num-blocks=128
+
+      # Terminal 2: stage 1 / worker
+      CUDA_VISIBLE_DEVICES=1 python examples/test_infer.py --device=nvidia --model=<path/to/model> --tp=1 --pp=2 --node-rank=1 --master-addr=127.0.0.1 --master-port=29500 --enable-paged-attn --attn=flash-attn --num-blocks=128
+      ```
+
+      跨节点运行时，每个节点的命令中的 `--master-addr` 和 `--master-port` 设置为 stage 0 节点的 IP 地址和通信端口。
 
 
   - 推理服务测试
@@ -79,9 +94,31 @@
       CUDA_VISIBLE_DEVICES=0,1,2,3 python python/infinilm/server/inference_server.py --device nvidia --model=/models/9G7B_MHA/ --max-new-tokens=100 --max-batch-size=32 --tp=4 --temperature=1.0 --top-p=0.8 --top-k=1
       ```
     
+    - 使用paged attention, flash attention后端，cuda graph等功能：
+      ```bash
+      CUDA_VISIBLE_DEVICES=0,1,2,3 python python/infinilm/server/inference_server.py --device nvidia --model=/models/9G7B_MHA/ --enable-paged-attn --attn=flash-attn --enable-graph
+      ```
+
+    - PP=2 推理服务示例：
+
+      只有 stage 0 启动 HTTP 服务。两个进程使用相同的 PP rendezvous 地址和模型配置。
+
+      ```bash
+      # Terminal 1: stage 0 / coordinator and HTTP server
+      python python/infinilm/server/inference_server.py --device=nvidia --model=<path/to/model> --tp=1 --pp=2 --node-rank=0 --master-addr=<HOST.IP> --master-port=29500 --enable-paged-attn --attn=flash-attn --num-blocks=128 --max-batch-size=32 --port=8000
+
+      # Terminal 2: stage 1 / worker
+      python python/infinilm/server/inference_server.py --device=nvidia --model=<path/to/model> --tp=1 --pp=2 --node-rank=1 --master-addr=<HOST.IP> --master-port=29500 --enable-paged-attn --attn=flash-attn --num-blocks=128 --max-batch-size=32 --port=8000
+      ```
+    
     - 测试推理服务性能：
       ```bash
       python scripts/test_perf.py --verbose
+      ```
+
+    - 单请求推理服务测试
+      ```bash
+      python test/service/request.py --content="text:Image 1:" --content="image_url:xxx.jpg" --content="text:Image 2:" --content="image_url:xxxx.jpg" --content="text:Compare the 2 images."
       ```
 
   - 运行推理基准测试（C-Eval/MMLU）
@@ -146,37 +183,3 @@
       ```bash
       python examples/bench.py --device nvidia --model=<model-path> --enable-paged-attn [--attn=default | --attn=flash-attn]
       ```
-
-## 使用方式(旧版)
-
-- 编译并安装 `InfiniCore` 。注意根据提示设置好 `INFINI_ROOT` 环境变量（默认为 `$HOME/.infini`）。
-
-- 编译并安装 `InfiniLM`
-
-```bash
-xmake && xmake install
-```
-
-- 运行模型推理测试
-
-```bash
-python scripts/jiuge.py [--cpu | --nvidia | --qy | --cambricon | --ascend | --metax | --moore | --iluvatar | --kunlun | --hygon | --ali] path/to/model_dir [n_device]
-```
-
-- 部署模型推理服务
-
-```bash
-python scripts/launch_server.py --model MODEL_PATH [-h] [--dev {cpu,nvidia,qy, cambricon,ascend,metax,moore,iluvatar,kunlun,hygon}] [--ndev NDEV] [--max-batch MAX_BATCH] [--max-new-tokens MAX_TOKENS]
-```
-
-- 测试模型推理服务性能
-
-```bash
-python scripts/test_perf.py
-```
-
-- 使用推理服务测试模型困惑度（Perplexity）
-
-```bash
-python scripts/test_ppl.py --model MODEL_PATH [--ndev NDEV] [--max-batch MAX_BATCH] [--max-new-tokens MAX_TOKENS]
-```

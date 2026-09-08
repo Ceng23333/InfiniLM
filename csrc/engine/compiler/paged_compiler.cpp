@@ -1,49 +1,89 @@
 #include "paged_compiler.hpp"
 #include "../../global_state/global_state.hpp"
+#include "../../utils.hpp"
 
+#include <algorithm>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+
+namespace infinilm::engine {
 namespace {
-// Todo: replace with Tensor::zeros when it is available
-inline void set_zeros(infinicore::Tensor &tensor) {
-    std::vector<uint8_t> zeros(tensor->nbytes(), 0);
-    infinicore::context::memcpyH2D(tensor->data(), zeros.data(), tensor->nbytes(), false);
-}
 
-inline void set_minus_one(infinicore::Tensor &tensor) {
-    // For int32 tensors, 0xFF bytes correspond to -1 in two's complement.
-    std::vector<uint8_t> minus_one(tensor->nbytes(), 0xFF);
-    infinicore::context::memcpyH2D(tensor->data(), minus_one.data(), tensor->nbytes(), false);
+bool has_mamba_cache(const infinilm::global_state::ForwardContext &forward_context) {
+    auto has_state = [](const std::vector<infinicore::Tensor> &state_vec) {
+        for (const auto &state : state_vec) {
+            if (state) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    return has_state(forward_context.conv_state_vec) || has_state(forward_context.ssm_state_vec);
 }
 
 } // namespace
-namespace infinilm::engine {
+
 PagedCompiler::PagedCompiler(const std::shared_ptr<InfinilmModel> &model, RankBarrier *barrier)
     : GraphCompiler(model, barrier) {
+    const auto *paged_config = dynamic_cast<const cache::PagedKVCacheConfig *>(
+        model_->get_cache_config());
+    if (paged_config == nullptr || paged_config->max_batch_size() == 0) {
+        return;
+    }
+    const size_t max_batch_size = paged_config->max_batch_size();
+    auto append_batch_size = [&](size_t batch_size) {
+        if (batch_size <= max_batch_size) {
+            decode_batch_sizes_.push_back(batch_size);
+        }
+    };
+
     for (size_t b = 1; b < 64; ++b) {
-        decode_batch_sizes_.push_back(b);
+        append_batch_size(b);
     }
     for (size_t b = 64; b < 128; b += 16) {
-        decode_batch_sizes_.push_back(b);
+        append_batch_size(b);
     }
     for (size_t b = 128; b < 256; b += 32) {
-        decode_batch_sizes_.push_back(b);
+        append_batch_size(b);
     }
     for (size_t b = 256; b <= 512; b += 64) {
-        decode_batch_sizes_.push_back(b);
+        append_batch_size(b);
+    }
+    if (decode_batch_sizes_.empty() || decode_batch_sizes_.back() != max_batch_size) {
+        decode_batch_sizes_.push_back(max_batch_size);
     }
 }
 
 void PagedCompiler::compile() {
     if (model_->get_cache_config() != nullptr && dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())) {
         size_t nblocks = dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())->num_blocks();
+        auto &forward_context = infinilm::global_state::get_forward_context();
+        const bool has_mamba_state = has_mamba_cache(forward_context);
+
+        const auto &model_config = model_->get_model_config();
+        const size_t position_id_axes = model_config == nullptr
+                                          ? 1
+                                          : model_config->get_or<size_t>("position_id_axes", 1);
+        if (position_id_axes == 0) {
+            throw std::runtime_error("PagedCompiler: position_id_axes must be positive");
+        }
+
         size_t max_batch_size = *std::max_element(decode_batch_sizes_.begin(), decode_batch_sizes_.end());
         compiled_map_decode_.clear();
         block_tables_holder_ = infinicore::Tensor::empty(
             {nblocks * max_batch_size}, infinicore::DataType::I32, infinicore::context::getDevice());
         set_zeros(block_tables_holder_);
-        for (size_t b : decode_batch_sizes_) {
+
+        auto make_decode_input = [&](size_t b) {
             InfinilmModel::Input input;
             input.input_ids = infinicore::Tensor::empty({1, b}, infinicore::DataType::I64, infinicore::context::getDevice());
-            input.position_ids = infinicore::Tensor::empty({b}, infinicore::DataType::I64, infinicore::context::getDevice());
+            input.position_ids = infinicore::Tensor::empty(
+                position_id_axes > 1
+                    ? std::vector<size_t>{position_id_axes, b}
+                    : std::vector<size_t>{b},
+                infinicore::DataType::I64, infinicore::context::getDevice());
             input.total_sequence_lengths = infinicore::Tensor::empty({b}, infinicore::DataType::I32, infinicore::context::getDevice());
             set_zeros(input.input_ids.value());
             set_zeros(input.position_ids.value());
@@ -63,8 +103,27 @@ void PagedCompiler::compile() {
             input.slot_mapping = infinicore::Tensor::empty({b}, infinicore::DataType::I64, infinicore::context::getDevice());
             set_zeros(input.slot_mapping.value());
 
+            if (has_mamba_state) {
+                input.mamba_init_state_indices = infinicore::Tensor::empty(
+                    {b}, infinicore::DataType::I32, infinicore::context::getDevice());
+                input.mamba_final_state_indices = infinicore::Tensor::empty(
+                    {b}, infinicore::DataType::I32, infinicore::context::getDevice());
+                std::vector<int32_t> init_state_indices_vec(b, 0);
+                std::vector<int32_t> final_state_indices_vec(b, 1);
+                infinicore::context::memcpyH2D(
+                    input.mamba_init_state_indices.value()->data(),
+                    init_state_indices_vec.data(),
+                    b * sizeof(int32_t),
+                    false);
+                infinicore::context::memcpyH2D(
+                    input.mamba_final_state_indices.value()->data(),
+                    final_state_indices_vec.data(),
+                    b * sizeof(int32_t),
+                    false);
+            }
+
             // Attention reads attn_metadata from thread-local forward context.
-            infinilm::global_state::get_forward_context().attn_metadata = {
+            forward_context.attn_metadata = {
                 input.past_sequence_lengths,
                 input.total_sequence_lengths,
                 input.input_offsets,
@@ -72,8 +131,41 @@ void PagedCompiler::compile() {
                 input.block_tables,
                 input.slot_mapping,
             };
+            // Hybrid linear-attention layers read cache indices from the same
+            // thread-local context. These tensors remain alive in CompiledResult
+            // and are updated in place before every graph replay.
+            forward_context.mamba_metadata = {
+                input.input_offsets,
+                input.mamba_init_state_indices,
+                input.mamba_final_state_indices,
+            };
+            return input;
+        };
+
+        {
+            const size_t warmup_batch_size = std::min(max_batch_size, static_cast<size_t>(64));
+            auto input = make_decode_input(warmup_batch_size);
+            model_->forward(input);
+            infinicore::context::syncStream();
+            // Warmup runs the eager Marlin path and may leave per-layer lock
+            // workspaces dirty. Reset before CUDA graph capture so capture
+            // starts from the same all-zero lock state as normal execution.
+            model_->reset_runtime_state();
+            infinicore::context::syncStream();
+        }
+
+        for (size_t b : decode_batch_sizes_) {
+            auto input = make_decode_input(b);
 
             barrier_->wait();
+            (void)model_->forward(input);
+            infinicore::context::syncStream();
+            // Capture must not start with stale Marlin locks from previous
+            // warmup/capture attempts. This reset is intentionally outside
+            // graph capture; the current implementation still pays a memset
+            // before every graph replay in get_compiled().
+            model_->reset_runtime_state();
+            infinicore::context::syncStream();
             infinicore::context::startGraphRecording();
             auto output = model_->forward(input);
             auto graph = infinicore::context::stopGraphRecording();
@@ -114,14 +206,50 @@ PagedCompiler::Compiled PagedCompiler::get_compiled(const InfinilmModel::Input &
                 return {nullptr, nullptr};
             }
 
-            // Initialize full padding to -1, then overwrite the narrowed logical region.
-            // This matches scheduler padding semantics without risking -1 access during graph recording.
+            // Initialize only the active graph rows to -1, then overwrite the
+            // runtime logical region. Avoid clearing the full preallocated
+            // holder on every decode token.
             auto &graph_block_tables = graph_input.block_tables.value();
-            set_minus_one(graph_block_tables);
-            graph_input.block_tables.value()->narrow({{1, 0, block_per_req}})->copy_from(input.block_tables.value());
+            set_minus_one_device_async(graph_block_tables);
+            graph_block_tables->narrow({{1, 0, block_per_req}})->copy_from(input.block_tables.value());
             graph_input.slot_mapping.value()->copy_from(input.slot_mapping.value());
 
+            const bool graph_has_mamba_indices = graph_input.mamba_init_state_indices.has_value() && graph_input.mamba_final_state_indices.has_value();
+            const bool input_has_mamba_indices = input.mamba_init_state_indices.has_value() && input.mamba_final_state_indices.has_value();
+            if (graph_has_mamba_indices != input_has_mamba_indices) {
+                return {nullptr, nullptr};
+            }
+            if (graph_has_mamba_indices) {
+                graph_input.mamba_init_state_indices.value()->copy_from(
+                    input.mamba_init_state_indices.value());
+                graph_input.mamba_final_state_indices.value()->copy_from(
+                    input.mamba_final_state_indices.value());
+            }
+            // CUDA graph replay reuses the same per-layer Marlin workspaces.
+            // The graph itself does not contain a workspace reset, so enqueue
+            // one on the same stream before launch. This is correct but costs
+            // decode latency; the intended follow-up is a reusable global
+            // zero workspace/lock buffer shared by all Marlin layers.
+            model_->reset_runtime_state();
+
             auto graph = std::get<0>(result->second.compiled);
+            if (graph != nullptr) {
+                const auto &runtime_seq_lens = input.total_sequence_lengths.value();
+                if (runtime_seq_lens->device().getType()
+                        != infinicore::Device::Type::CPU
+                    || runtime_seq_lens->dtype() != infinicore::DataType::I32
+                    || runtime_seq_lens->shape().size() != 1
+                    || runtime_seq_lens->shape()[0] != batch_size) {
+                    throw std::runtime_error(
+                        "PagedCompiler expected CPU int32 "
+                        "total_sequence_lengths for graph replay");
+                }
+                graph->bind_host_int_array(
+                    graph_input.total_sequence_lengths.value(),
+                    reinterpret_cast<const int32_t *>(
+                        runtime_seq_lens->data()),
+                    batch_size);
+            }
             auto shared_output = std::shared_ptr<InfinilmModel::Output>(new InfinilmModel::Output{std::get<1>(result->second.compiled)->logits->resume_from_blob_()});
 
             return std::make_tuple(graph, shared_output);

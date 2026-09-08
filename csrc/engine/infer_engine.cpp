@@ -1,55 +1,54 @@
 #include "infer_engine.hpp"
 #include "../config/config_factory.hpp"
 #include "spdlog/spdlog.h"
+#include <algorithm>
+#include <cstdint>
+#include <future>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_set>
 
 namespace infinilm::engine {
+namespace {
+
+size_t max_length_from_offsets(
+    const std::optional<infinicore::Tensor> &offsets,
+    const char *name) {
+    if (!offsets.has_value()) {
+        return 0;
+    }
+
+    auto cpu_offsets = offsets.value();
+    if (cpu_offsets->device().getType() != infinicore::Device::Type::CPU) {
+        cpu_offsets = cpu_offsets->to(infinicore::Device::cpu());
+        infinicore::context::syncStream();
+    }
+
+    if (cpu_offsets->dtype() != infinicore::DataType::I32
+        || cpu_offsets->shape().size() != 1
+        || cpu_offsets->shape()[0] < 2) {
+        throw std::invalid_argument(
+            std::string(name) + " must be a one-dimensional int32 tensor with at least two entries");
+    }
+
+    const auto *values = reinterpret_cast<const int32_t *>(cpu_offsets->data());
+    size_t max_length = 0;
+    for (size_t i = 1; i < cpu_offsets->shape()[0]; ++i) {
+        if (values[i] < values[i - 1]) {
+            throw std::invalid_argument(std::string(name) + " must be nondecreasing");
+        }
+        max_length = std::max(
+            max_length,
+            static_cast<size_t>(values[i] - values[i - 1]));
+    }
+    return max_length;
+}
+
+} // namespace
 
 //------------------------------------------------------
 // Constructor
 //------------------------------------------------------
-/**
- * @deprecated This function is deprecated and will be REMOVED in the next major release (v0.2.0).
- *
- * ⚠️ DEVELOPMENT POLICY:
- *   - NO new development or feature additions permitted on this interface
- *   - Only critical bug fixes (security/stability) allowed until removal
- *   - All new code MUST migrate to the polymorphic overload below
- *
- * Replacement: Use the polymorphic overload of this same function name with updated signature
- * Reason: Legacy signature lacks support for dynamic quantization modes.
- * Removal target: v0.2.0 (Q2 2026)
- */
-InferEngine::InferEngine(
-    const InfinilmModel::Config &config,
-    const distributed::DistConfig &distributed_config,
-    infinicore::Device::Type device_type,
-    const cache::CacheConfig *cache_config,
-    bool enable_graph_compiling,
-    backends::AttentionBackend attention_backend) // Changed parameter
-    : communication_group_(distributed_config, device_type),
-      legacy_model_config_(config),
-      attention_backend_(attention_backend) {
-    if (cache_config != nullptr) {
-        cache_config_ = cache_config->unique_copy();
-    }
-    // Create one RankWorker per rank
-    int world_size = communication_group_.get_world_size();
-    barrier_ = std::make_unique<RankBarrier>((size_t)world_size);
-    workers_.reserve(world_size);
-    for (int r = 0; r < world_size; ++r) {
-        workers_.emplace_back(std::make_unique<RankWorker>(
-            legacy_model_config_,
-            communication_group_.get_rank_info(r),
-            cache_config_ != nullptr ? cache_config_.get() : nullptr,
-            barrier_.get(),
-            enable_graph_compiling,
-            attention_backend_));
-    }
-
-    // Compile the model on all workers
-    this->compile();
-}
-
 InferEngine::InferEngine(
     const std::string &config_str,
     const distributed::DistConfig &distributed_config,
@@ -57,15 +56,30 @@ InferEngine::InferEngine(
     const cache::CacheConfig *cache_config,
     bool enable_graph_compiling,
     backends::AttentionBackend attention_backend,
-    std::optional<infinicore::DataType> kv_cache_dtype) // Changed parameter
-    : communication_group_(distributed_config, device_type), attention_backend_(attention_backend) {
+    std::optional<infinicore::DataType> kv_cache_dtype,
+    bool use_mla,
+    const std::string &weight_load_mode,
+    bool pre_transpose)
+    : communication_group_(distributed_config, device_type),
+      attention_backend_(attention_backend),
+      weight_load_mode_(weight_load_mode),
+      use_mla_(use_mla) {
+    if (weight_load_mode_ != "async" && weight_load_mode_ != "sync") {
+        throw std::invalid_argument("weight_load_mode must be either 'async' or 'sync'");
+    }
     if (cache_config != nullptr) {
         cache_config_ = cache_config->unique_copy();
     }
 
     // Load model config if model_path is provided, model_path must be valid, and config.json exists
     this->model_config_ = infinilm::config::ConfigFactory::createConfig(config_str);
-    auto infinilm_config = std::make_shared<infinilm::global_state::InfinilmConfig>(attention_backend, this->model_config_);
+    auto infinilm_config = std::make_shared<infinilm::global_state::InfinilmConfig>(
+        attention_backend,
+        this->model_config_,
+        use_mla,
+        distributed_config.moe_ep_backend,
+        distributed_config.moe_ep_size,
+        pre_transpose);
 
     // Only support offline int8 kv cache quantization in this version
     if (kv_cache_dtype.has_value()) {
@@ -84,8 +98,14 @@ InferEngine::InferEngine(
             enable_graph_compiling,
             attention_backend_));
     }
-    // Compile the model on all workers
-    this->compile();
+
+    for (auto &worker : workers_) {
+        worker->wait_for_init();
+    }
+    // Graphs must be compiled after weights are loaded and post-processed.
+    // Quantized models may replace their linear implementations during
+    // process_weights_after_loading(), so compiling here would capture stale
+    // fallback operators.
 }
 
 //------------------------------------------------------
@@ -96,6 +116,38 @@ void InferEngine::load_param(const std::string &name, const infinicore::Tensor &
     for (auto &worker : workers_) {
         worker->load_param(name, param);
     }
+}
+
+void InferEngine::load_params(const std::unordered_map<std::string, infinicore::Tensor> &params, bool strict) {
+    if (workers_.size() <= 1 || weight_load_mode_ == "sync") {
+        for (auto &worker : workers_) {
+            worker->load_params(params, strict);
+        }
+        return;
+    }
+
+    std::vector<std::future<void>> futures;
+    futures.reserve(workers_.size());
+    for (auto &worker : workers_) {
+        futures.emplace_back(std::async(std::launch::async, [&worker, &params, strict] {
+            worker->load_params(params, strict);
+        }));
+    }
+    for (auto &future : futures) {
+        future.get();
+    }
+}
+
+//------------------------------------------------------
+// load_param
+//------------------------------------------------------
+void InferEngine::process_weights_after_loading() {
+    // Process the weights after loading on all workers
+    for (auto &worker : workers_) {
+        worker->process_weights_after_loading();
+    }
+    weights_finalized_ = true;
+    this->compile();
 }
 
 //------------------------------------------------------
@@ -113,6 +165,23 @@ std::vector<std::unordered_map<std::string, infinicore::nn::Parameter>> InferEng
     return results;
 }
 
+std::vector<std::string> InferEngine::state_dict_keys() {
+    if (0 == workers_.size()) {
+        throw std::runtime_error(" Model object not found. ");
+    }
+    std::vector<std::string> ordered_keys;
+    std::unordered_set<std::string> seen_keys;
+    for (auto &worker : workers_) {
+        for (const auto &key : worker->state_dict_keys()) {
+            // Preserve first-seen worker order while removing duplicate TP keys.
+            if (seen_keys.emplace(key).second) {
+                ordered_keys.push_back(key);
+            }
+        }
+    }
+    return ordered_keys;
+}
+
 //------------------------------------------------------
 // forward
 //------------------------------------------------------
@@ -123,10 +192,38 @@ InferEngine::Input::to_model_input(infinicore::Device device) const {
         -> std::optional<infinicore::Tensor> {
         return t.has_value() ? t.value()->to(device) : t;
     };
+    auto to_device_vec = [&](const std::optional<std::vector<infinicore::Tensor>> &vec)
+        -> std::optional<std::vector<infinicore::Tensor>> {
+        if (!vec.has_value()) {
+            return vec;
+        }
+        std::vector<infinicore::Tensor> result;
+        result.reserve(vec->size());
+        for (const auto &t : vec.value()) {
+            result.push_back(t->to(device));
+        }
+        return result;
+    };
+
+    const bool is_prefill = input_ids.has_value()
+                         && total_sequence_lengths.has_value()
+                         && input_ids.value()->numel()
+                                != total_sequence_lengths.value()->numel();
+    const size_t max_query_length = is_prefill ? max_length_from_offsets(input_offsets, "input_offsets") : 0;
+    const size_t max_sequence_length = is_prefill ? max_length_from_offsets(cu_seqlens, "cu_seqlens") : 0;
+
+    // MACA maps a registered user pointer to only one node. Serialize H2D
+    // copies so TP ranks never access the same host registration concurrently.
+    static std::mutex maca_host_copy_mutex;
+    const bool serialize_host_copy
+        = device.getType() == infinicore::Device::Type::METAX;
+    std::unique_lock<std::mutex> maca_host_copy_lock;
+    if (serialize_host_copy) {
+        maca_host_copy_lock = std::unique_lock<std::mutex>(maca_host_copy_mutex);
+    }
 
     infinilm::InfinilmModel::Input input = {
         to_device(input_ids), // @todo: on device in the future
-        to_device(pixel_values),
         to_device(position_ids),
         to_device(past_sequence_lengths), // @todo: on device in the future
         to_device(total_sequence_lengths),
@@ -134,9 +231,20 @@ InferEngine::Input::to_model_input(infinicore::Device device) const {
         to_device(cu_seqlens),
         to_device(block_tables),
         to_device(slot_mapping),
-        to_device(image_bound),
-        to_device(tgt_sizes),
-    };
+        to_device(mamba_init_state_indices),
+        to_device(mamba_final_state_indices),
+        to_device_vec(pixel_values),
+        to_device_vec(image_bound),
+        to_device_vec(tgt_sizes),
+        to_device_vec(image_grid_thw),
+        image_req_ids,
+        visual_token_ranges,
+        to_device(target_hidden_states),
+        sample_all_positions};
+
+    if (serialize_host_copy) {
+        infinicore::context::syncStream();
+    }
 
     infinilm::global_state::get_forward_context().attn_metadata = {
         input.past_sequence_lengths,
@@ -145,7 +253,18 @@ InferEngine::Input::to_model_input(infinicore::Device device) const {
         input.cu_seqlens,
         input.block_tables,
         input.slot_mapping,
-    };
+        max_query_length,
+        max_sequence_length};
+
+    infinilm::global_state::get_forward_context().mamba_metadata = {
+        input.input_offsets,
+        input.mamba_init_state_indices,
+        input.mamba_final_state_indices};
+
+    global_state::get_forward_context().mm_metadata = {
+        image_req_ids,
+        visual_token_ranges};
+
     return input;
 }
 
@@ -163,6 +282,9 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &input) {
 }
 
 void InferEngine::compile() {
+    if (!weights_finalized_) {
+        return;
+    }
     for (auto &worker : workers_) {
         worker->compile();
     }
@@ -198,6 +320,24 @@ void InferEngine::reset_cache(const cache::CacheConfig *new_config) {
     }
     cache_config_ = new_config->unique_copy();
     this->compile();
+}
+
+std::vector<std::vector<infinicore::Tensor>> InferEngine::get_kv_cache() {
+    std::vector<std::vector<infinicore::Tensor>> kv_cache_list;
+    if (workers_.empty()) {
+        throw std::runtime_error("InferEngine::get_cache_vec: no workers");
+    }
+
+    kv_cache_list.reserve(workers_.size());
+    for (auto &worker : workers_) {
+        kv_cache_list.push_back(std::move(worker->get_kv_cache()));
+    }
+
+    for (auto &worker : workers_) {
+        worker->wait();
+    }
+
+    return kv_cache_list;
 }
 
 } // namespace infinilm::engine

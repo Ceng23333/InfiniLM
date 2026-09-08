@@ -1,57 +1,25 @@
 add_requires("pybind11")
 
-local INFINI_ROOT = os.getenv("INFINI_ROOT") or (os.getenv(is_host("windows") and "HOMEPATH" or "HOME") .. "/.infini")
-
 set_toolchains("gcc")
+
+option("cxx11-abi")
+    set_default(nil)
+    set_showmenu(true)
+    set_description("Set _GLIBCXX_USE_CXX11_ABI to match the installed InfiniCore")
+    set_values("0", "1")
+option_end()
+
+local cxx11_abi = os.getenv("INFINILM_CXX11_ABI") or get_config("cxx11-abi")
+if cxx11_abi and cxx11_abi ~= "" then
+    if cxx11_abi ~= "0" and cxx11_abi ~= "1" then
+        raise("INFINILM_CXX11_ABI must be 0 or 1")
+    end
+    add_defines("_GLIBCXX_USE_CXX11_ABI=" .. cxx11_abi)
+end
 
 -- Add spdlog from third_party directory
 add_includedirs("third_party/spdlog/include")
 add_includedirs("third_party/json/single_include/")
-
-option("use-kv-caching")
-    set_default(false)
-    set_showmenu(true)
-    set_description("Whether to compile the path using the kv caching operator")
-option_end()
-
-if has_config("use-kv-caching") then
-    add_defines("ENABLE_KV_CACHING")
-end
-
-option("use-classic-llama")
-    set_default(false)
-    set_showmenu(true)
-    set_description("Whether to using the classic LlamaForCausalLM")
-option_end()
-
-if has_config("use-classic-llama") then
-    add_defines("USE_CLASSIC_LLAMA")
-end
-
-target("infinicore_infer")
-    set_kind("shared")
-
-    add_includedirs("include", { public = false })
-    add_includedirs(INFINI_ROOT.."/include", { public = true })
-
-    add_linkdirs(INFINI_ROOT.."/lib")
-    add_links("infiniop", "infinirt", "infiniccl")
-
-    set_languages("cxx17")
-    set_warnings("all", "error")
-
-    add_files("src/models/*.cpp")
-    add_files("src/models/*/*.cpp")
-    add_files("src/tensor/*.cpp")
-    add_files("src/allocator/*.cpp")
-    add_files("src/dataloader/*.cpp")
-    add_files("src/cache_manager/*.cpp")
-    add_includedirs("include")
-
-    set_installdir(INFINI_ROOT)
-    add_installfiles("include/infinicore_infer.h", {prefixdir = "include"})
-    add_installfiles("include/infinicore_infer/models/*.h", {prefixdir = "include/infinicore_infer/models"})
-target_end()
 
 target("_infinilm")
     add_packages("pybind11")
@@ -65,13 +33,12 @@ target("_infinilm")
     -- add_includedirs("csrc", { public = false })
     -- add_includedirs("csrc/pybind11", { public = false })
     add_includedirs(INFINI_ROOT.."/include", { public = true })
-    add_includedirs("include", { public = false })
     -- spdlog is already included globally via add_includedirs at the top
 
     add_linkdirs(INFINI_ROOT.."/lib")
     add_links("infinicore_cpp_api", "infiniop", "infinirt", "infiniccl")
 
-    -- Add src files
+    -- Add C++ sources
     add_files("csrc/**.cpp")
     add_files("csrc/**.cc")
 

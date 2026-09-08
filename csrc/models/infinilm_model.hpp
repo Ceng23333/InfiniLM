@@ -20,9 +20,6 @@ public:
     struct Input {
         /// Token IDs tensor of shape `[batch, seq_len]`.
         std::optional<infinicore::Tensor> input_ids;
-        /// Image pixel values for multi-modal models.
-        /// Shape is model-specific (e.g. LLaVA: [batch, 3, H, W], MiniCPM-V: [batch, 3, patch, seq_len * patch]).
-        std::optional<infinicore::Tensor> pixel_values;
         /// Position IDs tensor of shape `[batch, seq_len]` or `[seq_len]`.
         std::optional<infinicore::Tensor> position_ids;
         /// Past Lengths of cached sequence for each request, of shape `[num_requests]`.
@@ -37,17 +34,36 @@ public:
         std::optional<infinicore::Tensor> block_tables;
         /// Slot ids for each token `[seq]`. Used for paged cache.
         std::optional<infinicore::Tensor> slot_mapping;
+        /// Mamba state cache indices read at the start of each request forward, of shape `[num_requests]`.
+        std::optional<infinicore::Tensor> mamba_init_state_indices;
+        /// Mamba state cache indices written with the final state of each request forward, of shape `[num_requests]`.
+        std::optional<infinicore::Tensor> mamba_final_state_indices;
+        /// Image pixel values for multi-modal models.
+        /// Vector of tensors. Shape is model-specific (e.g. LLaVA: [batch, 3, H, W], MiniCPM-V: [n_patch, 3, filter_H, H * W / filter_H]).
+        std::optional<std::vector<infinicore::Tensor>> pixel_values;
         /// Image placeholder bounds for MiniCPM-V style replacement.
-        /// Tensor shape: [batch, max_ranges, 2] (start, end).
-        std::optional<infinicore::Tensor> image_bound;
+        /// Vector of tensors shape: [n_patch, 2].
+        std::optional<std::vector<infinicore::Tensor>> image_bound;
         /// Target patch sizes for each image (MiniCPM-V).
-        /// Tensor shape: [batch, 2] or [batch, max_slices, 2] if pre-flattened.
-        std::optional<infinicore::Tensor> tgt_sizes;
+        /// Vector of tensors shape: [n_path, 2] if pre-flattened.
+        std::optional<std::vector<infinicore::Tensor>> tgt_sizes;
+        /// Qwen-style image grids. Vector of tensors shape: [3] with temporal, height, width.
+        std::optional<std::vector<infinicore::Tensor>> image_grid_thw;
+        /// req_id for each pixel_values among a batch.
+        std::optional<std::vector<size_t>> image_req_ids;
+        /// Flattened [start, end) visual token ranges in the packed language sequence.
+        std::optional<std::vector<size_t>> visual_token_ranges;
+        /// Target model hidden states consumed by draft/MTP models.
+        std::optional<infinicore::Tensor> target_hidden_states;
+        /// Preserve logits for every packed position for speculative/MTP callers.
+        bool sample_all_positions{false};
     };
 
     struct Output {
         /// Logits.
         infinicore::Tensor logits;
+        /// Optional final hidden states, used by MTP/Eagle draft models.
+        infinicore::Tensor hidden_states;
     };
 
     virtual ~InfinilmModel() = default;
@@ -56,6 +72,12 @@ public:
     virtual const cache::CacheConfig *get_cache_config() const {
         return cache_config_.get();
     }
+    const std::shared_ptr<infinilm::config::ModelConfig> &get_model_config() const {
+        return model_config_;
+    }
+
+    void process_weights_after_loading();
+    void reset_runtime_state() const;
 
 protected:
     std::vector<infinicore::Tensor> default_allocate_kv_cache_tensors(
@@ -65,5 +87,9 @@ protected:
 
     std::unique_ptr<cache::CacheConfig> cache_config_;
     std::shared_ptr<infinilm::config::ModelConfig> model_config_;
+
+private:
+    static void process_weights_recursive_(infinicore::nn::Module *module);
+    static void reset_runtime_state_recursive_(const infinicore::nn::Module *module);
 };
 } // namespace infinilm
