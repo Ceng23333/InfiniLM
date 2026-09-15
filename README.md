@@ -6,6 +6,31 @@
 
 当前版本依赖[`InfiniCore v0.2.9`](https://github.com/InfiniTensor/InfiniCore/releases/tag/v0.2.9)版本。
 
+### QY GPU
+
+QY uses InfiniCore's CUDA-compatible runtime path. Build the pinned Core with
+the QY backend enabled, then select it explicitly when launching InfiniLM:
+
+```bash
+export QY_ROOT=/usr/local/denglin
+export CUDA_HOME=$QY_ROOT/sdk
+export INFINI_ROOT=$HOME/.infini
+
+cd InfiniCore
+xmake f --qy-gpu=true --cuda="$CUDA_HOME" --ccl=true -cv
+xmake build && xmake install
+xmake build _infinicore && xmake install _infinicore
+pip install -e .
+
+cd ../InfiniLM
+pip install -e .
+python python/infinilm/server/inference_server.py \
+  --device qy --model=/path/to/MiniCPM5-2B --tp=1
+```
+
+When `--device auto` is used, this worktree detects a live QY installation by
+running `dlsmi`; an unsuccessful probe falls through to the other backends.
+
 ## 使用方式
 #### 一、编译并安装 `InfiniCore`
 编译并安装 `InfiniCore`， 详情见 InfiniCore的 [`README`](https://github.com/InfiniTensor/InfiniCore) :

@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import shutil
+import subprocess
 import warnings
 
 from infinilm.moe_config import MOE_EP_BACKEND_HELP
@@ -525,6 +526,24 @@ class BaseConfig:
         for device_name, env_names in env_checks:
             if any(os.getenv(env_name) for env_name in env_names):
                 return device_name
+
+        # QY exposes its device inventory through dlsmi rather than a torch
+        # device module. Require a successful probe so a stale executable does
+        # not make auto-selection choose an unavailable accelerator.
+        dlsmi = shutil.which("dlsmi")
+        if dlsmi:
+            try:
+                subprocess.run(
+                    [dlsmi],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                    timeout=2,
+                )
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                pass
+            else:
+                return "qy"
 
         command_checks = [
             ("cambricon", ["cnmon"]),

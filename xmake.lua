@@ -21,6 +21,21 @@ end
 add_includedirs("third_party/spdlog/include")
 add_includedirs("third_party/json/single_include/")
 
+-- Keep the Python extension rule available in minimal container images.
+rule("python.module")
+    on_config(function (target)
+        target:set("kind", "shared")
+        target:set("prefixname", "")
+        local suffix = os.iorun("python3 -c \"import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))\"")
+        if suffix then
+            suffix = suffix:trim()
+            if suffix ~= "None" then
+                target:set("extension", suffix)
+            end
+        end
+    end)
+rule_end()
+
 target("_infinilm")
     add_packages("pybind11")
     set_default(false)
