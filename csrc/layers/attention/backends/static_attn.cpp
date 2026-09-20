@@ -64,6 +64,8 @@ infinicore::Tensor StaticAttentionImpl::forward(const AttentionLayer &layer,
                           ->contiguous()
                           ->view({batch_size, seq_len, num_heads_ * value_head_dim}); // [bs, seq_len, n_q_head * value_head_dim]
     } else {
+        // GRAPH HAZARD: host read of total_sequence_lengths bakes attention
+        // window size into CUDA graphs (see StaticBatchingCompiler).
         size_t total_seq_len = reinterpret_cast<int32_t *>(total_sequence_lengths.value()->to(infinicore::Device::cpu())->data())[0];
 
         if (infinilm::quantization::KVQuantAlgo::NONE != this->kv_quant_scheme_) {
@@ -119,6 +121,10 @@ std::tuple<infinicore::Tensor, infinicore::Tensor> StaticAttentionImpl::do_kv_ca
 
     ASSERT_EQ(batch_size, max_batch_size);
 
+    // GRAPH HAZARD: reading past_sequence_lengths on the host and narrowing with
+    // the resulting cache_pos bakes that offset into any CUDA graph that captures
+    // this path (see StaticBatchingCompiler). Prefer device-side
+    // infinicore::op::kv_caching_ before re-enabling static-KV graph capture.
     size_t cache_pos = reinterpret_cast<int32_t *>(past_sequence_lengths->to(infinicore::Device::cpu())->data())[0];
     auto result_len = cache_pos + update_len;
     ASSERT(result_len <= max_seq_len);

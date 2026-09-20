@@ -3,6 +3,8 @@
 #include "../../global_state/global_state.hpp"
 #include "../../utils.hpp"
 
+#include <spdlog/spdlog.h>
+
 namespace infinilm::engine {
 StaticBatchingCompiler::StaticBatchingCompiler(const std::shared_ptr<InfinilmModel> &model, RankBarrier *barrier)
     : GraphCompiler(model, barrier) {
@@ -10,40 +12,23 @@ StaticBatchingCompiler::StaticBatchingCompiler(const std::shared_ptr<InfinilmMod
 
 void StaticBatchingCompiler::compile() {
     if (model_->get_cache_config() != nullptr && dynamic_cast<const cache::StaticKVCacheConfig *>(model_->get_cache_config())) {
-        size_t b = dynamic_cast<const cache::StaticKVCacheConfig *>(model_->get_cache_config())->max_batch_size();
-        InfinilmModel::Input input;
-        input.input_ids = infinicore::Tensor::empty({b, 1}, infinicore::DataType::I64, infinicore::context::getDevice());
-        input.position_ids = infinicore::Tensor::empty({b, 1}, infinicore::DataType::I64, infinicore::context::getDevice());
-        input.past_sequence_lengths = infinicore::Tensor::empty({b}, infinicore::DataType::I64, infinicore::context::getDevice());
-        input.total_sequence_lengths = infinicore::Tensor::empty({b}, infinicore::DataType::I64, infinicore::context::getDevice());
-        set_zeros(input.input_ids.value());
-        set_zeros(input.position_ids.value());
-        set_zeros(input.past_sequence_lengths.value());
-        std::vector<int64_t> total_sequence_lengths_vec(b, 1);
-        infinicore::context::memcpyH2D(input.total_sequence_lengths.value()->data(), total_sequence_lengths_vec.data(), b * sizeof(int64_t), false);
-
-        // Attention reads attn_metadata from thread-local forward context.
-        infinilm::global_state::get_forward_context().attn_metadata = {
-            input.past_sequence_lengths,
-            input.total_sequence_lengths,
-            input.input_offsets,
-            input.cu_seqlens,
-            input.block_tables,
-            input.slot_mapping,
-        };
-
-        barrier_->wait();
-        (void)model_->forward(input);
-        infinicore::context::syncStream();
-
-        infinicore::context::startGraphRecording();
-        auto output = model_->forward(input);
-        auto graph = infinicore::context::stopGraphRecording();
-        barrier_->wait();
-
-        auto shared_output = std::shared_ptr<InfinilmModel::Output>(new InfinilmModel::Output{infinicore::graph::GraphTensor(output.logits)});
-
-        compiled_map_[std::make_tuple(b, 1)] = CompiledResult{std::move(input), std::make_tuple(graph, shared_output)};
+        // StaticAttentionImpl (static_attn.cpp) reads past/total sequence lengths on the
+        // host to narrow KV cache views and attention windows:
+        //   cache_pos = past_sequence_lengths.cpu()[0]
+        //   total_seq_len = total_sequence_lengths.cpu()[0]
+        // CUDA graph capture runs that host control flow once. This compiler seeds
+        // past=0 and total=1 for capture, so replay after a long prefill still
+        // writes new KV at offset 0 and attends only length 1. On MiniCPM5/QY that
+        // shows up as decode loops on low-id special tokens (e.g. <|fim_prefix|>)
+        // and LongBench CoT EM=0 with --enable-graph.
+        //
+        // Device-side kv_caching_ + length-aware attention are required before a
+        // static-KV decode graph is safe. Until then, skip capture so RUN falls
+        // back to eager (correct) when --enable-graph is set.
+        spdlog::warn(
+            "[StaticBatchingCompiler] skipping CUDA graph capture for Static KV: "
+            "static_attn host-side past/total sequence lengths are not capture-safe");
+        return;
     }
 }
 
