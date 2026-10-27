@@ -338,7 +338,12 @@ class InferenceServer:
                 continue
 
             normalized_msg = msg
-            content = msg.get("content")
+            # OpenAI assistant tool-call turns often omit content or set null.
+            # Qwen3.5 processor indexes message["content"] — always provide a key.
+            if "content" not in msg or msg.get("content") is None:
+                normalized_msg = msg.copy()
+                normalized_msg["content"] = ""
+            content = normalized_msg.get("content")
             if isinstance(content, list):
                 text_parts = []
                 for part in content:

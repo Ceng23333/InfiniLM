@@ -137,7 +137,16 @@ class Qwen35Processor(BasicLLMProcessor):
     ):
         normalized_conversation = []
         for message in conversation:
-            content = message["content"]
+            content = message.get("content") if isinstance(message, dict) else None
+            if content is None:
+                # Preserve tool_calls / name / etc.; chat template tolerates empty content.
+                if isinstance(message, dict):
+                    fixed = dict(message)
+                    fixed["content"] = ""
+                    normalized_conversation.append(fixed)
+                else:
+                    normalized_conversation.append(message)
+                continue
             if not isinstance(content, list):
                 normalized_conversation.append(message)
                 continue
@@ -158,9 +167,10 @@ class Qwen35Processor(BasicLLMProcessor):
                         f"Unsupported Qwen3.5 content type: {item_type}"
                     )
 
-            normalized_conversation.append(
-                {"role": message.get("role", "user"), "content": normalized_content}
-            )
+            fixed = dict(message) if isinstance(message, dict) else {}
+            fixed["role"] = message.get("role", "user") if isinstance(message, dict) else "user"
+            fixed["content"] = normalized_content
+            normalized_conversation.append(fixed)
 
         template_owner = (
             self.processor if self.processor is not None else self.tokenizer
