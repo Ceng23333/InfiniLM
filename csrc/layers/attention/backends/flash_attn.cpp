@@ -62,7 +62,12 @@ infinicore::Tensor FlashAttentionImpl::forward(const AttentionLayer &layer,
                                ? static_cast<int>(attn_metadata.max_sequence_length)
                                : max_seqlen_q;
         if (block_tables.value()->ndim() >= 2) {
-            const int table_cap = static_cast<int>(block_tables.value()->size(1) * 256);
+            // page size = k_cache dim1 (FA requires multiple of 256). Do not
+            // hard-code 256 — must match run_server --block-size.
+            const int page = (k_total->ndim() >= 2)
+                                 ? static_cast<int>(k_total->size(1))
+                                 : 256;
+            const int table_cap = static_cast<int>(block_tables.value()->size(1) * page);
             max_seqlen_k = std::min(max_seqlen_k, table_cap);
             max_seqlen_q = std::min(max_seqlen_q, table_cap);
         }

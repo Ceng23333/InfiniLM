@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -139,7 +140,13 @@ std::unique_ptr<FlashAttnOperator> make_graph_safe_provider(
     const std::vector<std::int64_t> window_size{-1, -1};
     const double softcap = 0.0;
     const bool rotary_interleaved = true;
-    const std::int64_t num_splits = 0;
+    // MetaX: FA2 num_splits=0 (auto) picks multi-split on long decode and
+    // hits flash_fwd_splitkv_combine ATU. Default to 1; override via env.
+    const char *num_splits_env = std::getenv("INFINI_FA_NUM_SPLITS");
+    const std::int64_t num_splits =
+        (num_splits_env && *num_splits_env)
+            ? std::strtoll(num_splits_env, nullptr, 10)
+            : 1;
     const bool return_softmax_lse = false;
     const auto out = planned.out.tensor(planned.out_tensor);
 
@@ -178,8 +185,23 @@ void *plan(Tensor out,
            const Tensor &block_table,
            std::optional<Tensor> alibi_slopes,
            float scale) {
+    // MetaX/vLLM: FA requires contiguous block_table / seqlens. Piecewise and
+    // paged compilers often pass narrow() views; non-contig triggers
+    // flash_fwd_splitkv memory/ATU faults on MACA (same fix as mha_varlen).
+    Tensor seqlens_k_c = seqlens_k;
+    Tensor block_table_c = block_table;
+    if (seqlens_k_c && !seqlens_k_c->is_contiguous()) {
+        seqlens_k_c = seqlens_k_c->contiguous();
+    }
+    if (block_table_c && !block_table_c->is_contiguous()) {
+        block_table_c = block_table_c->contiguous();
+    }
+    if (alibi_slopes.has_value() && alibi_slopes.value()
+        && !alibi_slopes.value()->is_contiguous()) {
+        alibi_slopes = alibi_slopes.value()->contiguous();
+    }
     INFINICORE_ASSERT(is_supported(
-        out, q, k_cache, v_cache, seqlens_k, block_table, alibi_slopes));
+        out, q, k_cache, v_cache, seqlens_k_c, block_table_c, alibi_slopes));
     auto planned = std::unique_ptr<PlannedMeta>{new PlannedMeta{
         TensorMeta(out),
         TensorMeta(q),
@@ -236,7 +258,13 @@ void run(void *planned_meta) {
     const std::vector<std::int64_t> window_size{-1, -1};
     const double softcap = 0.0;
     const bool rotary_interleaved = true;
-    const std::int64_t num_splits = 0;
+    // MetaX: FA2 num_splits=0 (auto) picks multi-split on long decode and
+    // hits flash_fwd_splitkv_combine ATU. Default to 1; override via env.
+    const char *num_splits_env = std::getenv("INFINI_FA_NUM_SPLITS");
+    const std::int64_t num_splits =
+        (num_splits_env && *num_splits_env)
+            ? std::strtoll(num_splits_env, nullptr, 10)
+            : 1;
     const bool return_softmax_lse = false;
     const auto out = planned->out.tensor(planned->out_tensor);
 

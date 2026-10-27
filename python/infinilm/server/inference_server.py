@@ -15,11 +15,11 @@ from typing import Optional
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-
 from infinilm.base_config import BaseConfig
 from infinilm.config import KVTransferConfig
 from infinilm.llm import AsyncLLMEngine, FinishReason, SamplingParams
 from infinilm.moe_config import configure_moe_ep_backend
+from infinilm.server.openai_protocol import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -29,15 +29,23 @@ DEFAULT_REQUEST_TIMEOUT = 7200.0
 
 
 def chunk_json(
-    id_, content=None, role=None, finish_reason=None, model: str = "unknown"
+    id_,
+    content=None,
+    role=None,
+    tool_calls=None,
+    finish_reason=None,
+    model: str = "unknown",
+    usage=None,
 ):
     """Generate JSON chunk for streaming response."""
     delta = {}
-    if content:
+    if content is not None:
         delta["content"] = content
     if role:
         delta["role"] = role
-    return {
+    if tool_calls:
+        delta["tool_calls"] = tool_calls
+    payload = {
         "id": id_,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
@@ -53,6 +61,9 @@ def chunk_json(
             }
         ],
     }
+    if usage is not None:
+        payload["usage"] = usage
+    return payload
 
 
 def completion_json(
@@ -64,8 +75,13 @@ def completion_json(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     total_tokens: int = 0,
+    tool_calls=None,
 ):
     """Generate JSON response for non-streaming completion."""
+    message = {"role": role, "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
     return {
         "id": id_,
         "object": "chat.completion",
@@ -75,10 +91,7 @@ def completion_json(
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": role,
-                    "content": content,
-                },
+                "message": message,
                 "logprobs": None,
                 "finish_reason": finish_reason,
             }
@@ -264,13 +277,16 @@ class InferenceServer:
                 # logger.debug(f"Received request data: {data}")
             except Exception as e:
                 logger.error(f"Failed to parse request JSON: {e}")
-                return JSONResponse(content={"error": "Invalid JSON"}, status_code=400)
+                return self._error_response("Invalid JSON", status_code=400)
+
+            try:
+                self._validate_request(data)
+            except ValueError as exc:
+                return self._error_response(str(exc), status_code=400)
 
             if not data.get("messages"):
                 if not data.get("prompt"):
-                    return JSONResponse(
-                        content={"error": "No message provided"}, status_code=400
-                    )
+                    return self._error_response("No message provided", status_code=400)
                 else:
                     data["messages"] = [{"role": "user", "content": data.get("prompt")}]
 
@@ -328,8 +344,8 @@ class InferenceServer:
         """Normalize messages for chat-template compatibility.
 
         - Multimodal content lists -> joined text string
+        - Missing/null content -> "" (OpenAI tool turns often omit content)
         - OpenAI tool_calls.function.arguments JSON string -> dict
-          (Qwen chat_template uses arguments|items; vLLM-compatible)
         """
         normalized = []
         for msg in messages:
@@ -338,11 +354,10 @@ class InferenceServer:
                 continue
 
             normalized_msg = msg
-            # OpenAI assistant tool-call turns often omit content or set null.
-            # Qwen3.5 processor indexes message["content"] — always provide a key.
             if "content" not in msg or msg.get("content") is None:
                 normalized_msg = msg.copy()
                 normalized_msg["content"] = ""
+
             content = normalized_msg.get("content")
             if isinstance(content, list):
                 text_parts = []
@@ -354,7 +369,8 @@ class InferenceServer:
                             text_parts.append(part)
                     elif isinstance(part, str):
                         text_parts.append(part)
-                normalized_msg = msg.copy()
+                if normalized_msg is msg:
+                    normalized_msg = msg.copy()
                 normalized_msg["content"] = "".join(text_parts) if text_parts else ""
 
             tool_calls = normalized_msg.get("tool_calls")
@@ -382,8 +398,6 @@ class InferenceServer:
                                     "tool_calls.function.arguments is not valid JSON; using {}"
                                 )
                                 parsed = {}
-                        else:
-                            parsed = {}
                         fn = {**fn, "arguments": parsed}
                         tc = {**tc, "function": fn}
                     new_calls.append(tc)
@@ -392,6 +406,91 @@ class InferenceServer:
             normalized.append(normalized_msg)
 
         return normalized
+
+    @staticmethod
+    def _error_response(message: str, status_code: int = 500) -> JSONResponse:
+        error_type = "invalid_request_error" if status_code < 500 else "server_error"
+        return JSONResponse(
+            content={
+                "error": {
+                    "message": message,
+                    "type": error_type,
+                    "param": None,
+                    "code": None,
+                }
+            },
+            status_code=status_code,
+        )
+
+    @staticmethod
+    def _validate_request(data: dict) -> None:
+        if not isinstance(data, dict):
+            raise ValueError("Request body must be a JSON object")
+        if "messages" in data and not isinstance(data["messages"], list):
+            raise ValueError("messages must be an array")
+
+        tools = data.get("tools")
+        if tools is not None:
+            if not isinstance(tools, list):
+                raise ValueError("tools must be an array")
+            for tool in tools:
+                if (
+                    not isinstance(tool, dict)
+                    or tool.get("type") != "function"
+                    or not isinstance(tool.get("function"), dict)
+                    or not tool["function"].get("name")
+                ):
+                    raise ValueError(
+                        "each tool must be a function with a non-empty name"
+                    )
+
+        tool_choice = data.get("tool_choice")
+        if isinstance(tool_choice, str):
+            if tool_choice not in ("auto", "none", "required"):
+                raise ValueError("tool_choice must be auto, none, or required")
+        elif tool_choice is not None and not isinstance(tool_choice, dict):
+            raise ValueError("tool_choice must be a string or object")
+
+    @staticmethod
+    def _build_chat_template_kwargs(data: dict) -> dict:
+        raw_kwargs = data.get("chat_template_kwargs") or {}
+        if not isinstance(raw_kwargs, dict):
+            raise ValueError("chat_template_kwargs must be an object")
+        kwargs = raw_kwargs.copy()
+
+        tools = data.get("tools")
+        tool_choice = data.get("tool_choice")
+        if tools and tool_choice != "none":
+            if isinstance(tool_choice, dict):
+                function = tool_choice.get("function") or {}
+                function_name = function.get("name")
+                if function_name:
+                    tools = [
+                        tool
+                        for tool in tools
+                        if tool.get("function", {}).get("name") == function_name
+                    ]
+                    if not tools:
+                        raise ValueError(
+                            f"tool_choice references unknown function {function_name!r}"
+                        )
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+
+        for key in ("enable_thinking", "reasoning_effort", "preserve_thinking"):
+            if key in data:
+                kwargs[key] = data[key]
+
+        thinking = data.get("thinking")
+        if isinstance(thinking, dict) and "type" in thinking:
+            kwargs["enable_thinking"] = thinking["type"] != "disabled"
+        # MetaX showroom: Qwen3.8 defaults thinking=xhigh which makes decode
+        # runs exceed smoke budgets; default off unless request/env enables.
+        if "enable_thinking" not in kwargs:
+            import os
+            env = os.getenv("INFINI_ENABLE_THINKING", "0").strip().lower()
+            kwargs["enable_thinking"] = env in ("1", "true", "yes", "on")
+        return kwargs
 
     def _build_sampling_params(self, data: dict) -> SamplingParams:
         """Build SamplingParams from request data."""
@@ -410,11 +509,16 @@ class InferenceServer:
                 return sp.get(key)
             return default
 
-        # Accept common alias
-        max_tokens = pick("max_tokens", self.max_tokens)
+        max_tokens = None
+        for key in ("max_tokens", "max_completion_tokens", "max_new_tokens"):
+            if key in data and data[key] is not None:
+                max_tokens = data[key]
+                break
+            if key in sp and sp[key] is not None:
+                max_tokens = sp[key]
+                break
         if max_tokens is None:
-            # Some clients use max_new_tokens
-            max_tokens = pick("max_new_tokens", self.max_tokens)
+            max_tokens = self.max_tokens
 
         stop = pick("stop", None)
         if isinstance(stop, str):
@@ -437,6 +541,7 @@ class InferenceServer:
         try:
             messages = data.get("messages", [])
             sampling_params = self._build_sampling_params(data)
+            chat_template_kwargs = self._build_chat_template_kwargs(data)
 
             req = self.engine.add_chat_request(
                 messages=messages,
@@ -444,8 +549,14 @@ class InferenceServer:
                 request_id=request_id,
                 request_data=data,
                 add_generation_prompt=bool(data.get("add_generation_prompt", True)),
-                chat_template_kwargs=data.get("chat_template_kwargs") or {},
+                chat_template_kwargs=chat_template_kwargs,
             )
+            role_chunk = chunk_json(request_id, role="assistant", model=self.model_id)
+            yield f"data: {json.dumps(role_chunk)}\n\n"
+
+            # Always parse Qwen <tool_call> XML so it never leaks as assistant text.
+            tool_parser = ToolCallStreamParser()
+            tool_call_index = 0
 
             async for token_output in self.engine.stream_request(
                 req,
@@ -483,24 +594,65 @@ class InferenceServer:
                 )
 
                 if not is_eos_token and token_output.token_text:
-                    # Send token
-                    chunk = json.dumps(
-                        chunk_json(
+                    if tool_parser is None:
+                        content_parts, tool_calls = [token_output.token_text], []
+                    else:
+                        content_parts, tool_calls = tool_parser.feed(
+                            token_output.token_text
+                        )
+                    for content_part in content_parts:
+                        chunk = chunk_json(
+                            request_id, content=content_part, model=self.model_id
+                        )
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    for tool_call in tool_calls:
+                        delta_call = {"index": tool_call_index, **tool_call}
+                        tool_call_index += 1
+                        chunk = chunk_json(
                             request_id,
-                            content=token_output.token_text,
+                            tool_calls=[delta_call],
                             model=self.model_id,
-                        ),
-                        ensure_ascii=False,
-                    )
-                    yield f"data: {chunk}\n\n"
+                        )
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
                 if token_output.finished:
+                    if tool_parser is not None:
+                        content_parts, tool_calls = tool_parser.finalize()
+                        for content_part in content_parts:
+                            chunk = chunk_json(
+                                request_id, content=content_part, model=self.model_id
+                            )
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        for tool_call in tool_calls:
+                            delta_call = {"index": tool_call_index, **tool_call}
+                            tool_call_index += 1
+                            chunk = chunk_json(
+                                request_id,
+                                tool_calls=[delta_call],
+                                model=self.model_id,
+                            )
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     finish_reason = self._convert_finish_reason(
                         token_output.finish_reason
                     )
+                    if tool_parser is not None and tool_parser.has_tool_calls:
+                        finish_reason = "tool_calls"
+                    usage = None
+                    stream_options = data.get("stream_options")
+                    if isinstance(stream_options, dict) and stream_options.get(
+                        "include_usage"
+                    ):
+                        usage = {
+                            "prompt_tokens": req.get_prompt_length(),
+                            "completion_tokens": req.get_num_generated_tokens(),
+                            "total_tokens": req.get_total_length(),
+                        }
                     chunk = json.dumps(
                         chunk_json(
-                            request_id, finish_reason=finish_reason, model=self.model_id
+                            request_id,
+                            finish_reason=finish_reason,
+                            model=self.model_id,
+                            usage=usage,
                         ),
                         ensure_ascii=False,
                     )
@@ -542,6 +694,7 @@ class InferenceServer:
         try:
             messages = data.get("messages", [])
             sampling_params = self._build_sampling_params(data)
+            chat_template_kwargs = self._build_chat_template_kwargs(data)
 
             req = self.engine.add_chat_request(
                 messages=messages,
@@ -549,7 +702,7 @@ class InferenceServer:
                 request_id=request_id,
                 request_data=data,
                 add_generation_prompt=bool(data.get("add_generation_prompt", True)),
-                chat_template_kwargs=data.get("chat_template_kwargs") or {},
+                chat_template_kwargs=chat_template_kwargs,
             )
 
             # Collect all generated tokens
@@ -582,6 +735,11 @@ class InferenceServer:
 
             output_text = output_text.strip()
             finish_reason = self._convert_finish_reason(req.finish_reason)
+            output_text, tool_calls = parse_tool_calls(output_text)
+            if tool_calls:
+                finish_reason = "tool_calls"
+            else:
+                tool_calls = None
 
             response = completion_json(
                 request_id,
@@ -592,6 +750,7 @@ class InferenceServer:
                 prompt_tokens=req.get_prompt_length(),
                 completion_tokens=req.get_num_generated_tokens(),
                 total_tokens=req.get_total_length(),
+                tool_calls=tool_calls,
             )
             return response
 
@@ -602,7 +761,7 @@ class InferenceServer:
         except Exception as e:
             logger.error(f"Chat error for {request_id}: {e}", exc_info=True)
             _abort_reason = FinishReason.ERROR
-            return JSONResponse(content={"error": str(e)}, status_code=500)
+            return self._error_response(str(e), status_code=500)
 
         finally:
             # Unified abort: reason is ERROR if we got here via Exception, else CANCELED.
