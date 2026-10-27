@@ -274,8 +274,8 @@ class InferenceServer:
                 else:
                     data["messages"] = [{"role": "user", "content": data.get("prompt")}]
 
-            # Normalize messages to handle multimodal content (list format)
-            data["messages"] = data.get("messages", [])
+            # Normalize multimodal content + OpenAI tool_calls.arguments (JSON string -> dict)
+            data["messages"] = self._normalize_messages(data.get("messages", []))
 
             stream = data.get("stream", False)
             request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -325,10 +325,11 @@ class InferenceServer:
             return _models_payload()
 
     def _normalize_messages(self, messages: list) -> list:
-        """Normalize messages to handle multimodal content (list format).
+        """Normalize messages for chat-template compatibility.
 
-        Converts content from list format [{"type": "text", "text": "..."}]
-        to string format for chat template compatibility.
+        - Multimodal content lists -> joined text string
+        - OpenAI tool_calls.function.arguments JSON string -> dict
+          (Qwen chat_template uses arguments|items; vLLM-compatible)
         """
         normalized = []
         for msg in messages:
@@ -336,9 +337,9 @@ class InferenceServer:
                 normalized.append(msg)
                 continue
 
+            normalized_msg = msg
             content = msg.get("content")
             if isinstance(content, list):
-                # Extract text from multimodal content list
                 text_parts = []
                 for part in content:
                     if isinstance(part, dict):
@@ -348,12 +349,42 @@ class InferenceServer:
                             text_parts.append(part)
                     elif isinstance(part, str):
                         text_parts.append(part)
-                # Join all text parts
                 normalized_msg = msg.copy()
                 normalized_msg["content"] = "".join(text_parts) if text_parts else ""
-                normalized.append(normalized_msg)
-            else:
-                normalized.append(msg)
+
+            tool_calls = normalized_msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                if normalized_msg is msg:
+                    normalized_msg = msg.copy()
+                new_calls = []
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        new_calls.append(tc)
+                        continue
+                    fn = tc.get("function")
+                    if not isinstance(fn, dict):
+                        new_calls.append(tc)
+                        continue
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        parsed = {}
+                        if args.strip():
+                            try:
+                                loaded = json.loads(args)
+                                parsed = loaded if isinstance(loaded, dict) else {}
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    "tool_calls.function.arguments is not valid JSON; using {}"
+                                )
+                                parsed = {}
+                        else:
+                            parsed = {}
+                        fn = {**fn, "arguments": parsed}
+                        tc = {**tc, "function": fn}
+                    new_calls.append(tc)
+                normalized_msg["tool_calls"] = new_calls
+
+            normalized.append(normalized_msg)
 
         return normalized
 
