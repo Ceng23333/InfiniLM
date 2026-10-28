@@ -21,6 +21,11 @@ public:
         std::vector<std::shared_ptr<infinicore::graph::Graph>> post_attn;
         std::shared_ptr<infinicore::graph::Graph> lm_head;
         infinicore::Tensor logits_holder;
+
+        // Opt-in vLLM-style whole-forward prefill graph.
+        GraphCompiler::Compiled full_compiled;
+        size_t full_max_query_length{0};
+        size_t full_max_sequence_length{0};
         infinicore::Tensor hidden_states;
         infinicore::Tensor residual;
         infinicore::Tensor ar_staging;
@@ -80,6 +85,9 @@ private:
     void copy_runtime_into_bucket_(BucketGraphs &bucket_graphs,
                                    const InfinilmModel::Input &runtime,
                                    size_t valid_seq_len) const;
+    GraphCompiler::Compiled make_full_compiled_(const InfinilmModel::Input &input,
+                                 std::shared_ptr<infinicore::graph::Graph> graph,
+                                 const InfinilmModel::Output &output) const;
 
     std::shared_ptr<InfinilmModel> model_;
     RankBarrier *barrier_;

@@ -50,6 +50,20 @@ bool tryGreedyWithInfiniOps(
     const infiniops::TensorMeta indices_meta(indices);
     auto argmax_config = infiniops::defaultConfigForDevice<infini::ops::Argmax>(
         logits_meta.device.type());
+    // QY's native Argmax only supports flattened reductions. Passing dim=1
+    // silently reduces the entire batch in release builds, leaving all but
+    // the first output unwritten. Preserve the per-row sampling contract here.
+    if (device_type == Device::Type::kQy && batched) {
+        for (size_t row = 0; row < num_rows; ++row) {
+            auto score = logits->narrow({{0, row, 1}})->view({logits->size(1)});
+            auto index = indices->narrow({{0, row, 1}})->view({});
+            infini::ops::Argmax::Call(
+                handle, argmax_config,
+                infiniops::TensorMeta(score).tensor(score), std::optional<int64_t>{}, false,
+                infiniops::TensorMeta(index).tensor(index));
+        }
+        return true;
+    }
     const std::optional<int64_t> dim = batched
                                          ? std::optional<int64_t>{1}
                                          : std::nullopt;

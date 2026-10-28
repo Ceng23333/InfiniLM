@@ -217,7 +217,12 @@ class LLMEngine:
         )
 
     def _advance_chunk_progress(self, req: InferenceRequest, num_tokens: int) -> None:
-        req.chunk_prefill_offset += num_tokens
+        start = req.chunk_prefill_offset or req.num_local_cached_tokens
+        end = start + num_tokens
+        # slot_mapping is relative to num_local_cached_tokens. Advance both
+        # together or subsequent chunks overwrite the first chunk's KV slots.
+        req.slot_mapping = req.slot_mapping[end - req.num_local_cached_tokens :]
+        req.chunk_prefill_offset = end
         req.num_computed_tokens = req.chunk_prefill_offset
         req.num_local_cached_tokens = req.chunk_prefill_offset
         self.scheduler.commit_computed_tokens(req, req.num_computed_tokens)
@@ -399,8 +404,7 @@ class LLMEngine:
             if token_id < 0 or token_id >= vocab_size:
                 # Hard error: OOR samples must not be soft-mapped (% vocab);
                 # that kept the step loop alive but corrupted generation under
-                # wave packing. QY batch_greedy is disabled for n_out>1 so ids
-                # should stay in-range after the C++ fix.
+                # wave packing. A sampler failure must remain visible.
                 raise ValueError(
                     f"Out-of-range sampled token_id={token_id} for request "
                     f"{req.request_id} (vocab={vocab_size})"

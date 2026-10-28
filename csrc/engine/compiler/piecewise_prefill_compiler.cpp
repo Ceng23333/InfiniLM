@@ -73,6 +73,12 @@ bool rank_worker_profile_enabled() {
     return cached == 1;
 }
 
+/// Opt-in whole-forward prefill capture, analogous to vLLM CUDAGraphMode::FULL.
+bool prefill_full_cg_enabled() {
+    const char *raw = std::getenv("INFINI_PREFILL_FULL_CG");
+    return raw != nullptr && raw[0] == '1' && raw[1] == '\0';
+}
+
 /// When set with RANK_WORKER_PROFILE, syncDevice after each Graph::run so
 /// *_graph_run_ms is exclusive GPU+host (mirrors decode_phase_profile exclusive_sync).
 bool rank_worker_profile_sync() {
@@ -301,6 +307,25 @@ void clear_stale_bucket_tails_(global_state::PiecewisePrefillState &piecewise,
 }
 
 } // namespace
+
+GraphCompiler::Compiled PiecewisePrefillCompiler::make_full_compiled_(
+    const InfinilmModel::Input &input,
+    std::shared_ptr<infinicore::graph::Graph> graph,
+    const InfinilmModel::Output &output) const {
+    infinicore::Tensor graph_hidden_states;
+    if (output.hidden_states) {
+        graph_hidden_states = infinicore::graph::GraphTensor(
+            output.hidden_states,
+            infinicore::graph::GraphTensor::SnapshotPolicy::kBlob);
+    }
+    auto shared_output = std::shared_ptr<InfinilmModel::Output>(
+        new InfinilmModel::Output{
+            infinicore::graph::GraphTensor(
+                output.logits,
+                infinicore::graph::GraphTensor::SnapshotPolicy::kBlob),
+            graph_hidden_states});
+    return {std::move(graph), std::move(shared_output)};
+}
 
 PiecewisePrefillCompiler::PiecewisePrefillCompiler(const std::shared_ptr<InfinilmModel> &model,
                                                    RankBarrier *barrier)
@@ -731,6 +756,47 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_cap
         }
         infinicore::context::syncDevice();
     }
+    if (!mid_chunk_capture && prefill_full_cg_enabled()) {
+        const auto &capture_meta = global_state::get_forward_context().attn_metadata;
+        graphs.full_max_query_length = capture_meta.max_query_length;
+        graphs.full_max_sequence_length = capture_meta.max_sequence_length;
+        graphs.pre_attn.clear();
+        graphs.post_attn.clear();
+        graphs.lm_head.reset();
+        set_zeros(piecewise.residual);
+
+        barrier_->wait();
+        (void)model_->forward(graphs.input);
+        infinicore::context::syncStream();
+        model_->reset_runtime_state();
+        infinicore::context::syncStream();
+
+        piecewise.valid_seq_len = bucket;
+        piecewise.phase = global_state::PiecewiseCapturePhase::None;
+        piecewise.allow_inductor_pre_attn = false;
+        GraphRecordingGuard recording;
+        auto output = model_->forward(graphs.input);
+        graphs.full_compiled = make_full_compiled_(
+            graphs.input, recording.finish(), output);
+        barrier_->wait();
+        infinicore::context::syncDevice();
+
+        piecewise.phase = global_state::PiecewiseCapturePhase::None;
+        graphs.hidden_states = piecewise.hidden_states;
+        graphs.residual = piecewise.residual;
+        graphs.ar_staging = piecewise.ar_staging;
+        graphs.layer_staging = piecewise.layer_staging;
+        if (mid_chunk_capture) {
+            compiled_mid_[bucket] = std::move(graphs);
+        } else {
+            compiled_[bucket] = std::move(graphs);
+        }
+        spdlog::info(
+            "native FULL prefill CG: captured bucket={} layers={} mode=vllm_full",
+            bucket, capture_layers);
+        return;
+    }
+
     graphs.pre_attn.resize(capture_layers);
     graphs.post_attn.resize(capture_layers);
 
@@ -1156,8 +1222,13 @@ void PiecewisePrefillCompiler::copy_runtime_into_bucket_(BucketGraphs &bucket_gr
             offsets_tail->data(), pad.data(), pad.size() * sizeof(int32_t), false);
         auto cu_tail = graph_input.cu_seqlens.value()->narrow(
             {{0, runtime_n_req + 1, off_tail}});
+        auto last_cu = graph_input.cu_seqlens.value()
+                           ->narrow({{0, runtime_n_req, 1}})
+                           ->to(infinicore::Device{infinicore::Device::Type::kCpu});
+        const int32_t last_kv = *reinterpret_cast<const int32_t *>(last_cu->data());
+        std::vector<int32_t> cu_pad(off_tail, last_kv);
         infinicore::context::memcpyH2D(
-            cu_tail->data(), pad.data(), pad.size() * sizeof(int32_t), false);
+            cu_tail->data(), cu_pad.data(), cu_pad.size() * sizeof(int32_t), false);
     }
 
     const size_t block_per_req = runtime.block_tables.value()->size(1);
@@ -1242,6 +1313,53 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     // Pad-up (seq_len < graph_bucket): product default replays token-bucket CG with
     // valid_seq_len=L + zeroed tails (INFINI_PIECEWISE_PAD_UP_CG, default ON).
     // Kill-switch =0 restores legacy eager-only pad-up (PlannedMeta / SIGSEGV history).
+    auto &candidate = compiled_.at(graph_bucket);
+    if (!mid_chunk && prefill_full_cg_enabled()
+        && std::get<0>(candidate.full_compiled) != nullptr) {
+        // The provider captures host max-length scalars in its launch plan.
+        // Updating the length tensors does not enlarge that captured plan.
+        set_attn_metadata(input);
+        const auto &runtime_meta = global_state::get_forward_context().attn_metadata;
+        if (runtime_meta.max_query_length > candidate.full_max_query_length
+            || runtime_meta.max_sequence_length > candidate.full_max_sequence_length) {
+            ++prefill_misses_;
+            static thread_local bool warned = false;
+            if (!warned) {
+                spdlog::warn("FULL prefill length guard: runtime q/k={}/{} exceeds capture {}/{}; using eager",
+                             runtime_meta.max_query_length, runtime_meta.max_sequence_length,
+                             candidate.full_max_query_length, candidate.full_max_sequence_length);
+                warned = true;
+            }
+            return std::nullopt;
+        }
+        global_state::get_forward_context().piecewise.valid_seq_len = seq_len;
+        copy_runtime_into_bucket_(candidate, input, seq_len);
+        if (seq_len < graph_bucket) {
+            auto unused_slots = candidate.input.slot_mapping.value()->narrow(
+                {{0, seq_len, graph_bucket - seq_len}});
+            set_minus_one(unused_slots);
+        }
+        set_attn_metadata_for_varlen_batch(candidate.input, input);
+        model_->reset_runtime_state();
+        std::get<0>(candidate.full_compiled)->run();
+        const auto &captured_output = std::get<1>(candidate.full_compiled);
+        infinicore::Tensor full_logits = captured_output->logits->resume_from_blob_();
+        auto offsets_cpu = candidate.input.input_offsets.value()->to(infinicore::Device{infinicore::Device::Type::kCpu});
+        const auto *offsets = reinterpret_cast<const int32_t *>(offsets_cpu->data());
+        for (size_t req = 0; req < runtime_n_req; ++req) {
+            const size_t source_pos = req;
+            const size_t target_pos = offsets[req + 1] - 1;
+            infinicore::Tensor source = full_logits->shape().size() == 2
+                ? full_logits->narrow({{0, source_pos, 1}})
+                : full_logits->narrow({{1, source_pos, 1}});
+            auto target = candidate.logits_holder->narrow({{1, target_pos, 1}});
+            target->copy_from(source->view({1, 1, source->size(source->shape().size() - 1)}));
+        }
+        ++prefill_hits_;
+        last_prefill_executed_ = true;
+        return candidate.logits_holder;
+    }
+
     const bool pad_up = seq_len != graph_bucket;
     const bool pad_up_cg_on = piecewise_pad_up_cg_enabled();
     const bool pad_up_blocks_cg = pad_up && !pad_up_cg_on;
