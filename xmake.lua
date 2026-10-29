@@ -1,16 +1,8 @@
 -- Prefer pip/system pybind11 to avoid xmake-repo network fetches in offline containers.
+-- Note: xmake sandbox has no pcall(); set PYBIND11_INCLUDE in the environment.
 local PYBIND11_INCLUDE = os.getenv("PYBIND11_INCLUDE")
 if not PYBIND11_INCLUDE or PYBIND11_INCLUDE == "" then
-    local ok, out = pcall(function()
-        return os.iorunv(os.getenv("PYTHON") or "python3", {
-            "-c", "import pybind11; print(pybind11.get_include())"
-        })
-    end)
-    if ok and out and out:trim() ~= "" then
-        PYBIND11_INCLUDE = out:trim()
-    end
-end
-if not PYBIND11_INCLUDE or PYBIND11_INCLUDE == "" then
+    -- Fallback: may trigger xmake-repo fetch (needs network). Prefer exporting PYBIND11_INCLUDE.
     add_requires("pybind11")
     if is_plat("linux") then
         add_requireconfs("pybind11.python", { configs = { headeronly = true } })
@@ -112,6 +104,7 @@ target("infinicore_runtime")
         add_rpathdirs("@loader_path")
     end
     add_links("infiniops", "infiniccl", "infinirt", { public = true })
+    add_links("infinilm_metax_extra", { public = true })
 
     add_files("csrc/infinicore/src/*.cc")
     add_files("csrc/infinicore/src/adaptor/*.cc")
@@ -263,6 +256,9 @@ target("_infinilm")
     add_files("csrc/models/minicpm_eagle/*.cpp")
     add_files("csrc/models/qwen2/*.cpp")
     add_files("csrc/models/qwen3/*.cpp")
+    add_files("csrc/models/qwen3_5/*.cpp")
+    add_files("csrc/models/qwen3_5_moe/*.cpp")
+    add_files("csrc/models/qwen3_next/*.cpp")
 
     set_installdir("python/infinilm")
 target_end()

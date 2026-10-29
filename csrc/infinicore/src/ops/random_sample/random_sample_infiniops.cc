@@ -31,7 +31,7 @@ void calculate(
     Tensor indices, Tensor logits,
     float random_value, float top_p, int top_k, float temperature) {
     const auto dtype = logits->dtype();
-    INFINICORE_ASSERT(logits->device().type() == Device::Type::kNvidia);
+    INFINICORE_ASSERT(logits->device().type() == Device::Type::kNvidia || logits->device().type() == Device::Type::kMetax);
     INFINICORE_ASSERT_TENSORS_SAME_DEVICE(indices, logits);
     INFINICORE_ASSERT(logits->ndim() == 1 && logits->numel() > 0 && logits->is_contiguous());
     INFINICORE_ASSERT(
@@ -136,6 +136,7 @@ void calculate(
 
 static bool registered = []() {
     RandomSample::dispatcher().registerDevice(Device::Type::kNvidia, &calculate);
+    RandomSample::dispatcher().registerDevice(Device::Type::kMetax, &calculate);
     return true;
 }();
 

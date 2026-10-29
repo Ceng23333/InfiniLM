@@ -19,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <spdlog/spdlog.h>
 #include "infinicore/context/context.hpp"
 #include "infinicore/graph/graph.hpp"
@@ -260,13 +261,75 @@ size_t compute_prefill_len(const InfinilmModel::Input &input) {
     return 0;
 }
 
+
+namespace {
+bool has_mamba_cache_for_piecewise_() {
+    auto has_state = [](const std::vector<infinicore::Tensor> &state_vec) {
+        for (const auto &state : state_vec) {
+            if (state) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto &fwd = infinilm::global_state::get_forward_context();
+    return has_state(fwd.conv_state_vec) || has_state(fwd.ssm_state_vec);
+}
+
+void fill_mamba_capture_indices_(InfinilmModel::Input &input, size_t n_req) {
+    if (!has_mamba_cache_for_piecewise_()) {
+        return;
+    }
+    // Prefill convention (qwen3_5_processor): init=0 (shared empty), final=1..n_req.
+    input.mamba_init_state_indices = infinicore::Tensor::empty(
+        {n_req}, infinicore::DataType::kInt32, infinicore::context::getDevice());
+    input.mamba_final_state_indices = infinicore::Tensor::empty(
+        {n_req}, infinicore::DataType::kInt32, infinicore::context::getDevice());
+    std::vector<int32_t> init_vec(n_req, 0);
+    std::vector<int32_t> final_vec(n_req);
+    for (size_t i = 0; i < n_req; ++i) {
+        final_vec[i] = static_cast<int32_t>(i + 1);
+    }
+    infinicore::context::memcpyH2D(
+        input.mamba_init_state_indices.value()->data(),
+        init_vec.data(),
+        n_req * sizeof(int32_t),
+        false);
+    infinicore::context::memcpyH2D(
+        input.mamba_final_state_indices.value()->data(),
+        final_vec.data(),
+        n_req * sizeof(int32_t),
+        false);
+}
+} // namespace
+
 void set_attn_metadata(const InfinilmModel::Input &input) {
     attn_metadata_utils::set_attn_metadata(input);
+    // Hybrid linear-attention (Qwen3.5 GDN) reads cache indices from thread-local
+    // mamba_metadata — same contract as paged_compiler capture.
+    auto &fwd = infinilm::global_state::get_forward_context();
+    fwd.mamba_metadata = {
+        input.input_offsets,
+        input.mamba_init_state_indices,
+        input.mamba_final_state_indices,
+    };
 }
 
 void set_attn_metadata_for_varlen_batch(const InfinilmModel::Input &compiled,
                                         const InfinilmModel::Input &runtime) {
     attn_metadata_utils::set_attn_metadata_for_varlen_batch(compiled, runtime);
+    // to_model_input(cpu) replaces the thread-local Mamba metadata. Rebind it
+    // to the updated device buffers, just as we do for attention metadata.
+    if (compiled.mamba_init_state_indices.has_value()) {
+        const size_t n = runtime.block_tables.value()->size(0);
+        auto &fwd = infinilm::global_state::get_forward_context();
+        fwd.mamba_metadata = {
+            compiled.input_offsets.value()->narrow({{0, 0, n + 1}}),
+            compiled.mamba_init_state_indices.value()->narrow({{0, 0, n}}),
+            compiled.mamba_final_state_indices.value()->narrow({{0, 0, n}}),
+        };
+    }
+
 }
 
 void zero_tensor_tail_seq_(infinicore::Tensor &tensor, size_t valid_len, size_t bucket) {
@@ -379,8 +442,16 @@ void PiecewisePrefillCompiler::allocate_shared_banks_(size_t max_bucket,
 
     shared_banks_.input_ids =
         infinicore::Tensor::empty({1, max_bucket}, infinicore::DataType::kInt64, device);
-    shared_banks_.position_ids =
-        infinicore::Tensor::empty({max_bucket}, infinicore::DataType::kInt64, device);
+    const size_t position_id_axes = model_config->get_or<size_t>("position_id_axes", 1);
+    if (position_id_axes == 0) {
+        throw std::runtime_error("PiecewisePrefillCompiler: position_id_axes must be positive");
+    }
+    shared_banks_.position_ids = infinicore::Tensor::empty(
+        position_id_axes > 1
+            ? std::vector<size_t>{position_id_axes, max_bucket}
+            : std::vector<size_t>{max_bucket},
+        infinicore::DataType::kInt64,
+        device);
     shared_banks_.slot_mapping =
         infinicore::Tensor::empty({max_bucket}, infinicore::DataType::kInt64, device);
     shared_banks_.past_sequence_lengths =
@@ -454,7 +525,10 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
     }
     InfinilmModel::Input input;
     input.input_ids = shared_banks_.input_ids->narrow({{1, 0, bucket}});
-    input.position_ids = shared_banks_.position_ids->narrow({{0, 0, bucket}});
+    const bool multi_axis_pos = shared_banks_.position_ids->ndim() == 2;
+    input.position_ids = multi_axis_pos
+        ? shared_banks_.position_ids->narrow({{1, 0, bucket}})
+        : shared_banks_.position_ids->narrow({{0, 0, bucket}});
     input.past_sequence_lengths = shared_banks_.past_sequence_lengths;
     input.total_sequence_lengths = shared_banks_.total_sequence_lengths;
     input.input_offsets = shared_banks_.input_offsets;
@@ -472,10 +546,25 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
     const int64_t pos_start = mid_chunk_capture
         ? static_cast<int64_t>(past)
         : ((bucket < chunk_size) ? static_cast<int64_t>(chunk_size) : int64_t{0});
-    std::vector<int64_t> position_ids_vec(bucket);
-    std::iota(position_ids_vec.begin(), position_ids_vec.end(), pos_start);
-    infinicore::context::memcpyH2D(
-        input.position_ids.value()->data(), position_ids_vec.data(), bucket * sizeof(int64_t), false);
+    if (multi_axis_pos) {
+        const size_t axes = shared_banks_.position_ids->size(0);
+        std::vector<int64_t> position_ids_vec(axes * bucket);
+        for (size_t ax = 0; ax < axes; ++ax) {
+            for (size_t i = 0; i < bucket; ++i) {
+                position_ids_vec[ax * bucket + i] = pos_start + static_cast<int64_t>(i);
+            }
+        }
+        infinicore::context::memcpyH2D(
+            input.position_ids.value()->data(),
+            position_ids_vec.data(),
+            axes * bucket * sizeof(int64_t),
+            false);
+    } else {
+        std::vector<int64_t> position_ids_vec(bucket);
+        std::iota(position_ids_vec.begin(), position_ids_vec.end(), pos_start);
+        infinicore::context::memcpyH2D(
+            input.position_ids.value()->data(), position_ids_vec.data(), bucket * sizeof(int64_t), false);
+    }
 
     const int32_t per_req = static_cast<int32_t>(bucket / std::max<size_t>(1, n_req));
     std::vector<int32_t> past_lengths_vec(n_req, static_cast<int32_t>(past));
@@ -539,6 +628,7 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_bucket_input_(size_t bucket,
         input.slot_mapping.value()->data(), slot_mapping_vec.data(), bucket * sizeof(int64_t), false);
     // Mid capture is a continuing chunk (not final); leave flag empty → treated as final for
     // lm_head dry-run only when we explicitly run lm_head below. Runtime mid uses is_final=false.
+    fill_mamba_capture_indices_(input, n_req);
     return input;
 }
 
@@ -562,7 +652,10 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_mixed_mid_bucket_input_(size
 
     InfinilmModel::Input input;
     input.input_ids = shared_banks_.input_ids->narrow({{1, 0, bucket}});
-    input.position_ids = shared_banks_.position_ids->narrow({{0, 0, bucket}});
+    const bool multi_axis_pos = shared_banks_.position_ids->ndim() == 2;
+    input.position_ids = multi_axis_pos
+        ? shared_banks_.position_ids->narrow({{1, 0, bucket}})
+        : shared_banks_.position_ids->narrow({{0, 0, bucket}});
     // Narrow metadata to capture n_req so FA max_seqlens do not see zero-pad tails.
     input.past_sequence_lengths = shared_banks_.past_sequence_lengths->narrow({{0, 0, n_req}});
     input.total_sequence_lengths = shared_banks_.total_sequence_lengths->narrow({{0, 0, n_req}});
@@ -573,13 +666,29 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_mixed_mid_bucket_input_(size
     set_zeros(input.past_sequence_lengths.value());
     set_zeros(input.total_sequence_lengths.value());
 
-    std::vector<int64_t> position_ids_vec(bucket);
-    position_ids_vec[0] = static_cast<int64_t>(decode_past);
-    for (size_t i = 0; i < mid_q; ++i) {
-        position_ids_vec[decode_q + i] = static_cast<int64_t>(mid_past + i);
+    if (multi_axis_pos) {
+        const size_t axes = shared_banks_.position_ids->size(0);
+        std::vector<int64_t> position_ids_vec(axes * bucket, 0);
+        for (size_t ax = 0; ax < axes; ++ax) {
+            position_ids_vec[ax * bucket + 0] = static_cast<int64_t>(decode_past);
+            for (size_t i = 0; i < mid_q; ++i) {
+                position_ids_vec[ax * bucket + decode_q + i] = static_cast<int64_t>(mid_past + i);
+            }
+        }
+        infinicore::context::memcpyH2D(
+            input.position_ids.value()->data(),
+            position_ids_vec.data(),
+            axes * bucket * sizeof(int64_t),
+            false);
+    } else {
+        std::vector<int64_t> position_ids_vec(bucket);
+        position_ids_vec[0] = static_cast<int64_t>(decode_past);
+        for (size_t i = 0; i < mid_q; ++i) {
+            position_ids_vec[decode_q + i] = static_cast<int64_t>(mid_past + i);
+        }
+        infinicore::context::memcpyH2D(
+            input.position_ids.value()->data(), position_ids_vec.data(), bucket * sizeof(int64_t), false);
     }
-    infinicore::context::memcpyH2D(
-        input.position_ids.value()->data(), position_ids_vec.data(), bucket * sizeof(int64_t), false);
 
     const std::vector<int32_t> past_lengths_vec{
         static_cast<int32_t>(decode_past), static_cast<int32_t>(mid_past)};
@@ -640,6 +749,7 @@ InfinilmModel::Input PiecewisePrefillCompiler::make_mixed_mid_bucket_input_(size
 
     // Row0 decode (lm_head + sample); row1 continuing mid (no sample).
     input.is_final_prefill_chunk = {true, false};
+    fill_mamba_capture_indices_(input, n_req);
     return input;
 }
 
@@ -720,13 +830,24 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_cap
     if (!mid_chunk_capture) {
         model_->native_piecewise_lm_head(graphs.input, hidden, residual, graphs.logits_holder);
     }
-    // Reset KV so capture FA sees the same empty-cache shape as dry-run start.
+    // Reset KV / SSM / conv so capture FA+GDN see the same empty-cache shape as dry-run start.
     // Stale KV + many cudaGraphExecs on QY previously LOOR'd mid-ladder FA.
+    // Qwen3.5 GDN dry-run mutates ssm_state_vec / conv_state_vec — zero those too.
     {
-        auto &kv_cache_vec = infinilm::global_state::get_forward_context().kv_cache_vec;
-        for (auto &kv : kv_cache_vec) {
+        auto &fwd = infinilm::global_state::get_forward_context();
+        for (auto &kv : fwd.kv_cache_vec) {
             if (kv) {
                 set_zeros(kv);
+            }
+        }
+        for (auto &t : fwd.ssm_state_vec) {
+            if (t) {
+                set_zeros(t);
+            }
+        }
+        for (auto &t : fwd.conv_state_vec) {
+            if (t) {
+                set_zeros(t);
             }
         }
         infinicore::context::syncDevice();
@@ -1103,9 +1224,14 @@ void PiecewisePrefillCompiler::copy_runtime_into_bucket_(BucketGraphs &bucket_gr
     graph_input.input_ids.value()
         ->narrow({{1, 0, valid_seq_len}})
         ->copy_from(runtime.input_ids.value());
-    graph_input.position_ids.value()
-        ->narrow({{0, 0, valid_seq_len}})
-        ->copy_from(runtime.position_ids.value());
+    {
+        auto &graph_pos = graph_input.position_ids.value();
+        if (graph_pos->ndim() == 2) {
+            graph_pos->narrow({{1, 0, valid_seq_len}})->copy_from(runtime.position_ids.value());
+        } else {
+            graph_pos->narrow({{0, 0, valid_seq_len}})->copy_from(runtime.position_ids.value());
+        }
+    }
 
 
     const size_t runtime_n_req = runtime.block_tables.value()->size(0);
@@ -1181,6 +1307,15 @@ void PiecewisePrefillCompiler::copy_runtime_into_bucket_(BucketGraphs &bucket_gr
     graph_input.slot_mapping.value()
         ->narrow({{0, 0, valid_seq_len}})
         ->copy_from(runtime.slot_mapping.value());
+    if (graph_input.mamba_init_state_indices.has_value()
+        && runtime.mamba_init_state_indices.has_value()) {
+        graph_input.mamba_init_state_indices.value()
+            ->narrow({{0, 0, runtime_n_req}})
+            ->copy_from(runtime.mamba_init_state_indices.value());
+        graph_input.mamba_final_state_indices.value()
+            ->narrow({{0, 0, runtime_n_req}})
+            ->copy_from(runtime.mamba_final_state_indices.value());
+    }
     if (valid_seq_len < bucket) {
         // Prefer decode-style pad hygiene: zero slot tails (not -1). Prefill FA is
         // eager, but post CG may still touch padded width; -1 slots ATU under
@@ -1189,7 +1324,10 @@ void PiecewisePrefillCompiler::copy_runtime_into_bucket_(BucketGraphs &bucket_gr
         set_zeros(slot_tail);
         auto ids_tail = graph_input.input_ids.value()->narrow({{1, valid_seq_len, bucket - valid_seq_len}});
         set_zeros(ids_tail);
-        auto pos_tail = graph_input.position_ids.value()->narrow({{0, valid_seq_len, bucket - valid_seq_len}});
+        auto &graph_pos = graph_input.position_ids.value();
+        auto pos_tail = graph_pos->ndim() == 2
+            ? graph_pos->narrow({{1, valid_seq_len, bucket - valid_seq_len}})
+            : graph_pos->narrow({{0, valid_seq_len, bucket - valid_seq_len}});
         set_zeros(pos_tail);
     }
 }

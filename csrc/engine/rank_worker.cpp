@@ -456,6 +456,14 @@ void RankWorker::thread_loop() {
                             // FULL decode: FA in-graph under FA_INGRAPH=decode.
                             if (!logits && !piecewise_ran && uniform_decode) {
                                 auto [graph, output] = compiler_->get_compiled(model_input_cpu);
+                                static thread_local bool reported_decode_graph = false;
+                                if (!reported_decode_graph && std::getenv("INFINI_DECODE_GRAPH_DIAGNOSTICS")) {
+                                    spdlog::info("decode graph rank={} selected={} device_segments={}",
+                                                 rank_info_.tp_rank, graph != nullptr,
+                                                 graph ? graph->device_segment_count() : 0);
+                                    reported_decode_graph = true;
+                                }
+
                                 if (graph != nullptr && output != nullptr) {
                                     infinicore::context::InferencePhaseGuard phase_guard(
                                         infinicore::context::InferencePhase::Decode);
@@ -543,6 +551,9 @@ void RankWorker::thread_loop() {
 
                             const bool parameter_greedy = top_p == 0.0f || top_k == 1 || temperature == 0.0f;
                             const auto logits_dtype = logits->dtype();
+                            // QY batch_greedy (one random_sample_ on a flattened logits
+                            // view) returns garbage ids when n_out>1 under V1 multi-request.
+                            // Keep NVIDIA batch path; force QY through the per-index loop.
                             const bool batch_greedy = (rank_info_.device.type() == infinicore::Device::Type::kNvidia
                                                        || rank_info_.device.type() == infinicore::Device::Type::kQy)
                                                    && parameter_greedy
@@ -552,7 +563,9 @@ void RankWorker::thread_loop() {
                                                    && (logits_dtype == infinicore::DataType::kFloat16
                                                        || logits_dtype == infinicore::DataType::kBFloat16
                                                        || logits_dtype == infinicore::DataType::kFloat32)
-                                                   && (sample_all_positions || logits_are_last_token_only);
+                                                   && (sample_all_positions || logits_are_last_token_only)
+                                                   && !(rank_info_.device.type() == infinicore::Device::Type::kQy
+                                                        && n_out > 1);
                             if (batch_greedy) {
                                 float random_val = 0.0f;
                                 for (size_t i{0}; i < n_out; ++i) {
