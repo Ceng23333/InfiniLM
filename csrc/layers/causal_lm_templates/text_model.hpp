@@ -1,4 +1,5 @@
 #pragma once
+#include "../../debug_utils/graph_checkpoint.hpp"
 
 #include "../../config/model_config.hpp"
 #include "../../global_state/global_state.hpp"
@@ -65,6 +66,7 @@ public:
     infinicore::Tensor forward(const infinilm::InfinilmModel::Input &input) const {
         auto positions = input.position_ids.value();
         auto hidden_states = initial_hidden_states(input);
+        if (tp_rank_ == 0) debug::graph_checkpoint("00_embedding", hidden_states);
 
         size_t num_layers = layers_.size();
         infinicore::Tensor residual;
@@ -73,6 +75,10 @@ public:
                 positions,
                 hidden_states,
                 residual);
+            if (tp_rank_ == 0 && debug::graph_checkpoints_enabled()) {
+                debug::graph_checkpoint("layer_" + std::to_string(i) + "_hidden", hidden_states);
+                debug::graph_checkpoint("layer_" + std::to_string(i) + "_residual", residual);
+            }
         }
 
         if (!is_last_pp_stage()) {
@@ -82,6 +88,7 @@ public:
         }
 
         norm_->forward_inplace(hidden_states, residual);
+        if (tp_rank_ == 0) debug::graph_checkpoint("final_norm", hidden_states);
         return hidden_states;
     }
 

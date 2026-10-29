@@ -22,6 +22,10 @@ local OPERATOR_CALLS_HEADER = INFINI_ROOT .. "/include/infini/operator_call_inst
 
 set_toolchains("gcc")
 
+-- A mode name alone does not enable compiler optimization in xmake.
+add_rules("mode.debug", "mode.release", "mode.releasedbg")
+
+
 -- Fallback when xmake python plugin / network repos are unavailable.
 rule("python.module")
     on_config(function (target)

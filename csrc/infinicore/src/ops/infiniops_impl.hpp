@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "config.h"
 #include "data_type.h"
@@ -89,11 +90,23 @@ inline bool isSupportedDevice(Device::Type device_type) {
     }
 }
 
+// Provider traits live in the compiled InfiniOps library. Consumer headers
+// intentionally omit backend specializations; extern template declarations do
+// not prevent an optimizer from inlining that empty primary-template body.
+// Dispatch indirectly through the exported instantiation at every optimization
+// level instead of treating consumer-side traits as the provider manifest.
+template <typename Operator>
+std::vector<std::size_t> activeImplementationIndices(infini::ops::Device::Type device_type) {
+    using Query = std::vector<std::size_t> (*)(infini::ops::Device::Type);
+    Query volatile query = &Operator::active_implementation_indices;
+    return query(device_type);
+}
+
 template <typename Operator>
 infini::ops::Config configForImplementation(
     infini::ops::Device::Type device_type,
     std::size_t implementation_index) {
-    const auto implementation_indices = Operator::active_implementation_indices(device_type);
+    const auto implementation_indices = activeImplementationIndices<Operator>(device_type);
     if (std::find(
             implementation_indices.begin(),
             implementation_indices.end(),
@@ -114,7 +127,7 @@ template <typename Operator>
 infini::ops::Config defaultConfigForDevice(infini::ops::Device::Type device_type) {
     if (device_type == infini::ops::Device::Type::kNvidia) {
         static const std::size_t implementation_index = [] {
-            const auto implementation_indices = Operator::active_implementation_indices(
+            const auto implementation_indices = activeImplementationIndices<Operator>(
                 infini::ops::Device::Type::kNvidia);
             if (implementation_indices.empty()) {
                 throw std::runtime_error(
@@ -131,7 +144,7 @@ infini::ops::Config defaultConfigForDevice(infini::ops::Device::Type device_type
         return config;
     }
 
-    const auto implementation_indices = Operator::active_implementation_indices(device_type);
+    const auto implementation_indices = activeImplementationIndices<Operator>(device_type);
     if (implementation_indices.empty()) {
         throw std::runtime_error(
             "InfiniOps operator has no active implementation for device '"

@@ -64,6 +64,10 @@ class LLMEngine:
         # Initialize processor
         self.processor = self.model_runner.processor
         self.tokenizer = self.processor.get_tokenizer()
+        # The serving tokenizer is fixed after processor initialization. Some
+        # tokenizers rebuild vocabulary metadata in __len__; keep that work
+        # off the per-token path while including all added tokens.
+        self._tokenizer_vocab_size = len(self.tokenizer)
 
         # Initialize KV cache based on cache type
         if config.cache_type == "static":
@@ -390,7 +394,7 @@ class LLMEngine:
 
         # Prefer len(tokenizer): HF vocab_size often excludes added tokens
         # (MiniCPM5: vocab_size=130072 vs len=130560 == model config).
-        vocab_size = len(self.tokenizer)
+        vocab_size = self._tokenizer_vocab_size
 
         num_appended_tokens = 0
         for token_id in token_ids:

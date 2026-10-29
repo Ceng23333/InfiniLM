@@ -187,9 +187,15 @@ class BasicLLMProcessor(InfinilmProcessor):
         seq_lens.append(total_kv_len)
         current_offset = seq_offsets[-1] + len(tokens_to_compute)
         seq_offsets.append(current_offset)
-        slot_start = start - num_cached
-        slot_end = end - num_cached
-        # slot_mapping may cover the full allocated suffix from num_cached.
+        # The allocation covers the full uncached prefill suffix. Its origin
+        # stays fixed while num_local_cached_tokens advances after each chunk.
+        # Subtracting that moving counter would write every chunk into the
+        # first chunk's KV slots, discarding the earlier prompt context.
+        slot_origin = len(req_tokens) - len(req.slot_mapping)
+        slot_start = start - slot_origin
+        slot_end = end - slot_origin
+        if req.slot_mapping and not (0 <= slot_start <= slot_end <= len(req.slot_mapping)):
+            raise ValueError("Prefill chunk is outside its allocated KV slot mapping")
         if req.slot_mapping and slot_end > slot_start:
             slot_mapping.extend(req.slot_mapping[slot_start:slot_end])
         else:
