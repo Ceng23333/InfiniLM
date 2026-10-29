@@ -757,9 +757,14 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_cap
         infinicore::context::syncDevice();
     }
     if (!mid_chunk_capture && prefill_full_cg_enabled()) {
-        const auto &capture_meta = global_state::get_forward_context().attn_metadata;
-        graphs.full_max_query_length = capture_meta.max_query_length;
-        graphs.full_max_sequence_length = capture_meta.max_sequence_length;
+        // Capture capacities, not the lengths of the representative warmup rows.
+        // The same graph must handle one full chunk and growing cached prefixes.
+        const auto *cache = dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config());
+        graphs.full_max_query_length = bucket;
+        graphs.full_max_sequence_length = std::min(max_seq_len_, nblocks * cache->block_size());
+        auto &capture_meta = global_state::get_forward_context().attn_metadata;
+        capture_meta.max_query_length = graphs.full_max_query_length;
+        capture_meta.max_sequence_length = graphs.full_max_sequence_length;
         graphs.pre_attn.clear();
         graphs.post_attn.clear();
         graphs.lm_head.reset();
@@ -778,6 +783,9 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_cap
         auto output = model_->forward(graphs.input);
         graphs.full_compiled = make_full_compiled_(
             graphs.input, recording.finish(), output);
+        if (!std::get<0>(graphs.full_compiled)->is_fully_device_replayed()) {
+            throw std::runtime_error("FULL prefill capture contains host/eager segments; device-only replay is required");
+        }
         barrier_->wait();
         infinicore::context::syncDevice();
 
@@ -791,9 +799,11 @@ void PiecewisePrefillCompiler::capture_bucket_(size_t bucket, bool mid_chunk_cap
         } else {
             compiled_[bucket] = std::move(graphs);
         }
+        const auto &captured = compiled_.at(bucket);
         spdlog::info(
-            "native FULL prefill CG: captured bucket={} layers={} mode=vllm_full",
-            bucket, capture_layers);
+            "native FULL prefill CG: captured bucket={} layers={} max_q={} max_k={} device_segments={} mode=vllm_full",
+            bucket, num_layers, captured.full_max_query_length, captured.full_max_sequence_length,
+            std::get<0>(captured.full_compiled)->device_segment_count());
         return;
     }
 
@@ -1049,7 +1059,9 @@ void PiecewisePrefillCompiler::compile() {
     // Capture width ≥ MAX_BATCH_SIZE so mixed/multi-req PIECEWISE can replay with
     // runtime_n_req ≤ compiled_n_req (vLLM mixed_mode=PIECEWISE). Opt-in override:
     // INFINI_MAX_PREFILL_BATCH. Default 8 (Band C). Set to 1 only for Gate-D bisect.
-    max_capture_req_ = 8;
+    max_capture_req_ = prefill_full_cg_enabled()
+        ? std::max<size_t>(1, dynamic_cast<const cache::PagedKVCacheConfig *>(model_->get_cache_config())->max_batch_size())
+        : 8;
     if (const char *raw = std::getenv("INFINI_MAX_PREFILL_BATCH")) {
         max_capture_req_ = std::max<size_t>(1, std::stoul(raw));
     } else if (const char *raw = std::getenv("MAX_BATCH_SIZE")) {
@@ -1090,7 +1102,8 @@ void PiecewisePrefillCompiler::compile() {
         // MIXED dual-capture (compiled_mixed_mid_) is opt-in via KEEP_MIXED_MID_CAPTURE;
         // product MIXED prefer replays final compiled_ banks (vLLM-like).
         // QY: SKIP_MID_CAPTURE avoids a second full layer ladder of cudaGraphExec.
-        if (!skip_homo_mid_capture() && bucket == prefill_chunk_size_ && prefill_chunk_size_ > 0) {
+        if (!prefill_full_cg_enabled() && !skip_homo_mid_capture()
+            && bucket == prefill_chunk_size_ && prefill_chunk_size_ > 0) {
             capture_bucket_(bucket, /*mid_chunk_capture=*/true);
             infinicore::context::syncDevice();
             if (keep_mixed_mid_capture() && mixed_mid_capture_req_ >= 2 && bucket >= 2) {
@@ -1298,10 +1311,16 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
             need_lm_head);
     }
     if (compiled_.find(graph_bucket) == compiled_.end()) {
+        if (prefill_full_cg_enabled()) {
+            throw std::runtime_error("FULL prefill has no captured token bucket for this request");
+        }
         ++prefill_misses_;
         return std::nullopt;
     }
     if (runtime_n_req > max_capture_req_) {
+        if (prefill_full_cg_enabled()) {
+            throw std::runtime_error("FULL prefill request count exceeds configured capture capacity");
+        }
         ++prefill_misses_;
         spdlog::debug(
             "piecewise run_prefill: runtime_n_req={} > max_capture_req={} → eager",
@@ -1314,23 +1333,17 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
     // valid_seq_len=L + zeroed tails (INFINI_PIECEWISE_PAD_UP_CG, default ON).
     // Kill-switch =0 restores legacy eager-only pad-up (PlannedMeta / SIGSEGV history).
     auto &candidate = compiled_.at(graph_bucket);
-    if (!mid_chunk && prefill_full_cg_enabled()
-        && std::get<0>(candidate.full_compiled) != nullptr) {
+    if (prefill_full_cg_enabled()) {
+        if (std::get<0>(candidate.full_compiled) == nullptr) {
+            throw std::runtime_error("FULL prefill was enabled without a captured graph; recreate the engine");
+        }
         // The provider captures host max-length scalars in its launch plan.
         // Updating the length tensors does not enlarge that captured plan.
         set_attn_metadata(input);
         const auto &runtime_meta = global_state::get_forward_context().attn_metadata;
         if (runtime_meta.max_query_length > candidate.full_max_query_length
             || runtime_meta.max_sequence_length > candidate.full_max_sequence_length) {
-            ++prefill_misses_;
-            static thread_local bool warned = false;
-            if (!warned) {
-                spdlog::warn("FULL prefill length guard: runtime q/k={}/{} exceeds capture {}/{}; using eager",
-                             runtime_meta.max_query_length, runtime_meta.max_sequence_length,
-                             candidate.full_max_query_length, candidate.full_max_sequence_length);
-                warned = true;
-            }
-            return std::nullopt;
+            throw std::runtime_error("FULL prefill runtime exceeds capture capacity; configure token buckets and INFINI_COMPILE_MAX_SEQ before engine creation");
         }
         global_state::get_forward_context().piecewise.valid_seq_len = seq_len;
         copy_runtime_into_bucket_(candidate, input, seq_len);
@@ -1342,22 +1355,23 @@ std::optional<infinicore::Tensor> PiecewisePrefillCompiler::run_prefill(const In
         set_attn_metadata_for_varlen_batch(candidate.input, input);
         model_->reset_runtime_state();
         std::get<0>(candidate.full_compiled)->run();
+        if (!std::get<0>(candidate.full_compiled)->last_run_profile().used_device) {
+            throw std::runtime_error("FULL prefill replay did not launch a device graph");
+        }
         const auto &captured_output = std::get<1>(candidate.full_compiled);
         infinicore::Tensor full_logits = captured_output->logits->resume_from_blob_();
-        auto offsets_cpu = candidate.input.input_offsets.value()->to(infinicore::Device{infinicore::Device::Type::kCpu});
-        const auto *offsets = reinterpret_cast<const int32_t *>(offsets_cpu->data());
-        for (size_t req = 0; req < runtime_n_req; ++req) {
-            const size_t source_pos = req;
-            const size_t target_pos = offsets[req + 1] - 1;
-            infinicore::Tensor source = full_logits->shape().size() == 2
-                ? full_logits->narrow({{0, source_pos, 1}})
-                : full_logits->narrow({{1, source_pos, 1}});
-            auto target = candidate.logits_holder->narrow({{1, target_pos, 1}});
-            target->copy_from(source->view({1, 1, source->size(source->shape().size() - 1)}));
-        }
         ++prefill_hits_;
         last_prefill_executed_ = true;
-        return candidate.logits_holder;
+        if (profile) {
+            spdlog::info("full_prefill_replay: tokens={} bucket={} requests={} max_q={} max_k={} mid={} final={} used_device=1",
+                         seq_len, graph_bucket, runtime_n_req, runtime_meta.max_query_length,
+                         runtime_meta.max_sequence_length, mid_chunk, need_lm_head);
+        }
+        // The captured model gathers last-token hidden states on device from the
+        // live offsets. Return only active rows; padded rows must never be sampled.
+        return full_logits->ndim() == 2
+            ? full_logits->narrow({{0, 0, runtime_n_req}})->view({1, runtime_n_req, full_logits->size(1)})
+            : full_logits->narrow({{1, 0, runtime_n_req}});
     }
 
     const bool pad_up = seq_len != graph_bucket;

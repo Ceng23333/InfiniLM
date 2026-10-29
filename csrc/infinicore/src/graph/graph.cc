@@ -353,6 +353,18 @@ void Graph::run() const {
     }
 }
 
+bool Graph::is_fully_device_replayed() const {
+    if (segments_.empty()) {
+        return false;
+    }
+    for (const auto &segment : segments_) {
+        if (!segment->has_device_exec()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void Graph::add_operator(std::shared_ptr<GraphOperator> op) {
     op_list_.push_back(op);
 }

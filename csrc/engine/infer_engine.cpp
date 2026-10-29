@@ -272,6 +272,11 @@ InferEngine::Input::to_model_input(
     infinicore::Device device,
     bool snapshot_static_sequence_lengths,
     bool preserve_target_hidden_device) const {
+    if (!is_final_prefill_chunk.empty()
+        && (!input_offsets.has_value() || input_offsets.value()->numel() < 2
+            || is_final_prefill_chunk.size() + 1 != input_offsets.value()->numel())) {
+        throw std::invalid_argument("chunk-final flags must match the packed request count");
+    }
 
     auto to_device = [&](const std::optional<infinicore::Tensor> &t)
         -> std::optional<infinicore::Tensor> {
@@ -336,7 +341,8 @@ InferEngine::Input::to_model_input(
         preserve_target_hidden_device
             ? target_hidden_states
             : to_device(target_hidden_states),
-        sample_all_positions};
+        sample_all_positions,
+        is_final_prefill_chunk};
 
     if (serialize_host_copy) {
         infinicore::context::syncStream();

@@ -492,6 +492,20 @@ void RankWorker::thread_loop() {
                             hidden_states = model_output.hidden_states;
                         }
 
+                        if (rank_info_.pp_size == 1 && !local_args.sample_all_positions
+                            && !InfinilmModel::any_final_prefill_chunk(local_args.is_final_prefill_chunk)) {
+                            infinicore::context::syncStream();
+                            auto ids = infinicore::Tensor::empty(
+                                {local_args.is_final_prefill_chunk.size()}, infinicore::DataType::kInt64,
+                                infinicore::Device{infinicore::Device::Type::kCpu});
+                            auto *values = reinterpret_cast<int64_t *>(ids->data());
+                            std::fill(values, values + local_args.is_final_prefill_chunk.size(), int64_t{-1});
+                            output_ = Output{ids, logits, hidden_states};
+                            job_done_ = true;
+                            cv_.notify_all();
+                            continue;
+                        }
+
                         if (rank_info_.pp_size > 1 && rank_info_.pp_stage + 1 != rank_info_.pp_size) {
                             infinicore::Tensor output_ids;
                             if (rank_info_.pp_stage == 0 && rank_info_.tp_rank == 0) {
@@ -540,6 +554,12 @@ void RankWorker::thread_loop() {
                             const bool logits_are_last_token_only = !sample_all_positions && logits_positions == n_req;
                             const size_t n_out = sample_all_positions ? static_cast<size_t>(input_offsets[n_req]) : n_req;
                             auto output_ids{infinicore::Tensor::empty({n_out}, infinicore::DataType::kInt64, rank_info_.device)};
+                            const bool partial_chunk = !sample_all_positions
+                                && InfinilmModel::has_nonfinal_prefill_chunk(local_args.is_final_prefill_chunk);
+                            if (partial_chunk) {
+                                infinicore::context::setDeviceMemoryAsync(
+                                    output_ids->data(), 0xFF, output_ids->nbytes(), infinicore::context::getStream());
+                            }
 
                             const bool parameter_greedy = top_p == 0.0f || top_k == 1 || temperature == 0.0f;
                             const auto logits_dtype = logits->dtype();
@@ -548,6 +568,7 @@ void RankWorker::thread_loop() {
                             const bool batch_greedy = (rank_info_.device.type() == infinicore::Device::Type::kNvidia
                                                        || rank_info_.device.type() == infinicore::Device::Type::kQy)
                                                    && parameter_greedy
+                                                   && !partial_chunk
                                                    && n_out > 0
                                                    && logits_positions == n_out
                                                    && logits->is_contiguous()
@@ -569,6 +590,9 @@ void RankWorker::thread_loop() {
                                     temperature);
                             } else {
                                 for (size_t i{0}; i < n_out; ++i) {
+                                    if (partial_chunk && !local_args.is_final_prefill_chunk[i]) {
+                                        continue;
+                                    }
                                     size_t score_idx = i;
                                     if (!sample_all_positions && !logits_are_last_token_only) {
                                         score_idx = static_cast<size_t>(input_offsets[i + 1] - 1);

@@ -77,6 +77,8 @@ public:
 
     /// Number of capture-safe segments that own a device graph exec.
     size_t device_segment_count() const;
+    /// True only when every segment has a device executable (no host/eager work).
+    bool is_fully_device_replayed() const;
 
     /// Bytes retained by capture arena (0 when arena accounting unavailable).
     size_t capture_arena_bytes() const { return 0; }

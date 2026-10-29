@@ -83,6 +83,15 @@ bool MhaKVCache::supports_device_graph_capture(
                                 && seqlens_k->shape() == Shape({1})
                                 && block_table->size(0) == 1
                                 && block_table->size(1) > 0;
+    // QY MiniCPM5-2B B1-B4 share the same fused-QKV strides and persistent
+    // provider contract; lengths and physical pages remain device inputs.
+    const bool qy_minicpm5_2b_batch_shape = device.type() == Device::Type::kQy
+        && q->size(0) >= 1 && q->size(0) <= 4
+        && q->shape() == Shape({q->size(0), 1, 16, 128})
+        && k_cache->size(0) > 0 && k_cache->size(1) == 256
+        && k_cache->size(2) == 2 && k_cache->size(3) == 128
+        && seqlens_k->shape() == Shape({q->size(0)})
+        && block_table->size(0) == q->size(0) && block_table->size(1) > 0;
     // MiniCPM5-16A3 TP1 decode: gated attention Q|gate interleaved head stride.
     const bool minicpm5_16a3_shape = q->shape() == Shape({1, 1, 32, 128})
                                   && out->shape() == Shape({1, 1, 32, 128})
@@ -123,6 +132,7 @@ bool MhaKVCache::supports_device_graph_capture(
                                         || (p11_shape && p11_layout)
                                         || (p14_shape && p14_layout)
                                         || (minicpm5_2b_shape && minicpm5_2b_layout)
+                                        || (qy_minicpm5_2b_batch_shape && minicpm5_2b_layout)
                                         || (minicpm5_16a3_shape && minicpm5_16a3_layout);
     const auto dtype = q->dtype();
     const bool supported_device = device.type() == Device::Type::kNvidia

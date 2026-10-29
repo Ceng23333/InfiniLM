@@ -72,6 +72,8 @@ public:
         std::optional<infinicore::Tensor> target_hidden_states;
         /// Sample logits at every packed input position instead of one token per request.
         bool sample_all_positions{false};
+        /// Empty means every row needs a sample; false marks a continuing chunk.
+        std::vector<bool> is_final_prefill_chunk;
 
         float temperature{1};
 

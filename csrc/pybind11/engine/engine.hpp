@@ -193,6 +193,7 @@ inline void bind_infer_engine(py::module &m) {
                     "temperature",
                     "top_p",
                     "top_k",
+                    "is_final_prefill_chunk",
                 };
 
                 for (auto &item : kwargs) {
@@ -209,6 +210,8 @@ inline void bind_infer_engine(py::module &m) {
                         input.top_p = py::cast<float>(item.second);
                     } else if (key == "top_k") {
                         input.top_k = py::cast<int>(item.second);
+                    } else if (key == "is_final_prefill_chunk") {
+                        input.is_final_prefill_chunk = py::cast<std::vector<bool>>(item.second);
                     }
                 }
 
@@ -233,6 +236,7 @@ inline void bind_infer_engine(py::module &m) {
             py::arg("target_hidden_states") = std::nullopt,
             py::arg("sample_all_positions") = false)
         .def_readwrite("input_ids", &InferEngine::Input::input_ids)
+        .def_readwrite("is_final_prefill_chunk", &InferEngine::Input::is_final_prefill_chunk)
         .def_readwrite("position_ids", &InferEngine::Input::position_ids)
         .def_readwrite("past_sequence_lengths", &InferEngine::Input::past_sequence_lengths)
         .def_readwrite("total_sequence_lengths", &InferEngine::Input::total_sequence_lengths)
