@@ -1,0 +1,201 @@
+#include "infinilm_model.hpp"
+#include "../cache/kv_cache.hpp"
+#include "../global_state/global_state.hpp"
+#include "../utils.hpp"
+#include <stdexcept>
+
+namespace infinilm {
+
+void InfinilmModel::reset_cache(const cache::CacheConfig *cache_config) {
+    if (cache_config == nullptr) {
+        cache_config_.reset();
+        global_state::get_forward_context().kv_cache_vec.clear();
+        return;
+    }
+    cache_config_ = cache_config->unique_copy();
+    auto &kv_cache_vec = global_state::get_forward_context().kv_cache_vec;
+    kv_cache_vec.clear();
+    const backends::AttentionBackend attention_backend = infinilm::global_state::get_infinilm_config().attention_backend;
+    kv_cache_vec = std::move(default_allocate_kv_cache_tensors(cache_config, model_config_, attention_backend));
+}
+
+std::vector<infinicore::Tensor> InfinilmModel::default_allocate_kv_cache_tensors(
+    const cache::CacheConfig *cache_config,
+    const std::shared_ptr<infinilm::config::ModelConfig> &text_config,
+    const backends::AttentionBackend &attention_backend) {
+    if (nullptr == cache_config) {
+        return {};
+    }
+    if (nullptr == text_config) {
+        throw std::runtime_error("infinilm::InfinilmModel::default_allocate_kv_cache_tensors: text_config is null");
+    }
+    size_t head_dim = text_config->get<size_t>("head_dim");
+    size_t num_key_value_heads = text_config->get<size_t>("num_key_value_heads");
+    size_t max_position_embeddings = text_config->get<size_t>("max_position_embeddings");
+    const auto &dtype = model_config_->get_kv_cache_dtype();
+    const size_t num_hidden_layers = text_config->get<size_t>("num_hidden_layers");
+    const auto &rank_info = infinilm::global_state::get_tensor_model_parallel_rank_info();
+    const size_t pp_size = static_cast<size_t>(rank_info.pp_size);
+    const size_t pp_stage = static_cast<size_t>(rank_info.pp_stage);
+    const size_t local_layer_begin = num_hidden_layers * pp_stage / pp_size;
+    const size_t local_layer_end = num_hidden_layers * (pp_stage + 1) / pp_size;
+
+    std::vector<infinicore::Tensor> kv_cache_vec;
+    switch (attention_backend) {
+    case backends::AttentionBackend::STATIC_ATTN: {
+        auto static_kv_cache_config = dynamic_cast<const cache::StaticKVCacheConfig *>(cache_config);
+        if (nullptr == static_kv_cache_config) {
+            throw std::runtime_error("infinilm::InfinilmModel::default_allocate_kv_cache_tensors: invalid static kv cache config type");
+        }
+        kv_cache_vec.resize(num_hidden_layers);
+
+        for (size_t layer_idx = local_layer_begin; layer_idx < local_layer_end; ++layer_idx) {
+            auto kv_cache = cache::StaticKVCache::create_layer_kv_cache(
+                head_dim,
+                head_dim,
+                num_key_value_heads,
+                num_key_value_heads,
+                max_position_embeddings,
+                dtype,
+                *static_kv_cache_config);
+            kv_cache_vec[layer_idx] = kv_cache;
+        }
+        break;
+    }
+    case backends::AttentionBackend::FLASH_ATTN: {
+        ;
+    }
+    case backends::AttentionBackend::PAGED_ATTN: {
+        auto paged_kv_cache_config = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config);
+        if (nullptr == paged_kv_cache_config) {
+            throw std::runtime_error(
+                "infinilm::InfinilmModel::default_allocate_kv_cache_tensors: invalid paged kv cache config type");
+        }
+        kv_cache_vec.resize(num_hidden_layers);
+
+        for (size_t layer_idx = local_layer_begin; layer_idx < local_layer_end; ++layer_idx) {
+            auto kv_cache = cache::PagedKVCache::create_layer_kv_cache(
+                head_dim,
+                head_dim,
+                num_key_value_heads,
+                num_key_value_heads,
+                dtype,
+                *paged_kv_cache_config);
+            kv_cache_vec[layer_idx] = kv_cache;
+        }
+        infinicore::context::syncStream();
+        break;
+    }
+    default:
+        throw std::runtime_error("infinilm::InfinilmModel::default_allocate_kv_cache_tensors: Unsupported attention backend: " + std::to_string(static_cast<int>(attention_backend)));
+    }
+    return kv_cache_vec;
+}
+
+void InfinilmModel::process_weights_after_loading() {
+    for (const auto &[_, sub] : children()) {
+        process_weights_recursive_(sub.get());
+    }
+}
+
+void InfinilmModel::reset_runtime_state() const {
+    for (const auto &[_, sub] : children()) {
+        reset_runtime_state_recursive_(sub.get());
+    }
+}
+
+void InfinilmModel::process_weights_recursive_(infinicore::nn::Module *module) {
+    for (const auto &[_, sub] : module->children()) {
+        process_weights_recursive_(sub.get());
+    }
+    module->process_weights_after_loading();
+}
+
+void InfinilmModel::reset_runtime_state_recursive_(const infinicore::nn::Module *module) {
+    for (const auto &[_, sub] : module->children()) {
+        reset_runtime_state_recursive_(sub.get());
+    }
+    module->reset_runtime_state();
+}
+
+
+void InfinilmModel::native_piecewise_embed(const Input &,
+                                           infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_embed not supported");
+}
+
+void InfinilmModel::native_piecewise_pre_attn_layer(size_t,
+                                                    const Input &,
+                                                    infinicore::Tensor &,
+                                                    infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_pre_attn_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_pre_attn_qkv_layer(size_t,
+                                                        const Input &,
+                                                        infinicore::Tensor &,
+                                                        infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_pre_attn_qkv_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_pre_attn_rope_layer(size_t,
+                                                         const Input &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_pre_attn_rope_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_eager_attn_layer(size_t,
+                                                      const Input &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_eager_attn_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_post_attn_layer(size_t,
+                                                     const Input &,
+                                                     infinicore::Tensor &,
+                                                     infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_post_attn_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_post_attn_cg_layer(size_t,
+                                                        const Input &,
+                                                        infinicore::Tensor &,
+                                                        infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_post_attn_cg_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_post_attn_decode_cg_layer(size_t,
+                                                               const Input &,
+                                                               infinicore::Tensor &,
+                                                               infinicore::Tensor &) const {
+    throw std::runtime_error(
+        "InfinilmModel: native_piecewise_post_attn_decode_cg_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_eager_moe_layer(size_t,
+                                                     const Input &,
+                                                     infinicore::Tensor &,
+                                                     infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_eager_moe_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_post_attn_graph_layer(size_t,
+                                                           const Input &,
+                                                           infinicore::Tensor &,
+                                                           infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_post_attn_graph_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_post_attn_allreduce_layer(size_t,
+                                                               const Input &,
+                                                               infinicore::Tensor &,
+                                                               infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_post_attn_allreduce_layer not supported");
+}
+
+void InfinilmModel::native_piecewise_lm_head(const Input &,
+                                             infinicore::Tensor &,
+                                             infinicore::Tensor &,
+                                             infinicore::Tensor &) const {
+    throw std::runtime_error("InfinilmModel: native_piecewise_lm_head not supported");
+}
+
+} // namespace infinilm

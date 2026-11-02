@@ -1,0 +1,85 @@
+#pragma once
+
+#include "../models/infinilm_model.hpp"
+#include "piecewise_prefill_state.hpp"
+
+namespace infinilm::global_state {
+
+struct AttentionMetadata {
+    /// Past Lengths of cached sequence for each request, of shape `[num_requests]`.
+    std::optional<infinicore::Tensor> past_sequence_lengths;
+    /// ToTal Lengths for each request sequence, of shape `[num_requests]`.
+    std::optional<infinicore::Tensor> total_sequence_lengths;
+    /// Offsets of each request in a continous-batched sequence, of shape `[num_requests + 1]`.
+    std::optional<infinicore::Tensor> input_offsets;
+    /// Cumulative total sequence lengths for each request, of shape `[num_requests + 1]`.
+    std::optional<infinicore::Tensor> cu_seqlens;
+    /// Block ids for each request `[batch, max_block_table_length]`. Used for paged cache.
+    std::optional<infinicore::Tensor> block_tables;
+    /// Slot ids for each token `[seq]`. Used for paged cache.
+    std::optional<infinicore::Tensor> slot_mapping;
+    /// Maximum query length in the current batch.
+    size_t max_query_length{0};
+    /// Maximum total sequence length in the current batch.
+    size_t max_sequence_length{0};
+    /// Element 0 of past_sequence_lengths, snapshotted for static eager attention.
+    std::optional<size_t> first_past_sequence_length;
+    /// Element 0 of total_sequence_lengths, snapshotted for static eager attention.
+    std::optional<size_t> first_total_sequence_length;
+
+    AttentionMetadata() = default;
+
+    AttentionMetadata(std::optional<infinicore::Tensor> past_sequence_lengths,
+                      std::optional<infinicore::Tensor> total_sequence_lengths,
+                      std::optional<infinicore::Tensor> input_offsets,
+                      std::optional<infinicore::Tensor> cu_seqlens,
+                      std::optional<infinicore::Tensor> block_tables,
+                      std::optional<infinicore::Tensor> slot_mapping,
+                      size_t max_query_length = 0,
+                      size_t max_sequence_length = 0) : past_sequence_lengths(past_sequence_lengths),
+                                                        total_sequence_lengths(total_sequence_lengths),
+                                                        input_offsets(input_offsets),
+                                                        cu_seqlens(cu_seqlens),
+                                                        block_tables(block_tables),
+                                                        slot_mapping(slot_mapping),
+                                                        max_query_length(max_query_length),
+                                                        max_sequence_length(max_sequence_length) {}
+
+    AttentionMetadata(const infinilm::InfinilmModel::Input &input) : AttentionMetadata(input.past_sequence_lengths,
+                                                                                       input.total_sequence_lengths,
+                                                                                       input.input_offsets,
+                                                                                       input.cu_seqlens,
+                                                                                       input.block_tables,
+                                                                                       input.slot_mapping) {}
+};
+
+struct MultiModalMetadata {
+    std::optional<std::vector<size_t>> image_req_ids;
+    // Flattened [start, end) token ranges in the current packed language sequence.
+    std::optional<std::vector<size_t>> visual_token_ranges;
+};
+
+struct MambaMetadata {
+    /// Offsets of each request in a continous-batched sequence, of shape `[num_requests + 1]`.
+    std::optional<infinicore::Tensor> input_offsets;
+    /// State cache indices read at the start of each request forward.
+    std::optional<infinicore::Tensor> init_state_indices;
+    /// State cache indices written with the final state of each request forward.
+    std::optional<infinicore::Tensor> final_state_indices;
+};
+
+struct ForwardContext {
+    AttentionMetadata attn_metadata;
+    MambaMetadata mamba_metadata;
+    MultiModalMetadata mm_metadata;
+    std::vector<infinicore::Tensor> kv_cache_vec;
+    std::vector<infinicore::Tensor> conv_state_vec;
+    std::vector<infinicore::Tensor> ssm_state_vec;
+    PiecewisePrefillState piecewise;
+};
+
+void initialize_forward_context(ForwardContext &forward_context);
+
+ForwardContext &get_forward_context();
+
+} // namespace infinilm::global_state

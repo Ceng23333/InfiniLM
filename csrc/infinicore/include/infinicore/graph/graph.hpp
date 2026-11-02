@@ -1,0 +1,222 @@
+#pragma once
+
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include "../tensor.hpp"
+
+namespace infinicore {
+class Runtime;
+}
+
+namespace infinicore::graph {
+// Forward declarations
+class GraphManager;
+
+class GraphTensor : public Tensor {
+public:
+    enum class SnapshotPolicy {
+        kRecordingAware,
+        kBlob,
+    };
+
+    GraphTensor(const Tensor &);
+    GraphTensor(const Tensor &, SnapshotPolicy policy);
+};
+
+class GraphOperator {
+public:
+    virtual void run() const = 0;
+    virtual bool is_device_graph_capture_safe() const { return true; }
+    virtual ~GraphOperator() = default;
+};
+
+class DispatchableGraphOperator : public GraphOperator {
+public:
+    DispatchableGraphOperator() = default;
+    DispatchableGraphOperator(const DispatchableGraphOperator &) = delete;
+    DispatchableGraphOperator &operator=(const DispatchableGraphOperator &) = delete;
+    DispatchableGraphOperator(DispatchableGraphOperator &&) = delete;
+    DispatchableGraphOperator &operator=(DispatchableGraphOperator &&) = delete;
+
+    void run() const override;
+    ~DispatchableGraphOperator() override;
+
+protected:
+    using run_schema = void (*)(void *);
+    using cleanup_schema = void (*)(void **);
+    void *planned_meta_ = nullptr;
+    run_schema runner_ = nullptr;
+    cleanup_schema deleter_ = nullptr;
+};
+
+class Graph {
+private:
+    // Declared first so it outlives operators and all segment device graphs.
+    std::shared_ptr<::infinicore::Runtime> runtime_lease_;
+    std::shared_ptr<void> allocation_lease_;
+
+public:
+    /// Split of the most recent ``run()`` wall (ms). Zeroed when profile off.
+    struct LastRunProfile {
+        double launch_ms{0.0};    ///< sum of device GraphLaunch walls
+        double tail_sync_ms{0.0}; ///< end syncStream after device launch
+        double hostop_ms{0.0};    ///< capture-unsafe / host segments
+        double op_list_ms{0.0};   ///< eager op-list / fallback segments
+        bool used_device{false};
+        bool skipped_tail_sync{false};
+    };
+
+    Graph();
+    ~Graph() noexcept;
+
+    void run() const;
+
+    const LastRunProfile &last_run_profile() const { return last_run_profile_; }
+
+    /// Number of capture-safe segments that own a device graph exec.
+    size_t device_segment_count() const;
+
+    /// Bytes retained by capture arena (0 when arena accounting unavailable).
+    size_t capture_arena_bytes() const { return 0; }
+
+protected:
+    void add_operator(std::shared_ptr<GraphOperator> op);
+    void instantiate();
+    std::vector<std::shared_ptr<GraphOperator>> op_list_;
+
+    friend class GraphManager;
+
+private:
+    void retain_runtime(std::shared_ptr<::infinicore::Runtime> runtime,
+                        std::shared_ptr<void> allocation_lease);
+
+    struct DeviceGraph;
+    struct Segment {
+        explicit Segment(bool capture_safe);
+        ~Segment() noexcept;
+
+        void run() const;
+        bool has_device_exec() const;
+
+        bool capture_safe;
+        std::vector<std::shared_ptr<GraphOperator>> ops;
+        std::unique_ptr<DeviceGraph> device_graph_;
+    };
+    std::vector<std::unique_ptr<Segment>> segments_;
+
+    mutable LastRunProfile last_run_profile_{};
+
+    friend class ::infinicore::Runtime;
+};
+} // namespace infinicore::graph
+
+#define INFINICORE_GRAPH_OP_CLASS(__OP_NAME__, ...)                        \
+    class __OP_NAME__ : public graph::DispatchableGraphOperator {          \
+    public:                                                                \
+        using schema = void (*)(__VA_ARGS__);                              \
+        using plan_schema = void *(*)(__VA_ARGS__);                        \
+        static common::OpDispatcher<plan_schema> &plan_dispatcher();       \
+        static common::OpDispatcher<run_schema> &run_dispatcher();         \
+        static common::OpDispatcher<cleanup_schema> &cleanup_dispatcher(); \
+        __OP_NAME__(__VA_ARGS__);                                          \
+        static void execute(__VA_ARGS__);                                  \
+    };
+
+// Same as INFINICORE_GRAPH_OP_CLASS, but keeps the op in eager segments during
+// CUDA-graph capture (host D2H/H2D, ATen temps, or non-capturable kernels).
+#define INFINICORE_GRAPH_OP_CLASS_CAPTURE_UNSAFE(__OP_NAME__, ...)         \
+    class __OP_NAME__ : public graph::DispatchableGraphOperator {          \
+    public:                                                                \
+        using schema = void (*)(__VA_ARGS__);                              \
+        using plan_schema = void *(*)(__VA_ARGS__);                        \
+        static common::OpDispatcher<plan_schema> &plan_dispatcher();       \
+        static common::OpDispatcher<run_schema> &run_dispatcher();         \
+        static common::OpDispatcher<cleanup_schema> &cleanup_dispatcher(); \
+        __OP_NAME__(__VA_ARGS__);                                          \
+        static void execute(__VA_ARGS__);                                  \
+        bool is_device_graph_capture_safe() const override {               \
+            return false;                                                  \
+        }                                                                  \
+    };
+
+#define INFINICORE_GRAPH_OP_DISPATCHERS_IMPL(__OP_NAME__)                                  \
+    common::OpDispatcher<__OP_NAME__::plan_schema> &__OP_NAME__::plan_dispatcher() {       \
+        static common::OpDispatcher<__OP_NAME__::plan_schema> dispatcher_;                 \
+        return dispatcher_;                                                                \
+    }                                                                                      \
+    common::OpDispatcher<__OP_NAME__::run_schema> &__OP_NAME__::run_dispatcher() {         \
+        static common::OpDispatcher<__OP_NAME__::run_schema> dispatcher_;                  \
+        return dispatcher_;                                                                \
+    }                                                                                      \
+    common::OpDispatcher<__OP_NAME__::cleanup_schema> &__OP_NAME__::cleanup_dispatcher() { \
+        static common::OpDispatcher<__OP_NAME__::cleanup_schema> dispatcher_;              \
+        return dispatcher_;                                                                \
+    }
+
+#define INFINICORE_GRAPH_OP_DISPATCH(__DEVICE_TYPE__, ...)                 \
+    do {                                                                   \
+        const auto device_type = (__DEVICE_TYPE__);                        \
+        try {                                                              \
+            const auto plan = plan_dispatcher().lookup(device_type);       \
+            const auto runner = run_dispatcher().lookup(device_type);      \
+            const auto deleter = cleanup_dispatcher().lookup(device_type); \
+            planned_meta_ = plan(__VA_ARGS__);                             \
+            runner_ = runner;                                              \
+            deleter_ = deleter;                                            \
+        } catch (const std::exception &e) {                                \
+            throw std::runtime_error(std::string(e.what()) + " ["          \
+                                     + std::string(__PRETTY_FUNCTION__)    \
+                                     + "]");                               \
+        }                                                                  \
+    } while (0)
+
+#define INFINICORE_DETAIL_FIRST_ARG(__FIRST__, ...) __FIRST__
+
+#ifdef ENABLE_MUTUAL_AWARENESS
+#include "../analyzer/op_trace.hpp"
+#include "../analyzer/op_type_registry.hpp"
+
+// Trace one op invocation into the global ring. Op type is resolved by
+// stringified class name through `opTypeFromName`, so new graph ops are
+// automatically discoverable without modifying the op header.
+#define _INFINICORE_TRACE_OP(__OP_NAME__, __TRACE_TENSOR__)                    \
+    do {                                                                       \
+        auto __op_type = ::infinicore::analyzer::opTypeFromName(#__OP_NAME__); \
+        auto &&__trace_tensor = (__TRACE_TENSOR__);                            \
+        if (__trace_tensor) {                                                  \
+            const auto &__trace_shape = __trace_tensor->shape();               \
+            const auto __trace_device = __trace_tensor->device();              \
+            ::infinicore::analyzer::traceOp(                                   \
+                __op_type,                                                     \
+                __trace_shape.data(),                                          \
+                __trace_shape.size(),                                          \
+                static_cast<uint8_t>(__trace_tensor->dtype()),                 \
+                static_cast<uint8_t>(__trace_device.type()),                   \
+                static_cast<int8_t>(__trace_device.index()));                  \
+        } else {                                                               \
+            ::infinicore::analyzer::traceOp(__op_type, nullptr, 0, 0, 0, -1);  \
+        }                                                                      \
+    } while (0)
+#else
+#define _INFINICORE_TRACE_OP(__OP_NAME__, __TRACE_TENSOR__) ((void)0)
+#endif
+
+#define INFINICORE_GRAPH_OP_RECORD_OR_RUN(__OP_NAME__, ...)  \
+    const bool ___recording = context::isGraphRecording();   \
+    auto ___op = std::make_shared<__OP_NAME__>(__VA_ARGS__); \
+    if (___recording) {                                      \
+        context::addGraphOperator(___op);                    \
+    } else {                                                 \
+        ___op->run();                                        \
+    }                                                        \
+    _INFINICORE_TRACE_OP(__OP_NAME__, INFINICORE_DETAIL_FIRST_ARG(__VA_ARGS__));
+
+#define INFINICORE_GRAPH_OP_REGISTER_ALLDEVICE(__OP_NAME__, __PLAN_F__, __RUN_F__, __CLEANUP_F__) \
+    static bool registered = []() {                                                               \
+        __OP_NAME__::plan_dispatcher().registerAll(__PLAN_F__, false);                            \
+        __OP_NAME__::run_dispatcher().registerAll(__RUN_F__, false);                              \
+        __OP_NAME__::cleanup_dispatcher().registerAll(__CLEANUP_F__, false);                      \
+        return true;                                                                              \
+    }();
