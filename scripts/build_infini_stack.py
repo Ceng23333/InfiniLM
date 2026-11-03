@@ -316,12 +316,12 @@ def build_infiniccl_commands(
     iluvatar_arch: Optional[str] = None,
     hygon_arch: Optional[str] = None,
 ) -> List[List[str]]:
-    # QY InfiniCCL/NCCL is M3; TP1 keeps InfiniCCL CPU-only (no WITH_QY yet).
+    # QY InfiniCCL uses Denglin NCCL (M3); keep GetUniqueId+CommInitRank path in InfiniLM.
     ccl_backend = backend
     ccl_test = test
-    if backend == "qy":
-        ccl_backend = None
-        ccl_test = False
+    if backend == "moore":
+        # Moore uses MCCL, not NCCL.
+        pass
 
     configure = [
         "cmake",
@@ -329,7 +329,7 @@ def build_infiniccl_commands(
         str(source),
         "-B",
         str(build),
-        "-DWITH_NCCL=OFF" if backend in ("moore", "qy") else "-DWITH_NCCL=ON",
+        "-DWITH_NCCL=OFF" if backend == "moore" else "-DWITH_NCCL=ON",
         f"-DWITH_MCCL={'ON' if backend == 'moore' else 'OFF'}",
         "-DWITH_OMPI=OFF",
         "-DWITH_MPICH=OFF",
@@ -359,6 +359,22 @@ def build_infiniccl_commands(
                 f"-DCMAKE_CXX_COMPILER={dtk_root / 'bin/hipcc'}",
                 f"-DNCCL_INC={dtk_root / 'include'}",
                 f"-DNCCL_LIB={dtk_root / 'lib/librccl.so'}",
+            ]
+        )
+    elif backend == "qy":
+        qy_root = Path(
+            os.environ.get("QY_ROOT")
+            or os.environ.get("QY_HOME")
+            or "/usr/local/dlgpu"
+        )
+        nccl_root = Path(
+            os.environ.get("DENGLIN_NCCL_ROOT") or "/home/admin01/dlearning-soft/nccl"
+        )
+        configure.extend(
+            [
+                f"-DQY_ROOT={qy_root}",
+                f"-DNCCL_INC={nccl_root / 'include'}",
+                f"-DNCCL_LIB={nccl_root / 'lib/libnccl.so'}",
             ]
         )
 

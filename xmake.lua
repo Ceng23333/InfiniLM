@@ -1,12 +1,15 @@
 -- Prefer pip/system pybind11 to avoid xmake-repo network fetches in offline containers.
 local PYBIND11_INCLUDE = os.getenv("PYBIND11_INCLUDE")
 if not PYBIND11_INCLUDE or PYBIND11_INCLUDE == "" then
-    local ok, out = pcall(function()
-        return os.iorunv(os.getenv("PYTHON") or "python3", {
-            "-c", "import pybind11; print(pybind11.get_include())"
-        })
-    end)
-    if ok and out and out:trim() ~= "" then
+    -- Use xmake try{} (not Lua pcall) for broader xmake version compatibility.
+    local out = try {
+        function ()
+            return os.iorunv(os.getenv("PYTHON") or "python3", {
+                "-c", "import pybind11; print(pybind11.get_include())"
+            })
+        end
+    }
+    if out and out:trim() ~= "" then
         PYBIND11_INCLUDE = out:trim()
     end
 end
