@@ -151,6 +151,10 @@ class LLMEngine:
         if isinstance(self.eos_token_ids, int):
             self.eos_token_ids = [self.eos_token_ids]
 
+        # Always cache vocab len: HF vocab_size often excludes added tokens;
+        # len(tokenizer) on the apply hot path is ~53 ms/step on MiniCPM5 HF.
+        self._vocab_size = len(self.tokenizer)
+
         logger.info(
             f"LLMEngine initialized with model at {config.model_path} "
             f"on device {config.device}, "
@@ -395,7 +399,7 @@ class LLMEngine:
 
         # Prefer len(tokenizer): HF vocab_size often excludes added tokens
         # (MiniCPM5: vocab_size=130072 vs len=130560 == model config).
-        vocab_size = len(self.tokenizer)
+        vocab_size = self._vocab_size
 
         num_appended_tokens = 0
         for token_id in token_ids:
@@ -624,6 +628,13 @@ class LLM:
             use_legacy_moe=use_legacy_moe,
             enable_prefix_caching=enable_prefix_caching,
         )
+        if enable_graph:
+            try:
+                from infinilm.compile.env import apply_cudagraph_policy_env
+
+                apply_cudagraph_policy_env(prefer_full_and_piecewise=True)
+            except Exception:  # noqa: BLE001 — best-effort policy expand
+                pass
         self.engine = LLMEngine(config)
         self.config = config
 
@@ -857,6 +868,13 @@ class AsyncLLMEngine:
             use_legacy_moe=use_legacy_moe,
             enable_prefix_caching=enable_prefix_caching,
         )
+        if enable_graph:
+            try:
+                from infinilm.compile.env import apply_cudagraph_policy_env
+
+                apply_cudagraph_policy_env(prefer_full_and_piecewise=True)
+            except Exception:  # noqa: BLE001 — best-effort policy expand
+                pass
         self.engine = LLMEngine(config)
         self.config = config
 

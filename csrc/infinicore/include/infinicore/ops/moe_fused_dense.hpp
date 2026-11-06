@@ -7,18 +7,61 @@
 
 namespace infinicore::op {
 
-// Capture-safe for QY full_and_piecewise (vLLM / pre-refactor InfiniLM proven).
-// Impls skip host sync while the stream is capturing (see sync_unless_capturing).
-INFINICORE_GRAPH_OP_CLASS(MoeFusedDense,
-                          Tensor,
-                          const Tensor &,
-                          const Tensor &,
-                          const Tensor &,
-                          const Tensor &,
-                          const Tensor &,
-                          const Tensor &,
-                          const Tensor &,
-                          const Tensor &);
+// Device-graph safety is ctor-gated (moeTritonCaptureAllowed + QY decode gate).
+// QY Decode defaults to host-break unless INFINI_MOE_QY_ALLOW_GRAPH=1; Prefill
+// stays capture-safe. Non-QY follows moeTritonCaptureAllowed only.
+class MoeFusedDense : public graph::DispatchableGraphOperator {
+public:
+    using schema = void (*)(Tensor,
+                            const Tensor &,
+                            const Tensor &,
+                            const Tensor &,
+                            const Tensor &,
+                            const Tensor &,
+                            const Tensor &,
+                            const Tensor &,
+                            const Tensor &);
+    using plan_schema = void *(*)(Tensor,
+                                  const Tensor &,
+                                  const Tensor &,
+                                  const Tensor &,
+                                  const Tensor &,
+                                  const Tensor &,
+                                  const Tensor &,
+                                  const Tensor &,
+                                  const Tensor &);
+
+    static common::OpDispatcher<plan_schema> &plan_dispatcher();
+    static common::OpDispatcher<run_schema> &run_dispatcher();
+    static common::OpDispatcher<cleanup_schema> &cleanup_dispatcher();
+
+    MoeFusedDense(Tensor output,
+                  const Tensor &hidden_states,
+                  const Tensor &w13,
+                  const Tensor &w2,
+                  const Tensor &topk_weights,
+                  const Tensor &topk_ids,
+                  const Tensor &sorted_token_ids,
+                  const Tensor &expert_ids,
+                  const Tensor &num_tokens_post_padded);
+
+    static void execute(Tensor output,
+                        const Tensor &hidden_states,
+                        const Tensor &w13,
+                        const Tensor &w2,
+                        const Tensor &topk_weights,
+                        const Tensor &topk_ids,
+                        const Tensor &sorted_token_ids,
+                        const Tensor &expert_ids,
+                        const Tensor &num_tokens_post_padded);
+
+    bool is_device_graph_capture_safe() const override {
+        return device_graph_capture_safe_;
+    }
+
+private:
+    bool device_graph_capture_safe_;
+};
 
 Tensor moe_fused_dense(
     const Tensor &hidden_states,

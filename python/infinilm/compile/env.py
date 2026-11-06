@@ -50,13 +50,32 @@ def cudagraph_policy() -> str:
     return ""
 
 
-def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
+def apply_cudagraph_policy_env(
+    policy: Optional[str] = None,
+    *,
+    prefer_full_and_piecewise: bool = False,
+) -> str:
     """Expand companion knobs when F&P is selected.
+
+    ``full_and_piecewise`` mirrors vLLM ``CUDAGraphMode.FULL_AND_PIECEWISE``:
+    decode → FULL by batch size; prefill/chunk → PIECEWISE by padded token
+    count (same bank for first and mid). ``INFINI_PREFILL_FULL_CG`` is a
+    separate first/final whole-forward overlay (not a ``full`` policy string).
 
     Keeps existing FA_INGRAPH=decode setdefault, and setdefaults
     ``INFINI_MAX_NUM_BATCHED_TOKENS=2048`` under F&P when unset.
+
+    When ``prefer_full_and_piecewise`` is true and the policy env is empty
+    (legacy), select ``full_and_piecewise``. Explicit ``eager`` is preserved.
+    Does **not** enable ``INFINI_PREFILL_FULL_CG`` (EM-gated separately).
     """
     pol = (policy or os.environ.get("INFINI_CUDAGRAPH_POLICY", "")).strip().lower()
+    if prefer_full_and_piecewise and not pol:
+        pol = CUDAGRAPH_POLICY_FULL_AND_PIECEWISE
+        os.environ["INFINI_CUDAGRAPH_POLICY"] = pol
+        logger.info(
+            "enable_graph → default INFINI_CUDAGRAPH_POLICY=full_and_piecewise"
+        )
     if pol == CUDAGRAPH_POLICY_FULL_AND_PIECEWISE:
         os.environ.setdefault(
             "INFINI_CUDAGRAPH_POLICY", CUDAGRAPH_POLICY_FULL_AND_PIECEWISE
@@ -67,6 +86,9 @@ def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
                 "cudagraph_policy=full_and_piecewise → INFINI_FA_INGRAPH=decode"
             )
         _setdefault_env("INFINI_MAX_NUM_BATCHED_TOKENS", "2048")
+        # H2 lever: skip Graph::run tail syncStream when safe (TP1 decode path).
+        # Opt out with INFINI_GRAPH_SKIP_TAIL_SYNC=0.
+        _setdefault_env("INFINI_GRAPH_SKIP_TAIL_SYNC", "1")
         return CUDAGRAPH_POLICY_FULL_AND_PIECEWISE
     return cudagraph_policy()
 

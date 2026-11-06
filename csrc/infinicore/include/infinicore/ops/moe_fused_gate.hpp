@@ -9,16 +9,59 @@
 
 namespace infinicore::op {
 
-INFINICORE_GRAPH_OP_CLASS(MoeFusedGate,
-                          Tensor,
-                          Tensor,
-                          const Tensor &,
-                          const Tensor &,
-                          const size_t,
-                          const size_t,
-                          const size_t,
-                          const float,
-                          const bool);
+// Same QY device-graph gate as MoeFusedDense (INFINI_MOE_QY_ALLOW_GRAPH opt-in).
+class MoeFusedGate : public graph::DispatchableGraphOperator {
+public:
+    using schema = void (*)(Tensor,
+                            Tensor,
+                            const Tensor &,
+                            const Tensor &,
+                            const size_t,
+                            const size_t,
+                            const size_t,
+                            const float,
+                            const bool);
+    using plan_schema = void *(*)(Tensor,
+                                  Tensor,
+                                  const Tensor &,
+                                  const Tensor &,
+                                  const size_t,
+                                  const size_t,
+                                  const size_t,
+                                  const float,
+                                  const bool);
+
+    static common::OpDispatcher<plan_schema> &plan_dispatcher();
+    static common::OpDispatcher<run_schema> &run_dispatcher();
+    static common::OpDispatcher<cleanup_schema> &cleanup_dispatcher();
+
+    MoeFusedGate(Tensor topk_weights,
+                 Tensor topk_indices,
+                 const Tensor &input,
+                 const Tensor &bias,
+                 const size_t num_expert_group,
+                 const size_t topk_group,
+                 const size_t num_fused_shared_experts,
+                 const float routed_scaling_factor,
+                 const bool apply_routed_scaling_factor_on_output);
+
+    static void execute(Tensor topk_weights,
+                        Tensor topk_indices,
+                        const Tensor &input,
+                        const Tensor &bias,
+                        const size_t num_expert_group,
+                        const size_t topk_group,
+                        const size_t num_fused_shared_experts,
+                        const float routed_scaling_factor,
+                        const bool apply_routed_scaling_factor_on_output);
+
+    bool is_device_graph_capture_safe() const override {
+        return device_graph_capture_safe_;
+    }
+
+private:
+    bool device_graph_capture_safe_;
+};
 
 std::tuple<Tensor, Tensor> moe_fused_gate(
     const Tensor &input,

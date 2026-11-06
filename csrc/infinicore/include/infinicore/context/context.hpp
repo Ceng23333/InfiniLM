@@ -86,6 +86,14 @@ bool faInGraphAllowed();
 /// ``eager`` policy → host-break.
 bool moeTritonCaptureAllowed();
 
+/// Fused MoE device-segment safety for graph partitioning: requires
+/// ``moeTritonCaptureAllowed()``. On ``Device::Type::kQy`` without
+/// ``INFINI_MOE_QY_ALLOW_GRAPH=1``, Prefill may still enter device segments
+/// (proven), but Decode is forced host-break (Denglin MoE-in-graph instantiate
+/// segfault). Logs once when decode phase wants capture but QY forces
+/// host-break. Unconditional QY host-break OORs eager MoE during FULL prefill.
+bool moeDeviceGraphCaptureSafe(Device::Type device_type);
+
 /// RAII restore of ``InferencePhase`` for graph capture / forward scopes.
 class InferencePhaseGuard {
 public:

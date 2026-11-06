@@ -198,7 +198,9 @@ class InferenceServer:
         try:
             from infinilm.compile.env import apply_cudagraph_policy_env
 
-            apply_cudagraph_policy_env()
+            apply_cudagraph_policy_env(
+                prefer_full_and_piecewise=bool(self.enable_graph)
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort policy expand
             logger.debug("apply_cudagraph_policy_env skipped: %s", exc)
         app = self._create_app()

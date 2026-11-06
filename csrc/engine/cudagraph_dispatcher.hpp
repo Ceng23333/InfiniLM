@@ -3,7 +3,8 @@
 /// vLLM-shaped CUDA-graph runtime dispatch (thin InfiniLM mirror).
 ///
 /// Selects FULL / PIECEWISE / NONE from a BatchDescriptor derived from input
-/// shape (not scheduler PREFILL/DECODE/MIXED). Under ``full_and_piecewise``:
+/// shape (not scheduler PREFILL/DECODE/MIXED). Under ``full_and_piecewise``
+/// (vLLM ``CUDAGraphMode.FULL_AND_PIECEWISE`` / mixed_mode=PIECEWISE for prefill):
 ///   - uniform decode batches in ``INFINI_DECODE_CG_BATCHES`` → FULL
 ///     (exact hit, or pad-up to next FULL key unless ``INFINI_DECODE_CG_PAD_UP=0``)
 ///   - ragged / mixed / multi-req prefill (``!uniform_decode``): pad-up
@@ -12,6 +13,8 @@
 ///     with ``key.num_tokens = padded``; eager only when
 ///     ``num_tokens > max_capture_size``
 ///   - else → NONE (eager)
+/// Prefill first/final whole-forward overlay is opt-in via ``INFINI_PREFILL_FULL_CG``
+/// (not a separate policy string); mid chunks still use the PIECEWISE token bank.
 /// ``eager`` policy → always NONE.
 
 #include "compiled_prefill_flags.hpp"

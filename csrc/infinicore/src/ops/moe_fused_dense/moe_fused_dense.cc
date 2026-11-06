@@ -1,6 +1,7 @@
 #include "infinicore/ops/moe_fused_dense.hpp"
 
 #include "../../utils.hpp"
+#include "infinicore/context/context.hpp"
 
 namespace infinicore::op {
 
@@ -14,7 +15,9 @@ MoeFusedDense::MoeFusedDense(Tensor output,
                              const Tensor &topk_ids,
                              const Tensor &sorted_token_ids,
                              const Tensor &expert_ids,
-                             const Tensor &num_tokens_post_padded) {
+                             const Tensor &num_tokens_post_padded)
+    : device_graph_capture_safe_(
+          context::moeDeviceGraphCaptureSafe(output->device().type())) {
     INFINICORE_ASSERT_TENSORS_SAME_DEVICE(
         output, hidden_states, w13, w2, topk_weights, topk_ids,
         sorted_token_ids, expert_ids, num_tokens_post_padded);

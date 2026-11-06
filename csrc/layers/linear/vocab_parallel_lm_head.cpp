@@ -1,5 +1,7 @@
 #include "vocab_parallel_lm_head.hpp"
 
+#include "../../global_state/global_state.hpp"
+
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -81,6 +83,22 @@ private:
 };
 
 } // namespace
+
+size_t vocab_parallel_logits_bank_width(size_t vocab_size) {
+    const auto &rank_info =
+        infinilm::global_state::get_tensor_model_parallel_rank_info();
+    const int world = rank_info.tp_size;
+    const int rank = rank_info.tp_rank;
+    const auto device = infinicore::context::getDevice();
+    const auto dtype =
+        infinilm::global_state::get_infinilm_config().model_config->get_dtype();
+    if (!eligible(vocab_size, dtype, device, world, rank_info.pp_size)) {
+        return vocab_size;
+    }
+    // Root gathers to full vocab; non-root keeps the local shard.
+    return rank == 0 ? vocab_size
+                     : vocab_size / static_cast<size_t>(world);
+}
 
 infinicore::Tensor gather_vocab_logits(const infinicore::Tensor &local,
                                        int rank, int world,

@@ -544,6 +544,31 @@ bool moeTritonCaptureAllowed() {
     return false;
 }
 
+bool moeDeviceGraphCaptureSafe(Device::Type device_type) {
+    const bool phase_ok = moeTritonCaptureAllowed();
+    if (!phase_ok) {
+        return false;
+    }
+    if (device_type != Device::Type::kQy) {
+        return true;
+    }
+    if (env_truthy_("INFINI_MOE_QY_ALLOW_GRAPH")) {
+        return true;
+    }
+    // QY default: keep Prefill MoE-in-graph (FULL P+D proven); host-break only
+    // Decode — Denglin segfaults on MoE cudaGraph instantiate in PagedCompiler.
+    // Unconditional host-break makes eager MoE at bucket=512 OOR during FULL CG.
+    if (getInferencePhase() == InferencePhase::Decode) {
+        static bool warned = false;
+        warn_once_(
+            warned,
+            "QY MoE: INFINI_MOE_INGRAPH requests decode capture but QY forces "
+            "host-break (set INFINI_MOE_QY_ALLOW_GRAPH=1 to opt in)");
+        return false;
+    }
+    return true;
+}
+
 std::shared_ptr<Memory> reinstantiateBlob(std::shared_ptr<Memory> blob) {
     setDevice(blob->device());
     return ContextImpl::singleton().getCurrentRuntime()->reinstantiateBlob(blob);

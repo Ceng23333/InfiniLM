@@ -1,13 +1,52 @@
 #include "rank_worker.hpp"
 #include "compiled_prefill_flags.hpp"
+#include "../global_state/decode_phase_profile.hpp"
 #include "../models/model_factory.hpp"
 #include "infinicore/context/context.hpp"
 #include "infinicore/ops.hpp"
 #include "infinicore/ops/distributed/send_recv.hpp"
+#include <cstdlib>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
+#include <string>
 
 namespace infinilm::engine {
+namespace {
+
+/// Opt-in: skip redundant syncStream after sample output_ids D2H.
+/// memcpyD2H already StreamSynchronize's; under SKIP_TAIL_SYNC the decode
+/// Graph::run leaves work ordered on the same stream until that D2H drain.
+/// Default off. Prefill Gate C unchanged.
+bool decode_coalesce_sample_sync_enabled() {
+    static const bool enabled = [] {
+        const char *raw = std::getenv("INFINI_DECODE_COALESCE_SAMPLE_SYNC");
+        if (raw == nullptr || raw[0] == '\0') {
+            return false;
+        }
+        return raw[0] != '0';
+    }();
+    return enabled;
+}
+
+void sync_stream_after_sample_d2h() {
+    if (decode_coalesce_sample_sync_enabled()) {
+        return;
+    }
+    infinicore::context::syncStream();
+}
+
+/// When set with INFINI_DECODE_HOST_PROFILE, syncDevice after Graph::run so
+/// graph_run_ms is exclusive GPU+host (heavier; measure-arm second pass).
+bool decode_host_profile_sync() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *raw = std::getenv("INFINI_RANK_WORKER_PROFILE_SYNC");
+        cached = (raw != nullptr && raw[0] == '1' && raw[1] == '\0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+} // namespace
 
 RankWorker::RankWorker(
     std::shared_ptr<infinilm::global_state::InfinilmConfig> infinilm_config,
@@ -418,6 +457,12 @@ void RankWorker::thread_loop() {
                     {
                         std::lock_guard<std::mutex> lk(mutex_);
 
+                        namespace dpp = infinilm::global_state::decode_phase_profile;
+                        const bool host_prof = dpp::enabled();
+                        const double t_step0 = host_prof ? dpp::monotonic_ms() : 0.0;
+                        dpp::HostStep host_step{};
+                        bool host_step_valid = false;
+
                         infinicore::Tensor logits;
                         infinicore::Tensor hidden_states;
                         bool piecewise_ran = false;
@@ -431,10 +476,14 @@ void RankWorker::thread_loop() {
                                 && local_args.block_tables.value()->size(0)
                                        == local_args.input_ids.value()->size(1)
                                 && local_args.input_ids.value()->size(1) > 0;
+                            const double t_to0 = host_prof ? dpp::monotonic_ms() : 0.0;
                             auto model_input_cpu = local_args.to_model_input(
                                 infinicore::Device{infinicore::Device::Type::kCpu},
                                 false,
                                 true);
+                            if (host_prof) {
+                                host_step.to_model_ms = dpp::monotonic_ms() - t_to0;
+                            }
 
                             // F&P native piecewise prefill (FA host-break segments).
                             if (!uniform_decode && general_compiler != nullptr
@@ -455,11 +504,33 @@ void RankWorker::thread_loop() {
 
                             // FULL decode: FA in-graph under FA_INGRAPH=decode.
                             if (!logits && !piecewise_ran && uniform_decode) {
+                                const double t_gc0 = host_prof ? dpp::monotonic_ms() : 0.0;
                                 auto [graph, output] = compiler_->get_compiled(model_input_cpu);
+                                if (host_prof) {
+                                    host_step.get_compiled_ms = dpp::monotonic_ms() - t_gc0;
+                                    const auto &split = dpp::last_get_compiled_split();
+                                    host_step.bank_h2d_ms = split.bank_h2d_ms;
+                                    host_step.reset_runtime_ms = split.reset_runtime_ms;
+                                }
                                 if (graph != nullptr && output != nullptr) {
                                     infinicore::context::InferencePhaseGuard phase_guard(
                                         infinicore::context::InferencePhase::Decode);
+                                    const double t_run0 = host_prof ? dpp::monotonic_ms() : 0.0;
                                     graph->run();
+                                    if (host_prof && decode_host_profile_sync()) {
+                                        infinicore::context::syncDevice();
+                                    }
+                                    if (host_prof) {
+                                        host_step.graph_run_ms = dpp::monotonic_ms() - t_run0;
+                                        const auto &rp = graph->last_run_profile();
+                                        host_step.launch_ms = rp.launch_ms;
+                                        host_step.hostop_ms = rp.hostop_ms;
+                                        host_step.op_list_ms = rp.op_list_ms;
+                                        host_step.tail_sync_ms = rp.tail_sync_ms;
+                                        host_step.skipped_tail_sync = rp.skipped_tail_sync;
+                                        host_step.device_segment_count = graph->device_segment_count();
+                                        host_step_valid = true;
+                                    }
                                     logits = output->logits;
                                     hidden_states = output->hidden_states;
                                     if (general_compiler != nullptr) {
@@ -510,7 +581,7 @@ void RankWorker::thread_loop() {
                                     (rank_info_.pp_size - 1) * rank_info_.tp_size,
                                     rank_info_.world_comm);
                                 output_ids = output_ids->to(infinicore::Device{infinicore::Device::Type::kCpu});
-                                infinicore::context::syncStream();
+                                sync_stream_after_sample_d2h();
                             }
                             output_ = Output{
                                 output_ids,
@@ -555,6 +626,7 @@ void RankWorker::thread_loop() {
                                                        || logits_dtype == infinicore::DataType::kBFloat16
                                                        || logits_dtype == infinicore::DataType::kFloat32)
                                                    && (sample_all_positions || logits_are_last_token_only);
+                            const double t_sample0 = host_prof && host_step_valid ? dpp::monotonic_ms() : 0.0;
                             if (batch_greedy) {
                                 float random_val = 0.0f;
                                 for (size_t i{0}; i < n_out; ++i) {
@@ -580,6 +652,9 @@ void RankWorker::thread_loop() {
                                         out, score, random_val, top_p, top_k, temperature);
                                 }
                             }
+                            if (host_prof && host_step_valid) {
+                                host_step.sample_ms = dpp::monotonic_ms() - t_sample0;
+                            }
 
                             if (rank_info_.pp_size > 1) {
                                 infinicore::op::distributed::send(
@@ -588,9 +663,19 @@ void RankWorker::thread_loop() {
                                     rank_info_.world_comm);
                             }
 
+                            const double t_d2h0 = host_prof && host_step_valid ? dpp::monotonic_ms() : 0.0;
                             output_ids = output_ids->to(infinicore::Device{infinicore::Device::Type::kCpu});
 
-                            infinicore::context::syncStream();
+                            // D2H already StreamSynchronize's; optional coalesce
+                            // drops this second host fence (INFINI_DECODE_COALESCE_SAMPLE_SYNC=1).
+                            sync_stream_after_sample_d2h();
+                            if (host_prof && host_step_valid) {
+                                host_step.d2h_ms = dpp::monotonic_ms() - t_d2h0;
+                                host_step.step_ms = dpp::monotonic_ms() - t_step0;
+                                dpp::record_host_step(
+                                    host_step,
+                                    /*log_rank0=*/rank_info_.tp_rank == 0 && rank_info_.pp_stage == 0);
+                            }
 
                             auto out{Output{output_ids, logits, hidden_states}};
 

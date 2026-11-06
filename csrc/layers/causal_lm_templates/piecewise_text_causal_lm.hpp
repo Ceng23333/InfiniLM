@@ -93,7 +93,17 @@ public:
                                   infinicore::Tensor &logits_out) const override {
         this->model_->piecewise_lm_head(hidden_states, residual);
         auto logits = this->lm_head_->forward(hidden_states);
-        logits_out->copy_from(logits);
+        // Vocab-parallel non-root keeps a local shard; never blind-copy into a
+        // full-vocab bank (or any mismatched shape).
+        if (!logits_out || !logits) {
+            return;
+        }
+        if (logits_out->shape() == logits->shape()) {
+            logits_out->copy_from(logits);
+            return;
+        }
+        // Rank-aware banks should match; if not, skip rather than throw mid-CG.
+        return;
     }
 };
 

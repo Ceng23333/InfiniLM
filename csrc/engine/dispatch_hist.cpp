@@ -151,9 +151,11 @@ void record_piecewise_eager(bool pad_up, bool mid_chunk_eager, bool missing_grap
     } else if (missing_graph) {
         h.pw_eager_missing_graph.fetch_add(1, std::memory_order_relaxed);
     } else {
-        // Final exact CG and exact-width mid CG (dual mid graphs) both land here.
+        // Exact-width first/final and mid/MIXED all replay compiled_ (token bank).
         h.pw_exact_cg.fetch_add(1, std::memory_order_relaxed);
     }
+    // record_mode may not run on the piecewise path; dump pw_* here too.
+    maybe_dump_eager("periodic");
 }
 
 void log_profile_hist(const char *tag) {
