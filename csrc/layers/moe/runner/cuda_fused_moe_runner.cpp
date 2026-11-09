@@ -161,11 +161,17 @@ CudaFusedMoeRunnerInput CudaFusedMoeRunner::prepare_runner_input(const DispatchO
     const size_t sorted_token_ids_capacity = max_num_tokens_padded;
     const auto device = topk_ids->device();
 
-    // Always real moe_align_ + real sorted_token_ids / expert_ids (prefill and
-    // decode). Dummy-ids use_moe_cu steered _dl_C onto J_invoke_fused_moe_take_*
-    // / store_* and regressed wall; frozen vLLM 20.88 uses use_moe_cu=False and
-    // still hits bf16/warpnk.
-    // Align block_size must equal moe_fused_dense block_size_m (TU segfault otherwise).
+    // Match vLLM fused_experts_impl use_moe_cu (unquantized): when
+    // M*top_k/E <= 16, skip moe_align_ and pass three size-1 int32 metadata
+    // tensors. That selects _invoke_fused_moe_bf16 / warpnk. Real align
+    // buffers (numel>1) select take_/store_. Prefill M=512 stays on align.
+    // Size-1 tensors are allocated before graph capture (ensure_tensor) and
+    // kept on separate workspace fields so decode FULL stays device_segments=1.
+    const bool use_moe_cu =
+        num_experts > 0 &&
+        (static_cast<double>(num_tokens) * static_cast<double>(topk) /
+         static_cast<double>(num_experts)) <= 16.0;
+
     {
         static bool logged_align = false;
         if (!logged_align) {
@@ -173,11 +179,37 @@ CudaFusedMoeRunnerInput CudaFusedMoeRunner::prepare_runner_input(const DispatchO
             std::cerr << "CudaFusedMoeRunner moe_align block_size=" << block_size
                       << " num_local_experts=" << num_local_experts_
                       << " num_tokens=" << num_tokens << " topk=" << topk
+                      << " use_moe_cu=" << (use_moe_cu ? 1 : 0)
                       << " sorted_cap=" << sorted_token_ids_capacity
                       << " expert_cap=" << max_num_blocks << std::endl;
         }
     }
 
+    if (use_moe_cu) {
+        ensure_tensor(workspace.moe_cu_sorted_token_ids,
+                      {1},
+                      infinicore::DataType::kInt32,
+                      device);
+        ensure_tensor(workspace.moe_cu_expert_ids,
+                      {1},
+                      infinicore::DataType::kInt32,
+                      device);
+        ensure_tensor(workspace.moe_cu_num_tokens_post_padded,
+                      {1},
+                      infinicore::DataType::kInt32,
+                      device);
+        return CudaFusedMoeRunnerInput{
+            dispatch_output.hidden_states,
+            dispatch_output.topk_output,
+            MoeRoutingMetadata{
+                workspace.moe_cu_sorted_token_ids,
+                workspace.moe_cu_expert_ids,
+                workspace.moe_cu_num_tokens_post_padded,
+            },
+        };
+    }
+
+    // Align block_size must equal moe_fused_dense block_size_m (TU segfault otherwise).
     if (!workspace.sorted_token_ids || workspace.sorted_token_ids_capacity < sorted_token_ids_capacity) {
         if (infinicore::context::isGraphRecording()) {
             throw std::runtime_error("MoE sorted_token_ids workspace was not initialized before graph capture");
