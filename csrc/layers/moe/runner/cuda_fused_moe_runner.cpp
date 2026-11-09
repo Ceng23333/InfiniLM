@@ -136,15 +136,47 @@ CudaFusedMoeRunnerInput CudaFusedMoeRunner::prepare_runner_input(const DispatchO
     if (topk_shape.size() != 2) {
         throw std::runtime_error("MoE runner requires topk_ids to be a 2D tensor");
     }
-    const size_t num_pairs = topk_shape[0] * topk_shape[1];
+    const size_t num_tokens = topk_shape[0];
+    const size_t topk = topk_shape[1];
+    const size_t num_pairs = num_tokens * topk;
     const size_t block_size = align_block_size_;
-    const size_t align_num_experts = num_local_experts_ + 1;
-    const size_t max_num_tokens_padded = num_pairs < align_num_experts
-                                           ? num_pairs * block_size
-                                           : num_pairs + align_num_experts * (block_size - 1);
-    const size_t sorted_token_ids_capacity = ((max_num_tokens_padded + 3) / 4) * 4;
-    const size_t max_num_blocks = (max_num_tokens_padded + block_size - 1) / block_size;
+    const size_t num_experts = num_local_experts_;
+    // Match vLLM moe_align_block_size Denglin (is_dl) capacity — NOT the
+    // generic num_pairs + (E+1)*(block-1) bound. Oversized sorted/expert
+    // buffers with BLOCK_SIZE_M=64 trip Denglin tu_program.cc:625 / SIGSEGV
+    // even when align block_size matches tiles (repro: 18240/285 OK, 18336/287
+    // crash for M=512,E=160,block=64).
+    size_t max_num_tokens_padded = 0;
+    size_t max_num_blocks = 0;
+    if (block_size > 0) {
+        // vLLM DL: min(numel, (numel - E) // B + E); use unsigned-safe form.
+        const size_t dl_blocks =
+            num_pairs > num_experts
+                ? std::min(num_pairs,
+                           (num_pairs - num_experts) / block_size + num_experts)
+                : num_pairs;
+        max_num_blocks = dl_blocks;
+        max_num_tokens_padded = dl_blocks * block_size;
+    }
+    const size_t sorted_token_ids_capacity = max_num_tokens_padded;
     const auto device = topk_ids->device();
+
+    // Always real moe_align_ + real sorted_token_ids / expert_ids (prefill and
+    // decode). Dummy-ids use_moe_cu steered _dl_C onto J_invoke_fused_moe_take_*
+    // / store_* and regressed wall; frozen vLLM 20.88 uses use_moe_cu=False and
+    // still hits bf16/warpnk.
+    // Align block_size must equal moe_fused_dense block_size_m (TU segfault otherwise).
+    {
+        static bool logged_align = false;
+        if (!logged_align) {
+            logged_align = true;
+            std::cerr << "CudaFusedMoeRunner moe_align block_size=" << block_size
+                      << " num_local_experts=" << num_local_experts_
+                      << " num_tokens=" << num_tokens << " topk=" << topk
+                      << " sorted_cap=" << sorted_token_ids_capacity
+                      << " expert_cap=" << max_num_blocks << std::endl;
+        }
+    }
 
     if (!workspace.sorted_token_ids || workspace.sorted_token_ids_capacity < sorted_token_ids_capacity) {
         if (infinicore::context::isGraphRecording()) {

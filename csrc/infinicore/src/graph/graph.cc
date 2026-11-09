@@ -388,13 +388,43 @@ void Graph::instantiate() {
             (policy[0] == '\0') ? "legacy" : policy);
     }
 
+    // Decode FULL (vLLM splitting_ops=[]): one segment for the whole op list.
+    // Do not split on capture_safe or prefers_own_device_segment — unsafe ops
+    // (Send/Recv) stay inside that capture. Prefill / piecewise unchanged.
+    const bool decode_full =
+        context::getInferencePhase() == context::InferencePhase::Decode;
+
     for (const auto &op : op_list_) {
+        if (decode_full) {
+            if (segments_.empty()) {
+                segments_.push_back(std::make_unique<Segment>(/*capture_safe=*/true));
+            }
+            segments_.back()->ops.push_back(op);
+            continue;
+        }
+
         const bool capture_safe = op->is_device_graph_capture_safe();
+        const bool own_seg = op->prefers_own_device_segment();
+        // Start a new segment when capture_safe flips, when this op wants its
+        // own segment, or when the previous op already claimed a private one
+        // (so MoE stays isolated without host-break / PiecewiseDecode).
+        const bool prev_own =
+            !segments_.empty() && !segments_.back()->ops.empty()
+            && segments_.back()->ops.back()->prefers_own_device_segment();
         if (segments_.empty()
-            || segments_.back()->capture_safe != capture_safe) {
+            || segments_.back()->capture_safe != capture_safe
+            || own_seg
+            || prev_own) {
             segments_.push_back(std::make_unique<Segment>(capture_safe));
         }
         segments_.back()->ops.push_back(op);
+    }
+
+    if (decode_full) {
+        spdlog::info(
+            "Decode FULL: assembled device_segments={} (no capture_safe / "
+            "own-segment split; vLLM-like target=1)",
+            segments_.size());
     }
 
     if (segments_.empty()) {

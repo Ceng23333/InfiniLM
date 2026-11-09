@@ -409,6 +409,13 @@ bool env_truthy_(const char *name) {
         && std::strcmp(v, "off") != 0;
 }
 
+bool env_explicitly_false_(const char *name) {
+    const char *v = std::getenv(name);
+    return v != nullptr
+        && (std::string(v) == "0" || std::strcmp(v, "false") == 0
+            || std::strcmp(v, "no") == 0 || std::strcmp(v, "off") == 0);
+}
+
 void warn_once_(bool &flag, const char *msg) {
     if (flag) {
         return;
@@ -552,19 +559,19 @@ bool moeDeviceGraphCaptureSafe(Device::Type device_type) {
     if (device_type != Device::Type::kQy) {
         return true;
     }
-    if (env_truthy_("INFINI_MOE_QY_ALLOW_GRAPH")) {
+    // vLLM-align default: MoE-in-graph on Decode (and Prefill) for QY.
+    // Kill-switch INFINI_MOE_QY_ALLOW_GRAPH=0|false|off|no forces Decode
+    // host-break for bisect only — not the campaign promote path.
+    if (env_explicitly_false_("INFINI_MOE_QY_ALLOW_GRAPH")) {
+        if (getInferencePhase() == InferencePhase::Decode) {
+            static bool warned = false;
+            warn_once_(
+                warned,
+                "QY MoE: INFINI_MOE_QY_ALLOW_GRAPH kill-switch forces Decode "
+                "host-break (unset or =1 for MoE-in-graph decode FULL)");
+            return false;
+        }
         return true;
-    }
-    // QY default: keep Prefill MoE-in-graph (FULL P+D proven); host-break only
-    // Decode — Denglin segfaults on MoE cudaGraph instantiate in PagedCompiler.
-    // Unconditional host-break makes eager MoE at bucket=512 OOR during FULL CG.
-    if (getInferencePhase() == InferencePhase::Decode) {
-        static bool warned = false;
-        warn_once_(
-            warned,
-            "QY MoE: INFINI_MOE_INGRAPH requests decode capture but QY forces "
-            "host-break (set INFINI_MOE_QY_ALLOW_GRAPH=1 to opt in)");
-        return false;
     }
     return true;
 }

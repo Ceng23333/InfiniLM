@@ -2,6 +2,7 @@
 
 #include "infinicore/adaptor/aten_adaptor.hpp"
 #include "infinicore/adaptor/denglin_fused_moe_adaptor.hpp"
+#include "infinicore/context/context.hpp"
 #include "infinicore/graph/graph.hpp"
 #include "infinicore/ops/moe_fused_dense.hpp"
 
@@ -10,6 +11,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <spdlog/spdlog.h>
 
 #include <stdexcept>
 #include <string>
@@ -44,6 +46,11 @@ struct FuseScratchPool {
             cache3_storage.defined() && same_shape_key(like, topk_v, h_v, inter_v) &&
             capacity_m >= m_v) {
             return;
+        }
+        if (infinicore::context::isGraphRecording()) {
+            throw std::runtime_error(
+                "QY moe_fused_dense FuseScratchPool cannot at::empty during "
+                "device-graph capture; warm decode m before PagedCompiler capture");
         }
         const int64_t alloc_m = m_v;
         {
@@ -140,13 +147,25 @@ void run(void *planned_meta) {
     const int64_t inter2 = w13.size(1);
     const int64_t inter = inter2 / 2;
 
-    // Workspace capacity rounding makes sorted_cap/expert_cap recovery inexact
-    // (e.g. 17 instead of 16 for typical prefill). MiniCPM5 / CudaFusedMoeRunner
-    // default moe_align_block_size is 16 — use that for _dl_C.
-    constexpr int64_t block_size_m = 16;
+    // vLLM TP2 default when E=160,N=256 JSON missing: 64/64/32.
+    // CRITICAL: block_size_m MUST equal moe_align_block_size (CudaFusedMoeRunner).
+    // Mismatch (align=16 + tiles M=64) → Denglin tu_program.cc:625 + SIGSEGV.
+    constexpr int64_t block_size_m = 64;
     constexpr int64_t block_size_n = 64;
-    constexpr int64_t block_size_k = 64;
+    constexpr int64_t block_size_k = 32;
     const std::vector<int64_t> block_shape; // empty == vLLM default
+
+    static bool logged_tiles = false;
+    if (!logged_tiles) {
+        logged_tiles = true;
+        spdlog::info(
+            "QY moe_fused_dense tiles block_size_m/n/k={}/{}/{} m={} topk={} "
+            "h={} inter2={} w13=[{},{},{}] w2=[{},{},{}] sorted={} expert={}",
+            block_size_m, block_size_n, block_size_k, m, topk, h, inter2,
+            w13.size(0), w13.size(1), w13.size(2),
+            w2.size(0), w2.size(1), w2.size(2),
+            sorted_token_ids.numel(), expert_ids.numel());
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 

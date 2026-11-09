@@ -7,9 +7,10 @@
 
 namespace infinicore::op {
 
-// Device-graph safety is ctor-gated (moeTritonCaptureAllowed + QY decode gate).
-// QY Decode defaults to host-break unless INFINI_MOE_QY_ALLOW_GRAPH=1; Prefill
-// stays capture-safe. Non-QY follows moeTritonCaptureAllowed only.
+// Device-graph safety is ctor-gated (moeTritonCaptureAllowed + QY policy).
+// Default: MoE-in-graph decode FULL (vLLM align). Kill-switch
+// INFINI_MOE_QY_ALLOW_GRAPH=0 forces Decode host-break. MoE also prefers its
+// own device segment to avoid Denglin CUresult 701 in giant decode captures.
 class MoeFusedDense : public graph::DispatchableGraphOperator {
 public:
     using schema = void (*)(Tensor,
@@ -58,6 +59,10 @@ public:
     bool is_device_graph_capture_safe() const override {
         return device_graph_capture_safe_;
     }
+
+    // vLLM CUDAGraphMode.FULL records MoE inside one decode graph — do not
+    // isolate MoE into private InfiniRT segments (that left wall at ~5.4 tok/s).
+    bool prefers_own_device_segment() const override { return false; }
 
 private:
     bool device_graph_capture_safe_;

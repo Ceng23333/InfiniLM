@@ -29,6 +29,9 @@ class GraphOperator {
 public:
     virtual void run() const = 0;
     virtual bool is_device_graph_capture_safe() const { return true; }
+    // When true, this op must not share a device-graph capture with neighbors
+    // (Denglin MoE multi-instance OOR / CUresult 701 inside giant decode FULL).
+    virtual bool prefers_own_device_segment() const { return false; }
     virtual ~GraphOperator() = default;
 };
 

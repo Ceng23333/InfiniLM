@@ -9,7 +9,7 @@
 
 namespace infinicore::op {
 
-// Same QY device-graph gate as MoeFusedDense (INFINI_MOE_QY_ALLOW_GRAPH opt-in).
+// Same QY device-graph gate as MoeFusedDense (default MoE-in-graph; =0 kill-switch).
 class MoeFusedGate : public graph::DispatchableGraphOperator {
 public:
     using schema = void (*)(Tensor,
@@ -58,6 +58,9 @@ public:
     bool is_device_graph_capture_safe() const override {
         return device_graph_capture_safe_;
     }
+
+    // Match MoeFusedDense: stay in the monolithic decode FULL capture.
+    bool prefers_own_device_segment() const override { return false; }
 
 private:
     bool device_graph_capture_safe_;

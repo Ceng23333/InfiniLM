@@ -152,9 +152,10 @@ void PagedCompiler::compile() {
         block_tables_holder_.reset();
 
         // Honor SKIP_MONOLITHIC_DECODE_CG / eager / DECODE_GRAPH_ONLY.
-        // QY MoE without INFINI_MOE_QY_ALLOW_GRAPH: MoE-in-graph segfaults on
-        // instantiate (CUresult 701); MoE host-break OORs at decode capture
-        // shapes — skip monolithic decode CG so MoE runs eager at runtime.
+        // vLLM-align default: capture monolithic decode CG for QY MoE too
+        // (MoE stays in-graph under moeDeviceGraphCaptureSafe). Opt-out
+        // kill-switch: INFINI_MOE_QY_ALLOW_GRAPH=0|false|off|no restores the
+        // prior skip (bisect / CUresult 701 workaround only — not the promote path).
         bool skip_decode = skip_monolithic_decode_graph();
         if (!skip_decode) {
             const auto &model_config = model_->get_model_config();
@@ -163,17 +164,17 @@ void PagedCompiler::compile() {
                 : model_config->get_or<size_t>("n_routed_experts", 0);
             const auto device = infinicore::context::getDevice();
             const char *allow = std::getenv("INFINI_MOE_QY_ALLOW_GRAPH");
-            const bool qy_moe_allow = allow != nullptr && allow[0] != '\0'
-                && std::string(allow) != "0"
-                && std::strcmp(allow, "false") != 0
-                && std::strcmp(allow, "no") != 0
-                && std::strcmp(allow, "off") != 0;
+            const bool qy_moe_disallow = allow != nullptr
+                && (std::string(allow) == "0"
+                    || std::strcmp(allow, "false") == 0
+                    || std::strcmp(allow, "no") == 0
+                    || std::strcmp(allow, "off") == 0);
             if (n_routed > 0 && device.type() == infinicore::Device::Type::kQy
-                && !qy_moe_allow) {
+                && qy_moe_disallow) {
                 skip_decode = true;
                 spdlog::info(
                     "QY MoE: skipping monolithic decode CG "
-                    "(set INFINI_MOE_QY_ALLOW_GRAPH=1 to keep MoE-in-graph decode)");
+                    "(INFINI_MOE_QY_ALLOW_GRAPH kill-switch; unset/1 = MoE-in-graph decode FULL)");
             }
         }
         if (skip_decode) {
@@ -307,15 +308,24 @@ void PagedCompiler::compile() {
             auto output = model_->forward(input);
             auto graph = recording.finish();
             barrier_->wait();
+            spdlog::info(
+                "PagedCompiler: decode FULL CG captured batch={} device_segments={} "
+                "(vLLM-align: MoE stays in-graph, not own-segment)",
+                b,
+                graph ? graph->device_segment_count() : 0);
 
             return make_compiled_result(
                 std::move(input), std::move(graph), output);
         };
 
         {
+            // Warm decode shapes (incl. MoE FuseScratchPool / align workspace)
+            // before StreamCaptureGuard so capture cannot at::empty.
             const size_t warmup_batch_size = std::min(max_batch_size, static_cast<size_t>(64));
             auto input = make_decode_input(
                 warmup_batch_size, nblocks, block_tables_holder_);
+            infinicore::context::InferencePhaseGuard warm_phase(
+                infinicore::context::InferencePhase::Decode);
             model_->forward(input);
             infinicore::context::syncStream();
             // Clear transient operator state before CUDA graph capture.
