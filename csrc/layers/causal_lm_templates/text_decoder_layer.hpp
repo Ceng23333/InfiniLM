@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../config/model_config.hpp"
+#include "../../global_state/ar_profile.hpp"
 #include "../../global_state/global_state.hpp"
 #include "../../global_state/piecewise_inductor_flags.hpp"
 #include "../../global_state/piecewise_prefill_state.hpp"
@@ -101,10 +102,27 @@ public:
     void piecewise_post_attn_cg(infinicore::Tensor &hidden_states,
                                 infinicore::Tensor &residual,
                                 global_state::PiecewiseLayerStaging &staging) const {
+        // Matmul-only o_proj, then AllReduce (valid_len), then norm+MLP with
+        // deferred down_proj AllReduce — keeps collectives capture-safe and
+        // avoids padded-bucket FC4_Sum when valid_seq_len < bucket.
         self_attn_->forward_post_attn_piecewise_cg_into(hidden_states, staging);
+        self_attn_->forward_post_attn_piecewise_allreduce_into(hidden_states, staging);
         post_attention_layernorm_->forward_inplace(hidden_states, residual);
-        auto mlp_out = mlp_->forward(hidden_states);
-        hidden_states->copy_from(mlp_out);
+        auto &piecewise = global_state::get_forward_context().piecewise;
+        const size_t seq_len = hidden_states->size(1);
+        const size_t valid_len = piecewise.valid_seq_len > 0 ? piecewise.valid_seq_len : seq_len;
+        auto hidden_for_mlp = (valid_len < seq_len)
+                                  ? hidden_states->narrow({{1, 0, valid_len}})
+                                  : hidden_states;
+        // MLP runs on the valid prefix only so down_proj AllReduce is LL-sized,
+        // not a padded-bucket FC4_Sum.
+        auto mlp_out = mlp_->forward_matmul(hidden_for_mlp);
+        mlp_->forward_allreduce(mlp_out);
+        if (valid_len < seq_len) {
+            hidden_states->narrow({{1, 0, valid_len}})->copy_from(mlp_out);
+        } else {
+            hidden_states->copy_from(mlp_out);
+        }
     }
 
     /// Dense MLP models capture the full post segment (no MoE break).
@@ -121,7 +139,7 @@ public:
     void piecewise_post_attn_graph(infinicore::Tensor &hidden_states,
                                    infinicore::Tensor &residual,
                                    global_state::PiecewiseLayerStaging &staging) const {
-        // Without deferred allreduce split, reuse the fused CG post path.
+        // Same body as cg: matmul segments + capture-safe AllReduce ops.
         piecewise_post_attn_cg(hidden_states, residual, staging);
     }
 
@@ -129,7 +147,9 @@ public:
                                        infinicore::Tensor &residual,
                                        global_state::PiecewiseLayerStaging &staging) const {
         (void)residual;
-        self_attn_->forward_post_attn_piecewise_allreduce_into(hidden_states, staging);
+        // AllReduce already applied inside piecewise_post_attn_cg / graph.
+        (void)hidden_states;
+        (void)staging;
     }
 
 protected:

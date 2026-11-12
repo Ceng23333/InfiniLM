@@ -1,4 +1,5 @@
 #include "qwen3_5_attention.hpp"
+#include "../../global_state/ar_profile.hpp"
 #include "../../global_state/global_state.hpp"
 #include "../../global_state/piecewise_prefill_state.hpp"
 #include "../../layers/attention/attention.hpp"
@@ -414,7 +415,7 @@ void Qwen35Attention::forward_post_attn_piecewise_into(
 void Qwen35Attention::forward_post_attn_piecewise_graph_into(
     infinicore::Tensor &hidden_states,
     global_state::PiecewiseLayerStaging &staging) const {
-    // Dest RowParallelLinear has no matmul-only/allreduce split; reuse fused path.
+    // Matmul-only; AllReduce is a separate capture-safe op via allreduce_into.
     forward_post_attn_piecewise_cg_into(hidden_states, staging);
 }
 
@@ -426,7 +427,7 @@ void Qwen35Attention::forward_post_attn_piecewise_cg_into(
     const size_t valid_len = piecewise.valid_seq_len > 0 ? piecewise.valid_seq_len : seq_len;
     auto hidden_narrow = hidden_states->narrow({{1, 0, valid_len}});
     auto attn_for_proj = staging.attn_output->narrow({{1, 0, valid_len}});
-    auto projected = o_proj_->forward(attn_for_proj);
+    auto projected = o_proj_->forward_matmul(attn_for_proj);
     hidden_narrow->copy_from(projected);
     if (valid_len < seq_len) {
         auto hidden_tail = hidden_states->narrow({{1, valid_len, seq_len - valid_len}});
@@ -437,9 +438,19 @@ void Qwen35Attention::forward_post_attn_piecewise_cg_into(
 void Qwen35Attention::forward_post_attn_piecewise_allreduce_into(
     infinicore::Tensor &hidden_states,
     global_state::PiecewiseLayerStaging &staging) const {
-    (void)hidden_states;
     (void)staging;
-    // TP>1 deferred allreduce not ported on post-refactor RowParallelLinear.
+    if (!o_proj_->needs_allreduce()) {
+        return;
+    }
+    auto &piecewise = global_state::get_forward_context().piecewise;
+    const size_t seq_len = hidden_states->size(1);
+    const size_t valid_len = piecewise.valid_seq_len > 0 ? piecewise.valid_seq_len : seq_len;
+    global_state::ar_profile::allreduce_hidden_valid_contiguous(
+        hidden_states,
+        valid_len,
+        piecewise.ar_staging,
+        [this](infinicore::Tensor &t) { o_proj_->forward_allreduce(t); });
 }
 
 } // namespace infinilm::models::qwen3_5
+

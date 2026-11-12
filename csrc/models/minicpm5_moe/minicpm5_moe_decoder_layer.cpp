@@ -4,6 +4,7 @@
 #include "../../global_state/decode_phase_profile.hpp"
 #include "../../global_state/global_state.hpp"
 #include "../../global_state/piecewise_inductor_flags.hpp"
+#include "../../global_state/piecewise_prefill_state.hpp"
 #include "infinicore/context/context.hpp"
 
 namespace infinilm::models::minicpm5_moe {
@@ -80,9 +81,27 @@ void MiniCPM5MoEDecoderLayer::piecewise_post_attn_cg(
     infinicore::Tensor &residual,
     global_state::PiecewiseLayerStaging &staging) const {
     self_attn_->forward_post_attn_piecewise_cg_into(hidden_states, staging);
+    self_attn_->forward_post_attn_piecewise_allreduce_into(hidden_states, staging);
     post_attention_layernorm_->forward_inplace(hidden_states, residual);
-    auto mlp_out = mlp_forward(hidden_states);
-    hidden_states->copy_from(mlp_out);
+    if (!use_moe_) {
+        auto &piecewise = global_state::get_forward_context().piecewise;
+        const size_t seq_len = hidden_states->size(1);
+        const size_t valid_len =
+            piecewise.valid_seq_len > 0 ? piecewise.valid_seq_len : seq_len;
+        auto hidden_for_mlp = (valid_len < seq_len)
+                                  ? hidden_states->narrow({{1, 0, valid_len}})
+                                  : hidden_states;
+        auto mlp_out = dense_mlp_->forward_matmul(hidden_for_mlp);
+        dense_mlp_->forward_allreduce(mlp_out);
+        if (valid_len < seq_len) {
+            hidden_states->narrow({{1, 0, valid_len}})->copy_from(mlp_out);
+        } else {
+            hidden_states->copy_from(mlp_out);
+        }
+    } else {
+        auto mlp_out = moe_mlp_->forward(hidden_states);
+        hidden_states->copy_from(mlp_out);
+    }
 }
 
 void MiniCPM5MoEDecoderLayer::piecewise_post_attn_decode_cg(
@@ -90,10 +109,23 @@ void MiniCPM5MoEDecoderLayer::piecewise_post_attn_decode_cg(
     infinicore::Tensor &residual,
     global_state::PiecewiseLayerStaging &staging) const {
     self_attn_->forward_post_attn_piecewise_cg_into(hidden_states, staging);
+    self_attn_->forward_post_attn_piecewise_allreduce_into(hidden_states, staging);
     post_attention_layernorm_->forward_inplace(hidden_states, residual);
     if (!use_moe_) {
-        auto mlp_out = dense_mlp_->forward(hidden_states);
-        hidden_states->copy_from(mlp_out);
+        auto &piecewise = global_state::get_forward_context().piecewise;
+        const size_t seq_len = hidden_states->size(1);
+        const size_t valid_len =
+            piecewise.valid_seq_len > 0 ? piecewise.valid_seq_len : seq_len;
+        auto hidden_for_mlp = (valid_len < seq_len)
+                                  ? hidden_states->narrow({{1, 0, valid_len}})
+                                  : hidden_states;
+        auto mlp_out = dense_mlp_->forward_matmul(hidden_for_mlp);
+        dense_mlp_->forward_allreduce(mlp_out);
+        if (valid_len < seq_len) {
+            hidden_states->narrow({{1, 0, valid_len}})->copy_from(mlp_out);
+        } else {
+            hidden_states->copy_from(mlp_out);
+        }
     } else if (infinicore::context::moeTritonCaptureAllowed()) {
         auto mlp_out = moe_mlp_->forward(hidden_states);
         hidden_states->copy_from(mlp_out);
@@ -120,7 +152,6 @@ void MiniCPM5MoEDecoderLayer::piecewise_post_attn_graph(
     infinicore::Tensor &hidden_states,
     infinicore::Tensor &residual,
     global_state::PiecewiseLayerStaging &staging) const {
-    // Without deferred allreduce split, reuse the fused CG post path.
     piecewise_post_attn_cg(hidden_states, residual, staging);
 }
 
@@ -129,7 +160,9 @@ void MiniCPM5MoEDecoderLayer::piecewise_post_attn_allreduce(
     infinicore::Tensor &residual,
     global_state::PiecewiseLayerStaging &staging) const {
     (void)residual;
-    self_attn_->forward_post_attn_piecewise_allreduce_into(hidden_states, staging);
+    (void)hidden_states;
+    (void)staging;
+    // AllReduce already applied inside piecewise_post_attn_cg.
 }
 
 } // namespace infinilm::models::minicpm5_moe
