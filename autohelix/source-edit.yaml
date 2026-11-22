@@ -1,0 +1,40 @@
+goal: |
+  Improve Qwen3-8B Mars serving by editing the InfiniLM codebase in this
+  AutoHelix worktree, rebuilding its candidate artifacts, restarting only the
+  candidate, and measuring a fresh unprofiled P64/N64 wall. Deployment-only
+  knob switching is forbidden. Use the matched InfiniProfiler evidence to name
+  one mechanism per iteration and preserve a source diff.
+
+constraints:
+  - command: bash scripts/promo/build_candidate.sh
+    timeout: 3600
+  - command: bash scripts/promo/verify_source_rebuild.sh
+    timeout: 300
+  - command: bash scripts/promo/launch_candidate.sh
+    timeout: 1800
+
+metrics:
+  - command: python scripts/promo/observe_source.py
+    values:
+      primary_wall_ratio: higher
+      ttft_p95_ratio: lower
+      success_rate: higher
+
+acceptance:
+  metric_gates:
+    - metric: primary_wall_ratio
+      max_regression_pct: 2
+
+scope:
+  editable:
+    - csrc
+    - python/infinilm
+    - xmake.lua
+
+agent:
+  type: codex
+  model: glm-5.3
+  timeout_seconds: 3600
+
+budget:
+  iterations: 4
