@@ -27,3 +27,12 @@ measured. `launch_candidate.sh` passes its own Git worktree as
 `CANDIDATE_WORKSPACE`; the parent launcher bind-mounts that directory over
 `/workspace/InfiniLM`, so the restarted service loads the edited worktree rather
 than the parent source checkout.
+
+Monitor Codex iterations with the structured watcher:
+
+```bash
+python scripts/promo/watch_codex.py --label source-edit
+```
+
+This parses the active Codex JSONL stream and switches automatically to the
+next iteration. Do not monitor campaign progress with raw `tail -f`.
