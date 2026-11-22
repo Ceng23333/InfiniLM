@@ -12,6 +12,8 @@ constraints:
     timeout: 300
   - command: bash scripts/promo/launch_candidate.sh
     timeout: 1800
+  - command: bash scripts/promo/smoke_candidate.sh
+    timeout: 300
 
 metrics:
   - command: python scripts/promo/observe_source.py

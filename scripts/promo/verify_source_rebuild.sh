@@ -16,8 +16,9 @@ changed="$(
 
 while IFS= read -r line; do
   [[ -n "${line}" ]] || continue
-  expected="${line%% *}"
-  artifact="${line#* }"
+  set -- ${line}
+  expected="${1}"
+  artifact="${2}"
   [[ -f "${artifact}" ]] || { echo "[verify-rebuild] missing artifact ${artifact}" >&2; exit 1; }
   actual="$(sha256sum "${artifact}" | awk '{print $1}')"
   [[ "${actual}" == "${expected}" ]] || {

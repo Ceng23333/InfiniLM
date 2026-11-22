@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec docker exec -i qwen3-8b-mars-inf-tp4 /opt/conda/bin/python3.10 "$@"

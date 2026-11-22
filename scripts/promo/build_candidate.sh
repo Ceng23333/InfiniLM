@@ -24,6 +24,18 @@ cd "${root}"
 mkdir -p artifacts
 require_source_edit
 
+itw_root="${INFINI_TENSOR_WORKTREE:-$(cd "${root}/../../.." && pwd)}"
+campaign_python_root="${CAMPAIGN_PYTHON_ROOT:-${itw_root}/.campaign-python}"
+python_include_dir="${campaign_python_root}/include/python3.10"
+if [[ ! -f "${python_include_dir}/Python.h" ]]; then
+  mkdir -p "${campaign_python_root}/include"
+  docker cp qwen3-8b-mars-inf-tp4:/opt/conda/include/python3.10 "${python_include_dir}"
+fi
+if [[ ! -x "${root}/scripts/promo/python-container" ]]; then
+  echo "[build-candidate] missing scripts/promo/python-container" >&2
+  exit 1
+fi
+
 export XMAKE_ROOT=y
 export HPCC_PATH="${HPCC_PATH:-/opt/hpcc}"
 export PYBIND11_INCLUDE="${PYBIND11_INCLUDE:-$(python3 - <<'PY'
@@ -34,13 +46,14 @@ except Exception:
     print("/opt/conda/include/python3.10")
 PY
 )}"
-export PYTHON_INCLUDE_DIR="${PYTHON_INCLUDE_DIR:-/opt/conda/include/python3.10}"
+export PYTHON_INCLUDE_DIR="${PYTHON_INCLUDE_DIR:-${python_include_dir}}"
+export PYTHON="${PYTHON:-${root}/scripts/promo/python-container}"
 
-xmake f --root -y -m release
-xmake --root -y -j32 infinicore_runtime
-xmake --root -y -j32 _infinicore
-xmake --root -y -j32 _infinilm
-xmake install -y infinicore_runtime
+xmake f --root -P "${root}" -y -m release
+xmake --root -P "${root}" -y -j32 infinicore_runtime
+xmake --root -P "${root}" -y -j32 _infinicore
+xmake --root -P "${root}" -y -j32 _infinilm
+xmake install --root -P "${root}" -y infinicore_runtime
 
 {
   sha256sum build/linux/arm64/release/libinfinicore_runtime.so
