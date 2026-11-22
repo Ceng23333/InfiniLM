@@ -18,6 +18,7 @@ import yaml
 
 
 METRIC_RE = re.compile(r"##autohelix\[([A-Za-z_][A-Za-z0-9_]*)=([-+0-9.eE]+)\]")
+LEVER_RE = re.compile(r"##autohelix\[lever=([A-Za-z0-9][A-Za-z0-9._-]*)\]")
 
 
 def utc_now() -> str:
@@ -84,6 +85,21 @@ def parse_metrics(path: Path) -> Dict[str, float]:
         for match in METRIC_RE.finditer(line):
             values[match.group(1)] = float(match.group(2))
     return values
+
+
+def parse_lever(path: Path) -> Optional[str]:
+    lever = None
+    for line in path.read_text(errors="replace").splitlines():
+        match = LEVER_RE.search(line)
+        if match:
+            lever = match.group(1)
+    return lever
+
+
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def source_files(root: Path, scope: List[str]) -> List[str]:
@@ -180,8 +196,43 @@ def commit_candidate(
     return commit
 
 
+def remember_failed_lever(
+    memory_path: Path,
+    record: Dict[str, Any],
+    failure_class: str,
+) -> bool:
+    rejected_commit = record.get("rejected_commit")
+    if not rejected_commit:
+        return False
+    entry = {
+        "schema": "campaign-failed-lever-1",
+        "lever": record.get("lever") or f"unlabeled-{failure_class}",
+        "failure_class": failure_class,
+        "run_id": record.get("run_id"),
+        "iteration": record.get("iteration"),
+        "rejected_ref": record.get("rejected_branch"),
+        "rejected_commit": rejected_commit,
+        "baseline_commit": record.get("baseline_commit"),
+        "source_files": record.get("source_files", []),
+        "metrics": record.get("metrics"),
+        "failure": (record.get("failure") or "")[-2000:],
+        "finished_utc": record.get("finished_utc"),
+    }
+    for existing in load_jsonl(memory_path):
+        if existing.get("rejected_commit") == rejected_commit:
+            return False
+    append_record(memory_path, entry)
+    return True
+
+
 def agent_prompt(spec: Dict[str, Any], iteration: int, baseline: Dict[str, Any]) -> str:
     scope = ", ".join(spec["scope"]["editable"])
+    memory = spec.get("memory") or {}
+    memory_path = Path(".campaign") / memory.get(
+        "failed_levers_path",
+        "failed_levers.jsonl",
+    )
+    failed_levers = (memory.get("known_failed_levers") or []) + load_jsonl(memory_path)
     return f"""Apply exactly one safe InfiniLM source mechanism for Qwen3-8B Mars serving.
 
 This is spec-driven iteration {iteration}. Work only in the current Git worktree.
@@ -193,6 +244,14 @@ is insufficient, leave the tree unchanged and explain why.
 
 Baseline identity:
 {json.dumps(baseline, indent=2, sort_keys=True)}
+
+Known failed levers (do not repeat one of these mechanisms):
+{json.dumps(failed_levers, indent=2, sort_keys=True)}
+
+Finish by printing exactly one marker identifying the mechanism, for example:
+##autohelix[lever=mars-batched-greedy-argmax]
+Use only lowercase kebab-case, digits, dots, or hyphens. This marker must be the
+last nonblank line of your final message.
 
 Do not edit artifacts/worktree_version.json. The controller owns that manifest
 and will run build, artifact verification, launch, real-generation smoke, and
@@ -226,6 +285,13 @@ def main() -> int:
     worktrees = campaign / "worktrees"
     history = campaign / "history.jsonl"
     state_path = campaign / "state.json"
+    memory_relative = Path((spec.get("memory") or {}).get(
+        "failed_levers_path",
+        "failed_levers.jsonl",
+    ))
+    if memory_relative.is_absolute() or ".." in memory_relative.parts:
+        raise SystemExit("memory.failed_levers_path must be under .campaign")
+    memory_path = campaign / memory_relative
     campaign.mkdir(parents=True, exist_ok=True)
 
     if state_path.exists():
@@ -315,6 +381,11 @@ def main() -> int:
                     )
             if process.returncode != 0:
                 raise RuntimeError(f"codex exited {process.returncode}")
+
+            lever = parse_lever(agent_log)
+            record["lever"] = lever
+            if (spec.get("memory") or {}).get("require_lever_marker") and not lever:
+                raise RuntimeError("agent omitted the required lever marker")
 
             changed = source_files(worktree, spec["scope"]["editable"])
             record["source_files"] = changed
@@ -452,6 +523,8 @@ def main() -> int:
                     )
                     record["rejected_branch"] = rejected_branch
                     record["rejected_commit"] = rejected_commit
+                record["finished_utc"] = utc_now()
+                remember_failed_lever(memory_path, record, "metrics_no_go")
         except Exception as exc:
             record["accepted"] = False
             record["failure"] = str(exc)
@@ -478,6 +551,11 @@ def main() -> int:
                         record["rejected_branch"] = rejected_branch
                         record["rejected_commit"] = rejected_commit
                         state["last_rejected_ref"] = rejected_branch
+                        record["finished_utc"] = utc_now()
+                        failure_class = (
+                            "missing_lever_marker" if not record.get("lever") else "constraint_failed"
+                        )
+                        remember_failed_lever(memory_path, record, failure_class)
                 except Exception as provenance_exc:
                     record["provenance_failure"] = str(provenance_exc)
             stopped = True

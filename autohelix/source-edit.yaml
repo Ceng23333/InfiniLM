@@ -5,12 +5,50 @@ goal: |
   knob switching is forbidden. Use the matched InfiniProfiler evidence to name
   one mechanism per iteration and preserve a source diff.
 
+  This wall is P64/N64 with 8192-token prompts and 128 output tokens against a
+  frozen vLLM baseline using total token throughput. Do not change compiler
+  optimization: the Mars runtime must remain `set_optimize("none")` with forced
+  `-O0`, because the prior `-O2` candidate hung during startup graph capture.
+  Do not modify vendored include paths; the controller supplies offline
+  `nlohmann/json` and `spdlog` headers through `CPATH`. Prefer one focused
+  prefill scheduling or Mars batched greedy sampling mechanism.
+
 spec_version: source-edit-spec-2
 
 traceability:
   worktree_manifest: artifacts/worktree_version.json
   artifact_hashes: artifacts/artifact_hashes.txt
   require_rejected_commit: true
+
+memory:
+  failed_levers_path: failed_levers.jsonl
+  require_lever_marker: true
+  known_failed_levers:
+    - lever: mars-batched-greedy-argmax
+      rejected_ref: campaign/rejected/20261122T133327Z-iter-1
+      rejected_commit: 4cceae60c754c43c0fda61541d64f2e10c5aa842
+      failure_class: constraint_failed
+      reason: >-
+        Blocked by missing vendored headers in the clean nested worktree; do not
+        retry without first proving the offline include path.
+    - lever: mars-runtime-o2-vendor-path
+      rejected_ref: campaign/rejected/20261122T135249Z-iter-2
+      rejected_commit: c7d3bd4f3b42290ef563a80bc8e085c809735a75
+      failure_class: constraint_failed
+      reason: >-
+        Restoring Mars -O2 hung in startup graph capture and never reached
+        health; keep set_optimize("none") and forced -O0.
+    - lever: mars-decode-default-tail-skip
+      rejected_ref: campaign/rejected/20261122T141251Z-iter-1
+      rejected_commit: b4bfb93ca67b1f0b81ee37ec2ca1a733425171ce
+      failure_class: metrics_no_go
+      metrics:
+        primary_wall_ratio: 0.77446146
+        ttft_p95_ratio: 1.12757065
+        success_rate: 1.0
+      reason: >-
+        Passed build, launch, and smoke but reduced P64/i8192/o128 total
+        throughput relative to frozen vLLM.
 
 constraints:
   - command: bash scripts/promo/record_worktree.sh edited
