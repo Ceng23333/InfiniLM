@@ -4,6 +4,7 @@ build/
 python/infinilm/lib/*.so
 python/infinicore/lib/*.so
 artifacts/
+.autohelix/
 runtime_backup_rebuilt_20261120/
 
 # MacOS Cache
