@@ -123,6 +123,12 @@ def make_worktree(project: Path, path: Path, ref: str) -> None:
         raise RuntimeError(result.stdout)
 
 
+def remove_worktree(project: Path, path: Path) -> None:
+    result = git(project, "worktree", "remove", "--force", str(path), check=False)
+    if result.returncode != 0:
+        raise RuntimeError(result.stdout)
+
+
 def campaign_env(
     state: Dict[str, Any],
     iteration: int,
@@ -225,14 +231,43 @@ def remember_failed_lever(
     return True
 
 
+def remember_accepted_lever(memory_path: Path, record: Dict[str, Any]) -> bool:
+    accepted_commit = record.get("commit")
+    if not accepted_commit:
+        return False
+    entry = {
+        "schema": "campaign-accepted-lever-1",
+        "lever": record.get("lever") or "unlabeled-accepted",
+        "run_id": record.get("run_id"),
+        "iteration": record.get("iteration"),
+        "accepted_ref": record.get("accepted_branch"),
+        "accepted_commit": accepted_commit,
+        "baseline_commit": record.get("baseline_commit"),
+        "source_files": record.get("source_files", []),
+        "metrics": record.get("metrics"),
+        "surpasses_baseline": record.get("surpasses_baseline"),
+        "finished_utc": record.get("finished_utc"),
+    }
+    for existing in load_jsonl(memory_path):
+        if existing.get("accepted_commit") == accepted_commit:
+            return False
+    append_record(memory_path, entry)
+    return True
+
+
 def agent_prompt(spec: Dict[str, Any], iteration: int, baseline: Dict[str, Any]) -> str:
     scope = ", ".join(spec["scope"]["editable"])
     memory = spec.get("memory") or {}
-    memory_path = Path(".campaign") / memory.get(
+    failed_path = Path(".campaign") / memory.get(
         "failed_levers_path",
         "failed_levers.jsonl",
     )
-    failed_levers = (memory.get("known_failed_levers") or []) + load_jsonl(memory_path)
+    failed_levers = (memory.get("known_failed_levers") or []) + load_jsonl(failed_path)
+    accepted_path = Path(".campaign") / memory.get(
+        "accepted_levers_path",
+        "accepted_levers.jsonl",
+    )
+    accepted_levers = load_jsonl(accepted_path)
     return f"""Apply exactly one safe InfiniLM source mechanism for Qwen3-8B Mars serving.
 
 This is spec-driven iteration {iteration}. Work only in the current Git worktree.
@@ -247,6 +282,9 @@ Baseline identity:
 
 Known failed levers (do not repeat one of these mechanisms):
 {json.dumps(failed_levers, indent=2, sort_keys=True)}
+
+Accepted levers already present in this campaign lineage:
+{json.dumps(accepted_levers, indent=2, sort_keys=True)}
 
 Finish by printing exactly one marker identifying the mechanism, for example:
 ##autohelix[lever=mars-batched-greedy-argmax]
@@ -292,6 +330,13 @@ def main() -> int:
     if memory_relative.is_absolute() or ".." in memory_relative.parts:
         raise SystemExit("memory.failed_levers_path must be under .campaign")
     memory_path = campaign / memory_relative
+    accepted_relative = Path((spec.get("memory") or {}).get(
+        "accepted_levers_path",
+        "accepted_levers.jsonl",
+    ))
+    if accepted_relative.is_absolute() or ".." in accepted_relative.parts:
+        raise SystemExit("memory.accepted_levers_path must be under .campaign")
+    accepted_path = campaign / accepted_relative
     campaign.mkdir(parents=True, exist_ok=True)
 
     if state_path.exists():
@@ -499,6 +544,8 @@ def main() -> int:
                 record["accepted_branch"] = branch
                 if record["surpasses_baseline"]:
                     state["current_ref"] = branch
+                record["finished_utc"] = utc_now()
+                remember_accepted_lever(accepted_path, record)
             else:
                 diff_path = iter_logs / "rejected.diff"
                 diff = git(
@@ -561,6 +608,26 @@ def main() -> int:
             stopped = True
         finally:
             record["finished_utc"] = utc_now()
+            restore_log = iter_logs / "restore_pinned.log"
+            restore_ok, restore_failure = run_command(
+                "bash scripts/promo/restore_pinned.sh",
+                project,
+                1800,
+                restore_log,
+                campaign_env(state, iteration, args.spec.name, "restore-pinned"),
+            )
+            record["restored_pinned"] = restore_ok
+            if not restore_ok:
+                record["restore_pinned_failure"] = restore_failure
+                record["failure"] = record.get("failure") or "pinned runtime restore failed"
+                stopped = True
+            if restore_ok and worktree.exists():
+                try:
+                    remove_worktree(project, worktree)
+                    record["worktree_removed"] = True
+                except Exception as cleanup_exc:
+                    record["worktree_removed"] = False
+                    record["worktree_cleanup_failure"] = str(cleanup_exc)
             append_record(history, record)
             state["next_iteration"] = iteration + 1
             state["last_utc"] = record["finished_utc"]
