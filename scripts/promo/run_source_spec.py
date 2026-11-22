@@ -53,6 +53,7 @@ def run_command(
     cwd: Path,
     timeout: int,
     log: Path,
+    env: Optional[Dict[str, str]] = None,
 ) -> Tuple[bool, Optional[str]]:
     with log.open("w", encoding="utf-8") as output:
         process = subprocess.Popen(
@@ -62,6 +63,7 @@ def run_command(
             stdout=output,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=env,
         )
         try:
             process.wait(timeout=timeout)
@@ -105,6 +107,79 @@ def make_worktree(project: Path, path: Path, ref: str) -> None:
         raise RuntimeError(result.stdout)
 
 
+def campaign_env(
+    state: Dict[str, Any],
+    iteration: int,
+    spec_name: str,
+    phase: str,
+) -> Dict[str, str]:
+    env = os.environ.copy()
+    env.update({
+        "CAMPAIGN_ITERATION": str(iteration),
+        "CAMPAIGN_RUN_ID": str(state["run_id"]),
+        "CAMPAIGN_SPEC_PATH": spec_name,
+        "SPEC_SHA256": str(state["spec_sha256"]),
+        "CAMPAIGN_BASELINE_REF": str(state["baseline_ref"]),
+        "CAMPAIGN_BASELINE_COMMIT": str(state["baseline_commit"]),
+        "CAMPAIGN_PARENT_REF": str(state["current_ref"]),
+        "CAMPAIGN_PHASE": phase,
+        "CAMPAIGN_EDITABLE_SCOPE": state["editable_scope"],
+    })
+    return env
+
+
+def write_manifest(
+    worktree: Path,
+    state: Dict[str, Any],
+    iteration: int,
+    spec_name: str,
+    phase: str,
+) -> Dict[str, Any]:
+    manifest = worktree / "artifacts/worktree_version.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "python3",
+            "scripts/promo/record_worktree.py",
+            "--phase",
+            phase,
+            "--manifest",
+            str(manifest.relative_to(worktree)),
+        ],
+        cwd=worktree,
+        env=campaign_env(state, iteration, spec_name, phase),
+        check=True,
+    )
+    return json.loads(manifest.read_text(encoding="utf-8"))
+
+
+def commit_candidate(
+    project: Path,
+    worktree: Path,
+    scope: List[str],
+    branch: str,
+    title: str,
+    state: Dict[str, Any],
+) -> str:
+    git(worktree, "add", "--", *scope)
+    manifest_hash = sha256(worktree / "artifacts/worktree_version.json")
+    git(
+        worktree,
+        "-c",
+        "user.name=Codex",
+        "-c",
+        "user.email=codex@local",
+        "commit",
+        "-m",
+        f"{title}\n\nWorktree-Version-Manifest: {manifest_hash}\n"
+        f"Spec-SHA256: {state['spec_sha256']}\n"
+        f"Campaign-Run-ID: {state['run_id']}",
+    )
+    commit = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    git(project, "branch", branch, commit)
+    return commit
+
+
 def agent_prompt(spec: Dict[str, Any], iteration: int, baseline: Dict[str, Any]) -> str:
     scope = ", ".join(spec["scope"]["editable"])
     return f"""Apply exactly one safe InfiniLM source mechanism for Qwen3-8B Mars serving.
@@ -119,8 +194,9 @@ is insufficient, leave the tree unchanged and explain why.
 Baseline identity:
 {json.dumps(baseline, indent=2, sort_keys=True)}
 
-The controller will run build, artifact verification, launch, real-generation smoke,
-and unprofiled wall observation after you stop.
+Do not edit artifacts/worktree_version.json. The controller owns that manifest
+and will run build, artifact verification, launch, real-generation smoke, and
+unprofiled wall observation after you stop.
 """
 
 
@@ -136,6 +212,15 @@ def main() -> int:
     project = Path.cwd().resolve()
     with args.spec.open(encoding="utf-8") as handle:
         spec = yaml.safe_load(handle)
+    if spec.get("spec_version") != "source-edit-spec-2":
+        raise SystemExit("spec must declare source-edit-spec-2")
+    traceability = spec.get("traceability")
+    if not traceability:
+        raise SystemExit("spec must declare traceability")
+    if traceability.get("worktree_manifest") != "artifacts/worktree_version.json":
+        raise SystemExit("spec must require artifacts/worktree_version.json")
+    if not traceability.get("require_rejected_commit"):
+        raise SystemExit("spec must require rejected candidate commits")
     campaign = project / ".campaign"
     logs = campaign / "logs"
     worktrees = campaign / "worktrees"
@@ -149,16 +234,26 @@ def main() -> int:
         baseline_commit = git(project, "rev-parse", args.baseline_ref).stdout.strip()
         state = {
             "schema": "source-spec-campaign-1",
+            "run_id": utc_now(),
             "spec": str(args.spec),
             "spec_sha256": sha256(args.spec),
             "baseline_ref": args.baseline_ref,
             "baseline_commit": baseline_commit,
             "baseline_summary": str(args.baseline_summary),
             "current_ref": args.baseline_ref,
+            "editable_scope": " ".join(spec["scope"]["editable"]),
             "next_iteration": 1,
             "started_utc": utc_now(),
         }
         state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+    if state.get("spec_sha256") != sha256(args.spec):
+        raise SystemExit(
+            "spec changed after campaign state was created; archive or reset .campaign"
+        )
+    if "run_id" not in state:
+        state["run_id"] = utc_now()
+    state.setdefault("editable_scope", " ".join(spec["scope"]["editable"]))
 
     max_iterations = args.max_iterations or int(spec.get("budget", {}).get("iterations", 1))
     with args.baseline_summary.open(encoding="utf-8") as handle:
@@ -180,9 +275,17 @@ def main() -> int:
             "baseline_commit": state["baseline_commit"],
             "current_ref": state["current_ref"],
             "worktree": str(worktree),
+            "run_id": state["run_id"],
         }
         try:
             make_worktree(project, worktree, state["current_ref"])
+            record["worktree_version_created"] = write_manifest(
+                worktree,
+                state,
+                iteration,
+                args.spec.name,
+                "created",
+            )
             agent_log = iter_logs / "codex.log"
             with agent_log.open("w", encoding="utf-8") as output:
                 process = subprocess.Popen(
@@ -218,6 +321,14 @@ def main() -> int:
             if not changed:
                 raise RuntimeError("agent made no editable source change")
 
+            record["worktree_version_edited"] = write_manifest(
+                worktree,
+                state,
+                iteration,
+                args.spec.name,
+                "edited",
+            )
+
             forbidden = source_files(
                 worktree, ["scripts/promo", "autohelix", "deployment"]
             )
@@ -231,6 +342,12 @@ def main() -> int:
                     worktree,
                     int(constraint["timeout"]),
                     log,
+                    campaign_env(
+                        state,
+                        iteration,
+                        args.spec.name,
+                        f"constraint-{index}",
+                    ),
                 )
                 record.setdefault("constraints", []).append(
                     {"command": constraint["command"], "log": str(log), "ok": ok}
@@ -239,6 +356,13 @@ def main() -> int:
                     raise RuntimeError(
                         f"constraint failed: {constraint['command']}: {failure}"
                     )
+                record["worktree_version"] = write_manifest(
+                    worktree,
+                    state,
+                    iteration,
+                    args.spec.name,
+                    "final" if index == len(spec["constraints"]) else "built",
+                )
 
             metric_constraint = spec["metrics"][0]
             metric_log = iter_logs / "observe.log"
@@ -247,6 +371,7 @@ def main() -> int:
                 worktree,
                 int(metric_constraint.get("timeout", 3600)),
                 metric_log,
+                    campaign_env(state, iteration, args.spec.name, "observe"),
             )
             metrics = parse_metrics(metric_log) if ok else {}
             record["metrics"] = metrics
@@ -279,22 +404,26 @@ def main() -> int:
             )
             record["accepted"] = accepted
             record["surpasses_baseline"] = bool(primary is not None and primary > 1.0)
+            record["worktree_version_final"] = write_manifest(
+                worktree,
+                state,
+                iteration,
+                args.spec.name,
+                "final",
+            )
+            artifacts = record["worktree_version_final"].get("artifacts") or []
+            record["artifact_hashes"] = artifacts
 
             if accepted:
                 branch = f"campaign/accepted/{stamp}-iter-{iteration}"
-                git(worktree, "add", "--", *spec["scope"]["editable"])
-                git(
+                commit = commit_candidate(
+                    project,
                     worktree,
-                    "-c",
-                    "user.name=Codex",
-                    "-c",
-                    "user.email=codex@local",
-                    "commit",
-                    "-m",
+                    spec["scope"]["editable"],
+                    branch,
                     f"Spec iteration {iteration}: accepted source lever",
+                    state,
                 )
-                commit = git(worktree, "rev-parse", "HEAD").stdout.strip()
-                git(project, "branch", branch, commit)
                 record["commit"] = commit
                 record["accepted_branch"] = branch
                 if record["surpasses_baseline"]:
@@ -311,9 +440,46 @@ def main() -> int:
                 )
                 diff_path.write_text(diff.stdout)
                 record["rejected_diff"] = str(diff_path)
+                if traceability.get("require_rejected_commit"):
+                    rejected_branch = f"campaign/rejected/{stamp}-iter-{iteration}"
+                    rejected_commit = commit_candidate(
+                        project,
+                        worktree,
+                        spec["scope"]["editable"],
+                        rejected_branch,
+                        f"Spec iteration {iteration}: rejected source lever",
+                        state,
+                    )
+                    record["rejected_branch"] = rejected_branch
+                    record["rejected_commit"] = rejected_commit
         except Exception as exc:
             record["accepted"] = False
             record["failure"] = str(exc)
+            if worktree.exists():
+                try:
+                    changed = source_files(worktree, spec["scope"]["editable"])
+                    if changed:
+                        record["worktree_version_failed"] = write_manifest(
+                            worktree,
+                            state,
+                            iteration,
+                            args.spec.name,
+                            "failed",
+                        )
+                        rejected_branch = f"campaign/rejected/{stamp}-iter-{iteration}"
+                        rejected_commit = commit_candidate(
+                            project,
+                            worktree,
+                            spec["scope"]["editable"],
+                            rejected_branch,
+                            f"Spec iteration {iteration}: failed source lever",
+                            state,
+                        )
+                        record["rejected_branch"] = rejected_branch
+                        record["rejected_commit"] = rejected_commit
+                        state["last_rejected_ref"] = rejected_branch
+                except Exception as provenance_exc:
+                    record["provenance_failure"] = str(provenance_exc)
             stopped = True
         finally:
             record["finished_utc"] = utc_now()

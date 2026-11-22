@@ -5,7 +5,16 @@ goal: |
   knob switching is forbidden. Use the matched InfiniProfiler evidence to name
   one mechanism per iteration and preserve a source diff.
 
+spec_version: source-edit-spec-2
+
+traceability:
+  worktree_manifest: artifacts/worktree_version.json
+  artifact_hashes: artifacts/artifact_hashes.txt
+  require_rejected_commit: true
+
 constraints:
+  - command: bash scripts/promo/record_worktree.sh edited
+    timeout: 60
   - command: bash scripts/promo/build_candidate.sh
     timeout: 3600
   - command: bash scripts/promo/verify_source_rebuild.sh
@@ -14,6 +23,8 @@ constraints:
     timeout: 1800
   - command: bash scripts/promo/smoke_candidate.sh
     timeout: 300
+  - command: bash scripts/promo/record_worktree.sh final
+    timeout: 60
 
 metrics:
   - command: python scripts/promo/observe_source.py
