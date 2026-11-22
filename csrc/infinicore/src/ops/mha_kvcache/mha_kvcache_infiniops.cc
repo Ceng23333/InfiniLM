@@ -208,16 +208,16 @@ void *plan(Tensor out,
         TensorMeta(q),
         TensorMeta(k_cache),
         TensorMeta(v_cache),
-        TensorMeta(seqlens_k),
-        TensorMeta(block_table),
+        TensorMeta(seqlens_k_c),
+        TensorMeta(block_table_c),
         alibi_slopes ? std::optional<TensorMeta>{TensorMeta(*alibi_slopes)}
                      : std::nullopt,
         graph::GraphTensor(out),
         graph::GraphTensor(q),
         graph::GraphTensor(k_cache),
         graph::GraphTensor(v_cache),
-        graph::GraphTensor(seqlens_k),
-        graph::GraphTensor(block_table),
+        graph::GraphTensor(seqlens_k_c),
+        graph::GraphTensor(block_table_c),
         alibi_slopes
             ? std::optional<graph::GraphTensor>{graph::GraphTensor(*alibi_slopes)}
             : std::nullopt,
@@ -229,8 +229,8 @@ void *plan(Tensor out,
             q,
             k_cache,
             v_cache,
-            seqlens_k,
-            block_table,
+            seqlens_k_c,
+            block_table_c,
             alibi_slopes)) {
         planned->graph_safe_provider = make_graph_safe_provider(*planned);
     }

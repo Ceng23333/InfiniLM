@@ -73,6 +73,17 @@ bool MhaKVCache::supports_device_graph_capture(
                         && k_cache->size(3) == 128
                         && seqlens_k->shape() == Shape({16})
                         && block_table->shape() == Shape({16, 512});
+    // Qwen3-8B TP4 P64 decode: 8 local Q heads and 2 local KV heads.
+    const bool qwen3_8b_tp4_p64_shape
+        = q->shape() == Shape({64, 1, 8, 128})
+          && out->shape() == Shape({64, 1, 8, 128})
+          && k_cache->size(0) > 0
+          && k_cache->size(1) == 256
+          && k_cache->size(2) == 2
+          && k_cache->size(3) == 128
+          && seqlens_k->shape() == Shape({64})
+          && block_table->size(0) == 64
+          && block_table->size(1) > 0;
     // MiniCPM5-2B TP1 decode: fused QKV Q view, paged KV [NUM_BLOCKS,256,2,128].
     const bool minicpm5_2b_shape = q->shape() == Shape({1, 1, 16, 128})
                                 && out->shape() == Shape({1, 1, 16, 128})
@@ -122,12 +133,17 @@ bool MhaKVCache::supports_device_graph_capture(
                                         || (p09_shape && p09_layout)
                                         || (p11_shape && p11_layout)
                                         || (p14_shape && p14_layout)
+                                        || (qwen3_8b_tp4_p64_shape && p13_layout)
                                         || (minicpm5_2b_shape && minicpm5_2b_layout)
                                         || (minicpm5_16a3_shape && minicpm5_16a3_layout);
     const auto dtype = q->dtype();
     const bool supported_device = device.type() == Device::Type::kNvidia
                                || device.type() == Device::Type::kQy;
-    const bool ok = supported_device
+    const bool mars_qwen3_8b_decode
+        = device.type() == Device::Type::kMars
+          && qwen3_8b_tp4_p64_shape
+          && p13_layout;
+    const bool ok = (supported_device || mars_qwen3_8b_decode)
                  && same_device(q)
                  && same_device(k_cache)
                  && same_device(v_cache)

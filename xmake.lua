@@ -1,15 +1,27 @@
 -- Prefer pip/system pybind11 to avoid xmake-repo network fetches in offline containers.
 -- Note: xmake sandbox has no pcall(); set PYBIND11_INCLUDE in the environment.
+local SCRIPT_ROOT = os.scriptdir()
 local PYBIND11_INCLUDE = os.getenv("PYBIND11_INCLUDE")
+if PYBIND11_INCLUDE and not os.isfile(PYBIND11_INCLUDE .. "/pybind11/pybind11.h") then
+    PYBIND11_INCLUDE = nil
+end
 if not PYBIND11_INCLUDE or PYBIND11_INCLUDE == "" then
-    -- Fallback: may trigger xmake-repo fetch (needs network). Prefer exporting PYBIND11_INCLUDE.
-    add_requires("pybind11")
-    if is_plat("linux") then
-        add_requireconfs("pybind11.python", { configs = { headeronly = true } })
+    local seed_dirs = os.dirs(
+        "/root/zenghua/workspace/*/.xmake_seed/packages/p/pybind11/*/*/include")
+    if seed_dirs and #seed_dirs > 0 then
+        PYBIND11_INCLUDE = seed_dirs[#seed_dirs]
     end
 end
 
-local INFINI_ROOT = os.getenv("INFINI_ROOT") or (os.getenv(is_host("windows") and "HOMEPATH" or "HOME") .. "/.infini")
+local INFINI_ROOT = os.getenv("INFINI_ROOT")
+if not INFINI_ROOT or INFINI_ROOT == "" then
+    local campaign_root = path.absolute(SCRIPT_ROOT .. "/../../../..")
+    if os.isfile(campaign_root .. "/prefix-mars/include/infini/rt.h") then
+        INFINI_ROOT = campaign_root .. "/prefix-mars"
+    else
+        INFINI_ROOT = os.getenv(is_host("windows") and "HOMEPATH" or "HOME") .. "/.infini"
+    end
+end
 local CUDA_ROOT = os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH") or "/usr/local/cuda"
 local NEUWARE_ROOT = os.getenv("NEUWARE_HOME") or "/usr/local/neuware"
 local ASCEND_ROOT = os.getenv("ASCEND_HOME_PATH") or os.getenv("ASCEND_TOOLKIT_HOME") or os.getenv("ASCEND_HOME") or "/usr/local/Ascend/ascend-toolkit/latest"
@@ -78,9 +90,18 @@ if cxx11_abi and cxx11_abi ~= "" then
     add_defines("_GLIBCXX_USE_CXX11_ABI=" .. cxx11_abi)
 end
 
--- Add spdlog from third_party directory
-add_includedirs("third_party/spdlog/include")
-add_includedirs("third_party/json/single_include/")
+-- Add spdlog from this checkout, falling back to its Git worktree parent.
+local PARENT_CHECKOUT = path.absolute(SCRIPT_ROOT .. "/../../..")
+if os.isdir(SCRIPT_ROOT .. "/third_party/spdlog/include") then
+    add_includedirs(SCRIPT_ROOT .. "/third_party/spdlog/include")
+else
+    add_includedirs(PARENT_CHECKOUT .. "/third_party/spdlog/include")
+end
+if os.isdir(SCRIPT_ROOT .. "/third_party/json/single_include") then
+    add_includedirs(SCRIPT_ROOT .. "/third_party/json/single_include")
+else
+    add_includedirs(PARENT_CHECKOUT .. "/third_party/json/single_include")
+end
 if os.isdir(CUDA_ROOT .. "/include") then
     add_includedirs(CUDA_ROOT .. "/include")
 end
@@ -253,7 +274,19 @@ target("infinicore_runtime")
 target_end()
 
 local PYTHON_INCLUDE_DIR = os.getenv("PYTHON_INCLUDE_DIR")
-    or "/opt/conda/include/python3.10"
+if PYTHON_INCLUDE_DIR and not os.isfile(PYTHON_INCLUDE_DIR .. "/Python.h") then
+    PYTHON_INCLUDE_DIR = nil
+end
+if not PYTHON_INCLUDE_DIR or PYTHON_INCLUDE_DIR == "" then
+    PYTHON_INCLUDE_DIR = "/opt/conda/include/python3.10"
+end
+if not os.isfile(PYTHON_INCLUDE_DIR .. "/Python.h") then
+    local home = os.getenv("HOME") or "/root"
+    local miniconda_python = home .. "/miniconda3/include/python3.13"
+    if os.isfile(miniconda_python .. "/Python.h") then
+        PYTHON_INCLUDE_DIR = miniconda_python
+    end
+end
 
 target("_infinicore")
     if PYBIND11_INCLUDE and PYBIND11_INCLUDE ~= "" then
