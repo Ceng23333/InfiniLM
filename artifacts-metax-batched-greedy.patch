@@ -1,0 +1,78 @@
+diff --git a/csrc/engine/rank_worker.cpp b/csrc/engine/rank_worker.cpp
+index 2b43b47..9139e3c 100644
+--- a/csrc/engine/rank_worker.cpp
++++ b/csrc/engine/rank_worker.cpp
+@@ -555,7 +555,8 @@ void RankWorker::thread_loop() {
+                             // view) returns garbage ids when n_out>1 under V1 multi-request.
+                             // Keep NVIDIA batch path; force QY through the per-index loop.
+                             const bool batch_greedy = (rank_info_.device.type() == infinicore::Device::Type::kNvidia
+-                                                       || rank_info_.device.type() == infinicore::Device::Type::kQy)
++                                                       || rank_info_.device.type() == infinicore::Device::Type::kQy
++                                                       || rank_info_.device.type() == infinicore::Device::Type::kMetax)
+                                                    && parameter_greedy
+                                                    && n_out > 0
+                                                    && logits_positions == n_out
+diff --git a/csrc/infinicore/src/ops/random_sample/random_sample_metax.cc b/csrc/infinicore/src/ops/random_sample/random_sample_metax.cc
+index 6bb5c77..363534e 100644
+--- a/csrc/infinicore/src/ops/random_sample/random_sample_metax.cc
++++ b/csrc/infinicore/src/ops/random_sample/random_sample_metax.cc
+@@ -141,14 +141,57 @@ void calculate(Tensor indices,
+                float temperature) {
+ 	INFINICORE_ASSERT(logits->device().type() == Device::Type::kMetax);
+ 	INFINICORE_ASSERT_TENSORS_SAME_DEVICE(indices, logits);
+-	INFINICORE_ASSERT(logits->ndim() == 1 && logits->numel() > 0 && logits->is_contiguous());
+-	INFINICORE_ASSERT(indices->numel() == 1 && indices->is_contiguous());
+ 	INFINICORE_ASSERT(std::isfinite(random_val));
+ 	INFINICORE_ASSERT(std::isfinite(topp));
+ 	INFINICORE_ASSERT(topk > 0);
+ 	INFINICORE_ASSERT(std::isfinite(temperature));
+ 
+ 	context::setDevice(logits->device());
++	if (indices->numel() > 1) {
++		INFINICORE_ASSERT(indices->is_contiguous());
++		INFINICORE_ASSERT(logits->ndim() == 2 && logits->numel() > 0 && logits->is_contiguous());
++		const auto &batched_shape = logits->shape();
++		const auto batch_size = static_cast<size_t>(batched_shape[0]);
++		const auto vocab_size = static_cast<size_t>(batched_shape[1]);
++		INFINICORE_ASSERT(vocab_size > 0);
++		INFINICORE_ASSERT(indices->numel() == batch_size);
++		const bool parameter_greedy = random_val == 0.0f || topp == 0.0f
++		                              || topk == 1 || temperature == 0.0f;
++		if (!parameter_greedy) {
++			throw std::runtime_error("random_sample_metax: batched sampling supports greedy only");
++		}
++
++		auto host_logits = logits_to_host_f32(logits);
++		if (indices->dtype() == DataType::kInt32) {
++			std::vector<int32_t> host_indices(batch_size);
++			for (size_t row = 0; row < batch_size; ++row) {
++				const auto begin = host_logits.begin() + static_cast<std::ptrdiff_t>(row * vocab_size);
++				host_indices[row] = static_cast<int32_t>(
++				    std::distance(begin, std::max_element(begin, begin + static_cast<std::ptrdiff_t>(vocab_size))));
++			}
++			context::memcpyH2D(
++			    indices->data(), host_indices.data(), batch_size * sizeof(int32_t), false);
++			return;
++		}
++		if (indices->dtype() == DataType::kInt64) {
++			std::vector<int64_t> host_indices(batch_size);
++			for (size_t row = 0; row < batch_size; ++row) {
++				const auto begin = host_logits.begin() + static_cast<std::ptrdiff_t>(row * vocab_size);
++				host_indices[row] = static_cast<int64_t>(
++				    std::distance(begin, std::max_element(begin, begin + static_cast<std::ptrdiff_t>(vocab_size))));
++			}
++			context::memcpyH2D(
++			    indices->data(), host_indices.data(), batch_size * sizeof(int64_t), false);
++			return;
++		}
++		throw std::runtime_error("random_sample_metax: unsupported indices dtype");
++	}
++
++	if (logits->ndim() == 2 && logits->shape()[0] == 1 && logits->is_contiguous()) {
++		logits = logits->view({logits->shape()[1]});
++	}
++	INFINICORE_ASSERT(logits->ndim() == 1 && logits->numel() > 0 && logits->is_contiguous());
++	INFINICORE_ASSERT(indices->numel() == 1 && indices->is_contiguous());
+ 	auto host_logits = logits_to_host_f32(logits);
+ 	const int32_t idx = sample_index(std::move(host_logits), random_val, topp, topk, temperature);
+ 

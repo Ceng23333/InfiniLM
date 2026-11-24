@@ -555,7 +555,8 @@ void RankWorker::thread_loop() {
                             // view) returns garbage ids when n_out>1 under V1 multi-request.
                             // Keep NVIDIA batch path; force QY through the per-index loop.
                             const bool batch_greedy = (rank_info_.device.type() == infinicore::Device::Type::kNvidia
-                                                       || rank_info_.device.type() == infinicore::Device::Type::kQy)
+                                                       || rank_info_.device.type() == infinicore::Device::Type::kQy
+                                                       || rank_info_.device.type() == infinicore::Device::Type::kMetax)
                                                    && parameter_greedy
                                                    && n_out > 0
                                                    && logits_positions == n_out
