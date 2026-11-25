@@ -10,7 +10,6 @@
 
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -366,27 +365,6 @@ void Graph::instantiate() {
         this->run();
     }
     infinicore::context::syncStream();
-
-    // Policy: eager / DISABLE kill-switch → recorded-operator replay only.
-    if (!context::deviceGraphSegmentsEnabled()) {
-        const char *policy = context::cudagraphPolicy();
-        if (std::strcmp(policy, "eager") == 0) {
-            spdlog::info(
-                "INFINI_CUDAGRAPH_POLICY=eager; replaying recorded operators without device segments");
-        } else {
-            spdlog::info("device graph segments disabled; replaying recorded operators");
-        }
-        return;
-    }
-
-    static bool policy_logged = false;
-    if (!policy_logged) {
-        policy_logged = true;
-        const char *policy = context::cudagraphPolicy();
-        spdlog::info(
-            "INFINI_CUDAGRAPH_POLICY={} (device graph segments enabled)",
-            (policy[0] == '\0') ? "legacy" : policy);
-    }
 
     for (const auto &op : op_list_) {
         const bool capture_safe = op->is_device_graph_capture_safe();

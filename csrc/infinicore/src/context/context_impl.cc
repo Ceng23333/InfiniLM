@@ -373,31 +373,11 @@ void cancelGraphRecording() noexcept {
 }
 
 const char *cudagraphPolicy() {
-    const char *v = std::getenv("INFINI_CUDAGRAPH_POLICY");
-    if (v == nullptr || v[0] == '\0') {
-        return "";
-    }
-    const std::string s(v);
-    if (s == "eager") {
-        return "eager";
-    }
-    if (s == "full_and_piecewise") {
-        return "full_and_piecewise";
-    }
-    // Reject unknown values — fall back to legacy (empty).
+    // Bench-frozen legacy policy; retained for ABI/API compatibility.
     return "";
 }
 
 bool deviceGraphSegmentsEnabled() {
-    // Kill-switch always wins (diagnostic escape hatch).
-    if (std::getenv("INFINICORE_DISABLE_DEVICE_GRAPH_SEGMENTS") != nullptr) {
-        return false;
-    }
-    const char *policy = cudagraphPolicy();
-    if (std::strcmp(policy, "eager") == 0) {
-        return false;
-    }
-    // full_and_piecewise and empty/legacy → enable segmented device graphs.
     return true;
 }
 
@@ -494,10 +474,6 @@ FaIngraphMode faIngraphMode_() {
             "INFINI_FA_INGRAPH=decode (product) or both/1 (Prefill+Decode)");
         return FaIngraphMode::Both;
     }
-    // Product full_and_piecewise defaults to decode (FULL segs≈1; prefill FA HB).
-    if (std::strcmp(cudagraphPolicy(), "full_and_piecewise") == 0) {
-        return FaIngraphMode::Decode;
-    }
     return FaIngraphMode::Off;
 }
 } // namespace
@@ -526,9 +502,6 @@ bool faInGraphAllowed() {
 
 bool moeTritonCaptureAllowed() {
     if (env_truthy_("INFINI_MOE_FORCE_HOST_BREAK")) {
-        return false;
-    }
-    if (std::strcmp(cudagraphPolicy(), "eager") == 0) {
         return false;
     }
     const MoeIngraphMode mode = moeIngraphMode_();

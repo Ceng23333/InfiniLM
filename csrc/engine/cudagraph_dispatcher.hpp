@@ -98,28 +98,15 @@ public:
         bs_to_padded_decode_.clear();
         max_capture_ = 0;
         max_decode_bs_ = 0;
-        const char *policy = cudagraph_policy();
-        if (std::strcmp(policy, "eager") == 0) {
-            // No capture keys — dispatch always NONE.
-            return;
+        for (size_t b : detail::parse_csv_sizes_(std::getenv("INFINI_DECODE_CG_BATCHES"))) {
+            full_keys_.insert(b);
         }
-        if (std::strcmp(policy, "full_and_piecewise") != 0 && policy[0] != '\0') {
-            // Unknown policy string already normalized to "" by cudagraph_policy().
-            return;
+        for (size_t b :
+             detail::parse_csv_sizes_(std::getenv("INFINI_NATIVE_CG_CAPTURE_BUCKETS"))) {
+            piecewise_keys_.insert(b);
         }
-        // full_and_piecewise or legacy (empty policy with companion envs).
-        if (std::strcmp(policy, "full_and_piecewise") == 0
-            || std::strcmp(policy, "") == 0) {
-            for (size_t b : detail::parse_csv_sizes_(std::getenv("INFINI_DECODE_CG_BATCHES"))) {
-                full_keys_.insert(b);
-            }
-            for (size_t b :
-                 detail::parse_csv_sizes_(std::getenv("INFINI_NATIVE_CG_CAPTURE_BUCKETS"))) {
-                piecewise_keys_.insert(b);
-            }
-            rebuild_pad_table_();
-            rebuild_decode_pad_table_();
-        }
+        rebuild_pad_table_();
+        rebuild_decode_pad_table_();
     }
 
     void add_full_key(size_t num_tokens) {
@@ -141,9 +128,6 @@ public:
     /// the next ``INFINI_DECODE_CG_BATCHES`` entry; kill-switch
     /// ``INFINI_DECODE_CG_PAD_UP=0``.
     std::pair<CudaGraphRuntimeMode, BatchDescriptor> dispatch(const BatchDescriptor &desc) const {
-        if (std::strcmp(cudagraph_policy(), "eager") == 0) {
-            return {CudaGraphRuntimeMode::None, desc};
-        }
         if (desc.uniform_decode && !full_keys_.empty()) {
             if (full_keys_.count(desc.num_tokens) > 0) {
                 BatchDescriptor key = desc;
@@ -181,9 +165,6 @@ public:
     /// Classify why ``dispatch`` returned NONE (for profile / hang_trace histograms).
     /// ``is_mixed`` is the scheduler MIXED / ragged flag from RankWorker.
     const char *none_reason(const BatchDescriptor &desc, bool is_mixed) const {
-        if (std::strcmp(cudagraph_policy(), "eager") == 0) {
-            return "eager_policy";
-        }
         if (desc.uniform_decode) {
             if (!full_keys_.empty() && desc.num_tokens > max_decode_bs_) {
                 return "decode_bs_over_max";

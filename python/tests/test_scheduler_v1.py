@@ -144,7 +144,6 @@ class SchedulerV1Test(unittest.TestCase):
     def test_homogeneous_env_ignored(self):
         """INFINI_SCHEDULE_HOMOGENEOUS=1 does not change mixed RUNNING-first behavior."""
         os.environ["INFINI_SCHEDULE_HOMOGENEOUS"] = "1"
-        os.environ["INFINI_PREFILL_NATIVE_CG"] = "1"
         self.assertFalse(schedule_homogeneous_enabled())
 
         os.environ["INFINI_MAX_NUM_BATCHED_TOKENS"] = "2048"

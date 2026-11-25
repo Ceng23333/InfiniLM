@@ -42,11 +42,9 @@ class CoreGraphSyncTest(unittest.TestCase):
             self.assertIn(contract, header)
 
         warmup = instantiate.index("for (size_t iter = 0; iter < 5; ++iter)")
-        policy = instantiate.index("deviceGraphSegmentsEnabled")
         partition = instantiate.index("op->is_device_graph_capture_safe()")
-        self.assertLess(warmup, policy)
-        self.assertLess(policy, partition)
-        self.assertIn("INFINI_CUDAGRAPH_POLICY", instantiate)
+        self.assertLess(warmup, partition)
+        self.assertNotIn("INFINI_CUDAGRAPH_POLICY", instantiate)
         self.assertIn("segments_.back()->ops.push_back(op)", instantiate)
         self.assertIn("if (!segment->capture_safe)", instantiate)
         self.assertIn("segment->run()", instantiate)
@@ -63,6 +61,15 @@ class CoreGraphSyncTest(unittest.TestCase):
         context_header = read_source(
             "csrc/infinicore/include/infinicore/context/context.hpp"
         )
+        context_source = read_source(
+            "csrc/infinicore/src/context/context_impl.cc"
+        )
+        policy_body = function_body(context_source, "const char *cudagraphPolicy()")
+        segments_body = function_body(context_source, "bool deviceGraphSegmentsEnabled()")
+        self.assertNotIn("getenv", policy_body)
+        self.assertIn('return "";', policy_body)
+        self.assertNotIn("getenv", segments_body)
+        self.assertIn("return true;", segments_body)
         self.assertIn("cudagraphPolicy()", context_header)
         self.assertIn("deviceGraphSegmentsEnabled()", context_header)
         self.assertIn("LastRunProfile", header)

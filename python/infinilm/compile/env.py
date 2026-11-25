@@ -1,18 +1,14 @@
-"""CUDA-graph policy + continuous-batching / chunked-prefill env knobs."""
+"""Bench-frozen CUDA-graph policy + scheduler/chunked-prefill knobs."""
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional, Tuple
+from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
-CUDAGRAPH_POLICY_EAGER = "eager"
-CUDAGRAPH_POLICY_FULL_AND_PIECEWISE = "full_and_piecewise"
-_CUDAGRAPH_POLICIES = frozenset(
-    {CUDAGRAPH_POLICY_EAGER, CUDAGRAPH_POLICY_FULL_AND_PIECEWISE}
-)
+CUDAGRAPH_POLICY_LEGACY = "legacy"
 
 _SCHEDULE_HOMOGENEOUS_WARNED = False
 _PREFILL_CHUNK_SIZE_WARNED = False
@@ -42,41 +38,22 @@ def _setdefault_env(name: str, value: str) -> None:
 
 
 def cudagraph_policy() -> str:
-    raw = os.environ.get("INFINI_CUDAGRAPH_POLICY", "").strip().lower()
-    if raw in ("", CUDAGRAPH_POLICY_EAGER):
-        return CUDAGRAPH_POLICY_EAGER if raw == CUDAGRAPH_POLICY_EAGER else ""
-    if raw == CUDAGRAPH_POLICY_FULL_AND_PIECEWISE:
-        return CUDAGRAPH_POLICY_FULL_AND_PIECEWISE
-    return ""
+    """Return the bench-frozen InfiniLM CUDA-graph policy."""
+    return CUDAGRAPH_POLICY_LEGACY
 
 
-def apply_cudagraph_policy_env(policy: Optional[str] = None) -> str:
-    """Expand companion knobs when F&P is selected.
-
-    Keeps existing FA_INGRAPH=decode setdefault, and setdefaults
-    ``INFINI_MAX_NUM_BATCHED_TOKENS=2048`` under F&P when unset.
-    """
-    pol = (policy or os.environ.get("INFINI_CUDAGRAPH_POLICY", "")).strip().lower()
-    if pol == CUDAGRAPH_POLICY_FULL_AND_PIECEWISE:
-        os.environ.setdefault(
-            "INFINI_CUDAGRAPH_POLICY", CUDAGRAPH_POLICY_FULL_AND_PIECEWISE
-        )
-        if not os.environ.get("INFINI_FA_INGRAPH", "").strip():
-            os.environ["INFINI_FA_INGRAPH"] = "decode"
-            logger.info(
-                "cudagraph_policy=full_and_piecewise → INFINI_FA_INGRAPH=decode"
-            )
-        _setdefault_env("INFINI_MAX_NUM_BATCHED_TOKENS", "2048")
-        return CUDAGRAPH_POLICY_FULL_AND_PIECEWISE
+def apply_cudagraph_policy_env() -> str:
+    """Expand the bench-frozen legacy path's companion defaults."""
+    if not os.environ.get("INFINI_FA_INGRAPH", "").strip():
+        os.environ["INFINI_FA_INGRAPH"] = "decode"
+        logger.info("bench policy legacy → INFINI_FA_INGRAPH=decode")
+    _setdefault_env("INFINI_MAX_NUM_BATCHED_TOKENS", "2048")
     return cudagraph_policy()
 
 
 def prefill_native_cg_enabled() -> bool:
-    """Native C++ piecewise CUDAGraph prefill (follows F&P policy when set)."""
-    raw = os.environ.get("INFINI_CUDAGRAPH_POLICY", "").strip().lower()
-    if raw in _CUDAGRAPH_POLICIES:
-        return raw == CUDAGRAPH_POLICY_FULL_AND_PIECEWISE
-    return _truthy("INFINI_PREFILL_NATIVE_CG", "0")
+    """Latest bench path disables native C++ piecewise prefill."""
+    return False
 
 
 def prefill_chunked_enabled() -> bool:
